@@ -22,7 +22,7 @@ WinUI 3 原生界面（类 Windows 11 风格）：
 
 ### 方式一：直接使用可执行文件
 
-下载 [Releases](https://github.com/rpytranslator/rpytranslator/releases) 中的 `RenPyTranslator.exe`，双击运行即可（Windows 10 1809+ 或 Windows 11）。
+下载 [Releases](https://github.com/haohan-hh/Machine_translated_Renpy_game/releases) 中的 `RenPyTranslator.exe`，双击运行即可（Windows 10 1809+ 或 Windows 11）。
 
 ### 方式二：源码运行
 
