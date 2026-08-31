@@ -326,7 +326,7 @@ class GuiApp(XamlApplication):
 
     def OnDrop(self, sender, e) -> None:
         try:
-            op = e.DataView.GetStorageItems()
+            op = e.DataView.GetStorageItemsAsync()
             asyncui.create_task(self._handle_drop(op))
         except Exception as exc:
             self._append_log("解析拖放内容失败: %s" % exc, "err")
@@ -342,7 +342,7 @@ class GuiApp(XamlApplication):
 
     def _pick_folder_dialog(self) -> str | None:
         """Win11 文件夹选择对话框（SHBrowseForFolderW，不依赖 COM 注册表激活）。"""
-        from ctypes import byref, create_unicode_buffer, cast, POINTER, c_uint16
+        from ctypes import byref, create_unicode_buffer, cast, c_wchar_p
         from win32more.Windows.Win32.UI.Shell import (
             BROWSEINFOW, SHBrowseForFolderW, SHGetPathFromIDListW,
         )
@@ -352,7 +352,7 @@ class GuiApp(XamlApplication):
             bi.hwndOwner = HWND(self._hwnd)
             bi.lpszTitle = "选择 Ren'Py 游戏目录"
             display = create_unicode_buffer(260)
-            bi.pszDisplayName = cast(display, POINTER(c_uint16))
+            bi.pszDisplayName = cast(display, c_wchar_p)
             bi.ulFlags = 0x0001 | 0x0040  # BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE
             pidl = SHBrowseForFolderW(byref(bi))
             if not pidl:
