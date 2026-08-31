@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+
+# 运行时生成
+rpytranslator_config.json
+汉化补丁/
+
+# 测试残留
+_unittest_results.txt
