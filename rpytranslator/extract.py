@@ -330,6 +330,7 @@ class RpyExtractor:
         self._label: str | None = None
         self._alternate: str | None = None
         self._stack: list[_Ctx] = []
+        self._open_define_parens = 0   # 跨行 define 未闭合的括号数
 
     # -- 通用 --------------------------------------------------------------
 
@@ -362,6 +363,42 @@ class RpyExtractor:
     def _indent_of(text: str) -> int:
         return len(text) - len(text.lstrip(" \t"))
 
+    @staticmethod
+    def _paren_net(text: str) -> int:
+        """统计一行中未闭合的 ( ) 数（忽略字符串与注释内的括号）。"""
+        depth = 0
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if ch == "\\":
+                i += 2
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+                triple = text.startswith(quote * 3, i)
+                if triple:
+                    end = text.find(quote * 3, i + 3)
+                    i = n if end == -1 else end + 3
+                else:
+                    i += 1
+                    while i < n:
+                        if text[i] == "\\":
+                            i += 2
+                            continue
+                        if text[i] == quote:
+                            break
+                        i += 1
+                    i += 1
+                continue
+            if ch == "#":
+                break
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            i += 1
+        return depth
+
     # -- 主流程 ------------------------------------------------------------
 
     def parse(self, raw: str) -> ExtractionResult:
@@ -384,6 +421,11 @@ class RpyExtractor:
             self._stack.pop()
 
         top = self._stack[-1] if self._stack else None
+
+        # 跨行 define 的延续行（ConditionSwitch / 字典 / 列表参数等），忽略
+        if self._open_define_parens:
+            self._open_define_parens += self._paren_net(text)
+            return
 
         # python / translate 块内：忽略语句（_() 字符串另由全局扫描处理）
         if top and top.kind in (_PYTHON, _TRANSLATE):
@@ -416,8 +458,8 @@ class RpyExtractor:
         if keyword == "screen":
             self._stack.append(_Ctx(_SCREEN, indent))
             return
-        if keyword in ("style", "transform") and stripped.endswith(":"):
-            # style / transform 块内只有属性语句，无对话
+        if keyword in ("style", "transform", "image", "layeredimage") and stripped.endswith(":"):
+            # style / transform / image (ATL) 块内只有属性语句，无对话
             self._stack.append(_Ctx(_PYTHON, indent))
             return
         if keyword in ("define", "default"):
@@ -486,7 +528,9 @@ class RpyExtractor:
         """define/default 语句：
         1) 值直接是字符串（跳过明显非文本内容）
         2) Character("名称") / DynamicCharacter(...) 的首个字符串参数
+        3) 跨行表达式（括号未闭合）时忽略后续参数行
         """
+        self._open_define_parens += self._paren_net(stripped)
         m = re.match(r'^(?:define|default)\s+[\w.]+(?:\[[^\]]*\])?\s*(?:=|\+=)\s*', stripped)
         if m:
             value, _ = _parse_string_literal(stripped, m.end())
