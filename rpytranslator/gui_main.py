@@ -280,7 +280,7 @@ class GuiApp(XamlApplication):
         except Exception:
             data = {}
         self.ApiUrlBox.Text = data.get("url", PRESETS[SERVICES[0]][0])
-        self.ApiKeyBox.Text = data.get("key", "")
+        self.ApiKeyBox.Password = data.get("key", "")
         self.ModelBox.Text = data.get("model", PRESETS[SERVICES[0]][1])
         try:
             si = SERVICES.index(data.get("service", SERVICES[0]))
@@ -301,7 +301,7 @@ class GuiApp(XamlApplication):
             "service": SERVICES[self.ServiceBox.SelectedIndex],
             "lang": LANGUAGES[self.LangBox.SelectedIndex],
             "url": self.ApiUrlBox.Text,
-            "key": self.ApiKeyBox.Text,
+            "key": self.ApiKeyBox.Password,
             "model": self.ModelBox.Text,
             "font": self.FontSwitch.IsOn,
             "lang_ui": self.LangUiSwitch.IsOn,
@@ -445,7 +445,7 @@ class GuiApp(XamlApplication):
             self._msgbox("请先选择游戏目录", "缺少游戏目录")
             return
         url = self.ApiUrlBox.Text.strip()
-        key = self.ApiKeyBox.Text.strip()
+        key = self.ApiKeyBox.Password.strip()
         model = self.ModelBox.Text.strip()
         if not url or not key or not model:
             self._append_log("请填写完整的 API 地址 / Key / 模型", "err")
