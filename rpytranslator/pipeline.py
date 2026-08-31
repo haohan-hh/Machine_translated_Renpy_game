@@ -152,6 +152,10 @@ def run_pipeline(
     d_trans = client.translate_texts([u.what for u in uniq_d], target=target)
     s_trans = client.translate_texts([u.text for u in uniq_s], target=target)
 
+    log(f"API 请求统计：共发出 {client.request_count} 次请求，"
+        f"失败 {client.error_count} 次"
+        + ("（0 次请求 = 未调用任何 API）" if client.request_count == 0 else ""))
+
     # 6. 组装译文映射
     dialogue_translations: dict[str, str] = {}
     for u, tr in zip(uniq_d, d_trans):

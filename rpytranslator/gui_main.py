@@ -213,6 +213,7 @@ class GuiApp(XamlApplication):
         self.game_info: object | None = None
         self._timer: DispatcherTimer | None = None
         self._log_lines = 0
+        self._last_result: str | None = None
 
     # -- 生命周期 ----------------------------------------------------------
 
@@ -474,7 +475,7 @@ class GuiApp(XamlApplication):
     def _run_translation(self, config: TranslationConfig) -> None:
         lang = LANGUAGES[self.LangBox.SelectedIndex].split("（")[0]
         try:
-            run_pipeline(
+            result = run_pipeline(
                 game_path=self.game_dir or "",
                 config=config,
                 language=lang,
@@ -482,6 +483,7 @@ class GuiApp(XamlApplication):
                 apply_font_patch=self.FontSwitch.IsOn,
                 apply_language_ui=self.LangUiSwitch.IsOn,
             )
+            self.msg_q.put("RESULT|%s" % result.message)
         except Exception as exc:
             self.msg_q.put("ERR|%s" % exc)
         finally:
@@ -499,6 +501,9 @@ class GuiApp(XamlApplication):
                 if msg == "__done__":
                     self._on_done()
                     continue
+                if msg.startswith("RESULT|"):
+                    self._last_result = msg[7:]
+                    continue
                 if msg.startswith("ERR|"):
                     self._append_log(msg[4:], "err")
                     continue
@@ -509,8 +514,10 @@ class GuiApp(XamlApplication):
     def _on_done(self) -> None:
         self.worker = None
         self._set_busy(False)
+        if getattr(self, "_last_result", None):
+            self._append_log(self._last_result, "ok")
+            self._last_result = None
         self.StatusText.Text = "完成"
-        self._append_log("全部完成，汉化补丁已生成。", "ok")
 
     def _set_busy(self, busy: bool) -> None:
         self.StartBtn.IsEnabled = not busy

@@ -128,6 +128,8 @@ class TranslationClient:
 
     def __init__(self, config: TranslationConfig):
         self.config = config
+        self.request_count = 0       # 实际发出的 API 请求次数
+        self.error_count = 0         # 失败的请求次数
 
     # -- 底层请求 ----------------------------------------------------------
 
@@ -139,6 +141,7 @@ class TranslationClient:
 
     def chat(self, messages: list[dict]) -> str:
         """发起一次对话请求，返回 assistant 的文本内容。"""
+        self.request_count += 1
         body = {
             "model": self.config.model,
             "messages": messages,
@@ -155,6 +158,7 @@ class TranslationClient:
             with urllib.request.urlopen(req, timeout=self.config.timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
+            self.error_count += 1
             detail = ""
             try:
                 detail = e.read().decode("utf-8", errors="replace")[:300]
@@ -164,6 +168,7 @@ class TranslationClient:
                 f"HTTP {e.code} 请求失败: {e.reason}{(' - ' + detail) if detail else ''}"
             ) from None
         except urllib.error.URLError as e:
+            self.error_count += 1
             raise TranslationError(
                 f"无法连接翻译服务（{self.config.base_url}）: {e.reason}"
             ) from None
