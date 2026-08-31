@@ -468,6 +468,7 @@ class GuiApp(XamlApplication):
         )
         self.worker.start()
         self._set_busy(True)
+        self.ProgressText.Text = "准备中…"
         self.StatusText.Text = "正在翻译…"
         self._append_log("开始汉化: %s → %s" % (self.game_dir, lang), "info")
         self._append_log("目标语言: %s | 模型: %s" % (lang, model), "info")
@@ -507,9 +508,22 @@ class GuiApp(XamlApplication):
                 if msg.startswith("ERR|"):
                     self._append_log(msg[4:], "err")
                     continue
+                if msg.startswith("PROGRESS|"):
+                    try:
+                        self._update_progress(int(msg.split("|")[1]))
+                    except (ValueError, IndexError):
+                        pass
+                    continue
                 self._append_log(msg)
         except queue.Empty:
             pass
+
+    def _update_progress(self, pct: int) -> None:
+        """对接成功后：把“就绪”替换为实时百分比进度。"""
+        pct = max(0, min(100, pct))
+        self.Progress.IsIndeterminate = False
+        self.Progress.Value = pct
+        self.ProgressText.Text = "%d%%" % pct
 
     def _on_done(self) -> None:
         self.worker = None
@@ -517,6 +531,7 @@ class GuiApp(XamlApplication):
         if getattr(self, "_last_result", None):
             self._append_log(self._last_result, "ok")
             self._last_result = None
+        self.ProgressText.Text = "完成"
         self.StatusText.Text = "完成"
 
     def _set_busy(self, busy: bool) -> None:

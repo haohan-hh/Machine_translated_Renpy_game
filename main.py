@@ -76,8 +76,14 @@ def _launch_cli(args) -> int:
     print(f"游戏目录: {game}")
     print(f"API: {args.api_url} | 模型: {args.model} | 语言: {args.lang}")
 
+    def _progress(m: str) -> None:
+        if m.startswith("PROGRESS|"):
+            print("  进度: %s%%" % m.split("|")[1])
+        else:
+            print("  ", m)
+
     result = run_pipeline(game, config=cfg, language=args.lang,
-                          progress_cb=lambda m: print("  ", m),
+                          progress_cb=_progress,
                           apply_font_patch=not args.no_font_patch,
                           apply_language_ui=not args.no_lang_ui)
     print("\n" + "=" * 50)

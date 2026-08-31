@@ -180,19 +180,29 @@ class TranslationClient:
     # -- 批量翻译 ----------------------------------------------------------
 
     def translate_texts(
-        self, texts: list[str], target: str = DEFAULT_TARGET
+        self, texts: list[str], target: str = DEFAULT_TARGET,
+        progress_cb=None, offset: int = 0, total: int | None = None,
     ) -> list[str]:
-        """批量翻译文本，返回与输入等长的译文列表（失败项回退原文）。"""
+        """批量翻译文本，返回与输入等长的译文列表（失败项回退原文）。
+
+        progress_cb(done, total) 在每完成一个批次时回调，用于实时进度显示。
+        """
         results: list[str] = list(texts)
         indices = [i for i, t in enumerate(texts) if t.strip()]
         if not indices:
             return results
+        if total is None:
+            total = len(indices)
         payload_texts = [texts[i] for i in indices]
 
         chunks = self._chunk(payload_texts)
         translated: list[str] = []
+        done = 0
         for chunk in chunks:
             translated.extend(self._translate_chunk(chunk, target))
+            done += len(chunk)
+            if progress_cb:
+                progress_cb(offset + done, total)
 
         for idx, val in zip(indices, translated):
             results[idx] = val

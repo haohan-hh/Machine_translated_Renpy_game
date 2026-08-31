@@ -149,8 +149,20 @@ def run_pipeline(
     log(f"开始 AI 翻译（目标语言：{target}）…")
     t0 = time.time()
 
-    d_trans = client.translate_texts([u.what for u in uniq_d], target=target)
-    s_trans = client.translate_texts([u.text for u in uniq_s], target=target)
+    total = len(uniq_d) + len(uniq_s)
+    def report_progress(done: int, total: int) -> None:
+        pct = int(done * 100 / total) if total else 100
+        if progress_cb:
+            progress_cb("PROGRESS|%d" % pct)
+
+    d_trans = client.translate_texts(
+        [u.what for u in uniq_d], target=target,
+        progress_cb=report_progress, offset=0, total=total)
+    s_trans = client.translate_texts(
+        [u.text for u in uniq_s], target=target,
+        progress_cb=report_progress, offset=len(uniq_d), total=total)
+    if progress_cb:
+        progress_cb("PROGRESS|100")
 
     log(f"API 请求统计：共发出 {client.request_count} 次请求，"
         f"失败 {client.error_count} 次"
