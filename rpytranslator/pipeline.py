@@ -5,6 +5,7 @@ CLI 与 GUI 共用；progress_cb(阶段, 消息) 用于界面刷新。
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -87,6 +88,117 @@ def _norm_filename(filename: str, game_dir) -> str:
     return p.name
 
 
+def _decode_say(raw: str) -> str:
+    """反向还原 encode_say_string：\\n→换行、\\"→"、\\ →空格、\\\\→\\。"""
+    out: list[str] = []
+    i, n = 0, len(raw)
+    while i < n:
+        c = raw[i]
+        if c == "\\" and i + 1 < n:
+            nxt = raw[i + 1]
+            if nxt == "n":
+                out.append("\n")
+            elif nxt == " ":
+                out.append(" ")
+            elif nxt == '"':
+                out.append('"')
+            else:
+                out.append(nxt)          # \\ → \
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _parse_untran_report(path: Path) -> list[str]:
+    """解析「未翻译报告」：返回其中列出的未翻译文本清单。
+
+    报告条目格式为 `文件名:行号  原文`（文件名与行号后为两个空格），
+    标题行、错误详情行等不会被解析进来。
+    """
+    texts: list[str] = []
+    try:
+        lines = path.read_text(encoding="utf-8-sig", errors="ignore").splitlines()
+    except OSError:
+        return texts
+    for ln in lines:
+        s = ln.strip()
+        if not s or s.startswith("==") or s.startswith("以下文本"):
+            continue
+        m = re.match(r"^.+:\d+\s{2,}(.+)$", s)
+        if m:
+            texts.append(m.group(1).strip())
+    return texts
+
+
+_TRANS_RE = re.compile(r"translate\s+(\S+)\s+(\S+):\s*$")
+
+
+def _parse_existing_tl(tl_dir: Path, language: str) -> tuple[dict[str, str], dict[str, str]]:
+    """解析已有 tl/<语言> 下的翻译文件。
+
+    返回 (对话 identifier→译文, 字符串 原文→译文)。增量汉化时据此保留
+    上次已经翻译成功的内容，避免全量重写 tl 后丢失已有译文。
+    只认语言一致的标准 Ren'Py 翻译块（本工具生成 / 官方格式均兼容）。
+    """
+    d_map: dict[str, str] = {}
+    s_map: dict[str, str] = {}
+    if not tl_dir.is_dir():
+        return d_map, s_map
+    for f in sorted(tl_dir.rglob("*.rpy")):
+        try:
+            lines = f.read_text(encoding="utf-8-sig", errors="ignore").splitlines()
+        except OSError:
+            continue
+        i, n = 0, len(lines)
+        while i < n:
+            m = _TRANS_RE.match(lines[i].strip())
+            if not m or m.group(1) != language:
+                i += 1
+                continue
+            block_id = m.group(2)
+            i += 1
+            if block_id == "strings":
+                # 字符串块：old/new 成对出现
+                cur_old: str | None = None
+                while i < n:
+                    ln = lines[i].strip()
+                    if not ln:
+                        i += 1
+                        continue
+                    if _TRANS_RE.match(ln):
+                        break
+                    mo = re.match(r'old\s+"(.*)"\s*$', ln)
+                    mn = re.match(r'new\s+"(.*)"\s*$', ln)
+                    if mo:
+                        cur_old = _decode_say(mo.group(1))
+                    elif mn and cur_old is not None:
+                        s_map[cur_old] = _decode_say(mn.group(1))
+                        cur_old = None
+                    i += 1
+            else:
+                # 对话块：跳过注释行（原文），取译文行首尾引号之间的内容
+                while i < n:
+                    ln = lines[i].strip()
+                    if not ln:
+                        i += 1
+                        continue
+                    if _TRANS_RE.match(ln):
+                        break
+                    if not ln.startswith("#"):
+                        q = ln.find('"')
+                        rq = ln.rfind('"')
+                        if q != -1 and rq > q:
+                            d_map[block_id] = _decode_say(ln[q + 1:rq])
+                        break
+                    i += 1
+                # 跳过本块其余行，直到下一个 translate 块
+                while i < n and not _TRANS_RE.match(lines[i].strip()):
+                    i += 1
+    return d_map, s_map
+
+
 def run_pipeline(
     game_path: str | Path,
     config: TranslationConfig | None = None,
@@ -116,7 +228,10 @@ def run_pipeline(
         return result
 
     result.game_dir = info.game_dir
-    if info.has_chinese:
+    report_path = info.game_dir / "tl" / f"{language}.未翻译报告.txt"
+    # 游戏自带中文且没有未翻译报告 → 无需汉化；
+    # 若仍留有未翻译报告（上次汉化未完成），继续增量汉化补齐。
+    if info.has_chinese and not report_path.exists():
         zh = next(
             (l for l in info.languages if engine.is_chinese_language(l)),
             info.languages[0],
@@ -125,7 +240,25 @@ def run_pipeline(
         result.ok = True
         return result
 
-    # 2. 提取
+    # 2. 增量汉化检测：拖入已汉化过的游戏时，检查是否仍存有未翻译报告。
+    #    有则本次只翻译报告中列出的文本，保留已有译文，完成后自动更新报告，
+    #    循环此过程直到全部汉化完成（报告消失）。
+    retry_texts: set[str] = set()
+    incremental = False
+    if report_path.exists():
+        incremental = True
+        retry_texts = set(_parse_untran_report(report_path))
+        if retry_texts:
+            log(f"检测到未翻译报告（{len(retry_texts)} 条未翻译文本）："
+                f"本次将增量汉化——只翻译报告中列出的文本，并保留已有译文")
+        else:
+            # 报告已无内容，删除空报告
+            try:
+                report_path.unlink()
+            except OSError:
+                pass
+
+    # 2.1 提取
     log("正在提取游戏文本…")
     dialogues: list[DialogueUnit] = []
     strings: list = []
@@ -221,6 +354,16 @@ def run_pipeline(
         result.ok = False
         return result
 
+    # 5.1 增量汉化：只翻译报告中列出的文本，其余文本沿用已有译文
+    if retry_texts:
+        todo_d = [u for u in uniq_d if u.what in retry_texts]
+        todo_s = [u for u in uniq_s if u.text in retry_texts]
+        log(f"增量汉化：跳过 {len(uniq_d) - len(todo_d)} 条对话、"
+            f"{len(uniq_s) - len(todo_s)} 条字符串（已有译文），"
+            f"待翻译 {len(todo_d)} 条对话、{len(todo_s)} 条字符串")
+    else:
+        todo_d, todo_s = uniq_d, uniq_s
+
     # 6. 翻译 + 自动补译：第一次翻译后，凡译文仍等于原文（失败回退）的
     #    文本会自动进入下一轮，只重译这些文本；重复直到全部翻译完成
     #    （或达到 MAX_RETRY_ROUNDS 上限，此时保留“未翻译报告”供手动处理）。
@@ -231,7 +374,7 @@ def run_pipeline(
     log(f"开始 AI 翻译（目标语言：{target}）…")
     t0 = time.time()
 
-    total = len(uniq_d) + len(uniq_s)
+    total = len(todo_d) + len(todo_s)
     def report_progress(done: int, total: int) -> None:
         pct = int(done * 100 / total) if total else 100
         if progress_cb:
@@ -241,35 +384,37 @@ def run_pipeline(
         if progress_cb:
             progress_cb("ERR|" + msg)
 
-    # 第 1 轮：翻译全部去重文本
+    # 第 1 轮：翻译本轮待翻译的去重文本
     d_trans = client.translate_texts(
-        [u.what for u in uniq_d], target=target, names=protect_terms,
+        [u.what for u in todo_d], target=target, names=protect_terms,
         progress_cb=report_progress, offset=0, total=total,
         error_cb=report_error)
     s_trans = client.translate_texts(
-        [u.text for u in uniq_s], target=target, names=protect_terms,
-        progress_cb=report_progress, offset=len(uniq_d), total=total,
+        [u.text for u in todo_s], target=target, names=protect_terms,
+        progress_cb=report_progress, offset=len(todo_d), total=total,
         error_cb=report_error)
 
     # 按文本保存译文（多轮补译期间持续更新）
-    d_by_text: dict[str, str] = {u.what: tr for u, tr in zip(uniq_d, d_trans)}
-    s_by_text: dict[str, str] = {u.text: tr for u, tr in zip(uniq_s, s_trans)}
+    d_by_text: dict[str, str] = {u.what: tr for u, tr in zip(todo_d, d_trans)}
+    s_by_text: dict[str, str] = {u.text: tr for u, tr in zip(todo_s, s_trans)}
 
     # 第 2+ 轮：只重译仍未翻译（译文 == 原文）的文本
+    # 注意：这里使用 retry_d/retry_s，不要复用上面的 todo_d/todo_s，
+    # 后者在增量汉化里表示“本次要翻译的条目”，后面组装映射还要用到。
     retry_round = 0
     while True:
-        todo_d = [u for u in uniq_d if d_by_text.get(u.what) == u.what]
-        todo_s = [u for u in uniq_s if s_by_text.get(u.text) == u.text]
-        if not todo_d and not todo_s:
+        retry_d = [u for u in uniq_d if d_by_text.get(u.what) == u.what]
+        retry_s = [u for u in uniq_s if s_by_text.get(u.text) == u.text]
+        if not retry_d and not retry_s:
             break
         retry_round += 1
         if retry_round > MAX_RETRY_ROUNDS:
-            log(f"补译 {MAX_RETRY_ROUNDS} 轮后仍有 {len(todo_d)} 条对话、"
-                f"{len(todo_s)} 条字符串未翻译，保留未翻译报告供手动处理")
+            log(f"补译 {MAX_RETRY_ROUNDS} 轮后仍有 {len(retry_d)} 条对话、"
+                f"{len(retry_s)} 条字符串未翻译，保留未翻译报告供手动处理")
             break
-        sub_total = len(todo_d) + len(todo_s)
+        sub_total = len(retry_d) + len(retry_s)
         log(f"补译第 {retry_round}/{MAX_RETRY_ROUNDS} 轮：剩余 "
-            f"{len(todo_d)} 条对话、{len(todo_s)} 条字符串，重新翻译…")
+            f"{len(retry_d)} 条对话、{len(retry_s)} 条字符串，重新翻译…")
         time.sleep(2)   # 间隔片刻，缓解限流
 
         def sub_progress(done: int, total: int) -> None:
@@ -278,16 +423,16 @@ def run_pipeline(
                 progress_cb("PROGRESS|%d" % pct)
 
         d2 = client.translate_texts(
-            [u.what for u in todo_d], target=target, names=protect_terms,
+            [u.what for u in retry_d], target=target, names=protect_terms,
             progress_cb=sub_progress, offset=0, total=sub_total,
             error_cb=report_error)
         s2 = client.translate_texts(
-            [u.text for u in todo_s], target=target, names=protect_terms,
-            progress_cb=sub_progress, offset=len(todo_d), total=sub_total,
+            [u.text for u in retry_s], target=target, names=protect_terms,
+            progress_cb=sub_progress, offset=len(retry_d), total=sub_total,
             error_cb=report_error)
-        for u, tr in zip(todo_d, d2):
+        for u, tr in zip(retry_d, d2):
             d_by_text[u.what] = tr
-        for u, tr in zip(todo_s, s2):
+        for u, tr in zip(retry_s, s2):
             s_by_text[u.text] = tr
     if progress_cb:
         progress_cb("PROGRESS|100")
@@ -299,15 +444,19 @@ def run_pipeline(
         log(f"错误详情（{len(client.error_messages)} 类）："
             + " | ".join(client.error_messages[:5]))
 
-    # 7. 组装译文映射：同一文本的所有出现（identifier 不同）共享同一译文，
-    #    避免按文本去重后重复出现的对话拿不到译文而被跳过。
-    dialogue_translations: dict[str, str] = {}
-    for u in uniq_d:
+    # 7. 组装译文映射：先加载已有 tl 中的译文（增量汉化时保留已翻译内容，
+    #    避免全量重写后丢失），再写入本次翻译结果。同一文本的所有出现
+    #    （identifier 不同）共享同一译文，避免按文本去重后重复出现的对话
+    #    拿不到译文而被跳过。
+    existing_d, existing_s = _parse_existing_tl(
+        info.game_dir / "tl" / language, language)
+    dialogue_translations: dict[str, str] = dict(existing_d)
+    string_translations: dict[str, str] = dict(existing_s)
+    for u in todo_d:
         tr = d_by_text[u.what]
         for idx in d_groups.get(u.what, ()):
             dialogue_translations[dialogues[idx].identifier] = tr
-    string_translations: dict[str, str] = {}
-    for u in uniq_s:
+    for u in todo_s:
         tr = s_by_text[u.text]
         for idx in s_groups.get(u.text, ()):
             string_translations[strings[idx].text] = tr
