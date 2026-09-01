@@ -338,17 +338,38 @@ _LANG_UI_SNIPPET = (
     'style "radio_button"\n'
 )
 
-# 语言英文名 → 设置界面显示的中文名
-_LANGUAGE_DISPLAY = {
-    "schinese": ("简体中文", ("Simplified Chinese", "Chinese (Simplified)",
-                              "Chinese", "English")),
-    "tchinese": ("繁体中文", ("Traditional Chinese", "Chinese (Traditional)",
-                             "Chinese", "English")),
-    "zh_cn": ("简体中文", ("Simplified Chinese", "Chinese (Simplified)",
-                          "Chinese", "English")),
-    "zh_hans": ("简体中文", ("Simplified Chinese", "Chinese (Simplified)",
-                            "Chinese", "English")),
-    "zh": ("简体中文", ("Chinese", "Simplified Chinese", "English")),
+# 各语言语言码对应的「Ren'Py 语言显示名 → 中文显示名」
+# 注意：English 不能统一译为目标语言名，否则语言切换菜单里会全是“简体中文”。
+_LANGUAGE_DISPLAY: dict[str, dict[str, str]] = {
+    "schinese": {
+        "Simplified Chinese": "简体中文",
+        "Chinese (Simplified)": "简体中文",
+        "Chinese": "中文",
+        "English": "英语",
+    },
+    "tchinese": {
+        "Traditional Chinese": "繁体中文",
+        "Chinese (Traditional)": "繁体中文",
+        "Chinese": "中文",
+        "English": "英语",
+    },
+    "zh_cn": {
+        "Simplified Chinese": "简体中文",
+        "Chinese (Simplified)": "简体中文",
+        "Chinese": "中文",
+        "English": "英语",
+    },
+    "zh_hans": {
+        "Simplified Chinese": "简体中文",
+        "Chinese (Simplified)": "简体中文",
+        "Chinese": "中文",
+        "English": "英语",
+    },
+    "zh": {
+        "Chinese": "中文",
+        "Simplified Chinese": "简体中文",
+        "English": "英语",
+    },
 }
 
 _LANG_UI_PATTERNS = (
@@ -605,14 +626,13 @@ def ensure_language_name(game_dir: Path, language: str) -> PatchResult | None:
     res = PatchResult()
     # 用 zz_ 前缀的独立文件名，避免与源文件 languages.rpy 生成的翻译文件同名覆盖
     f = tl_dir / _LANG_DISPLAY_FILE
-    names = _LANGUAGE_DISPLAY.get(language.lower())
-    if names is None:
-        cn, english = language, ("English",)
-    else:
-        cn, english = names
+    mappings = _LANGUAGE_DISPLAY.get(language.lower())
+    if mappings is None:
+        # 未知语言码：兜底只保留 English 不翻译（避免意外覆盖）
+        mappings = {"English": "English"}
     existing = _existing_old_strings(tl_dir)
     body = f"# 语言显示名（汉化工具自动生成）\ntranslate {language} strings:\n"
-    for en in english:
+    for en, cn in mappings.items():
         if en not in existing:
             body += f"    old {en!r}\n    new {cn!r}\n"
     if "Language" not in existing:
