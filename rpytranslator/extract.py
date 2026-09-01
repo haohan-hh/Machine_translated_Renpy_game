@@ -36,6 +36,21 @@ NON_WHO_KEYWORDS = {
     "hbar", "frame", "window", "fixed", "hbox", "vbox", "grid", "viewport",
     "use", "key", "input", "style_prefix", "size_group", "properties",
     "tile", "side", "scrollbar", "vscrollbar", "slider", "vslider", "label",
+    # style 属性（`color "#000"`、`thumb "gui/..."`、`scrollbars "vertical"`、
+    # `layout "subtitle"`、`background "gui/..."` 等是样式配置，不是对话）
+    "color", "layout", "thumb", "base_bar", "background", "foreground",
+    "xalign", "yalign", "xanchor", "yanchor", "xpos", "ypos", "xoffset",
+    "yoffset", "xsize", "ysize", "xpadding", "ypadding", "xmargin", "ymargin",
+    "spacing", "padding", "xfill", "yfill", "xmaximum", "ymaximum",
+    "xminimum", "yminimum", "text_align", "textalign", "size", "font",
+    "italic", "bold", "underline", "kerning", "line_spacing", "first_indent",
+    "rest_indent", "xzoom", "yzoom", "rotate", "alpha", "blend", "time",
+    "xcenter", "ycenter", "offset", "area", "hover_foreground",
+    "idle_foreground", "hover_background", "idle_background",
+    "selected_hover_background", "selected_idle_background",
+    "insensitive_background", "bar_vertical", "bar_invert", "unscrollable",
+    "thumb_offset", "left_gutter", "right_gutter", "top_gutter",
+    "bottom_gutter", "xscrollbar", "yscrollbar", "guiprop", "guivar",
 }
 
 
@@ -346,7 +361,9 @@ class RpyExtractor:
             line=line_no, source_line=source_line, **kw,
         )
         unit.identifier = self._unique_id(unit.identifier)
-        if unit.what:
+        # 对话同样过滤纯数字/颜色/资源路径等技术性内容（如旁白 `"#000"`），
+        # 避免把代码数据当文本送去翻译并在未翻译报告中制造噪音。
+        if unit.what and self._is_translatable_text(unit.what):
             self.dialogues.append(unit)
 
     @staticmethod
@@ -364,6 +381,12 @@ class RpyExtractor:
         if re.fullmatch(r"\d+(?:\.\d+)*", v):        # 版本号 / 数字
             return False
         if re.fullmatch(r"#[0-9a-fA-F]{3,8}", v):    # 颜色
+            return False
+        # 资源引用：图片 / 字体 / 音频 / 脚本路径（如 gui/...png、DejaVuSans.ttf）
+        if re.search(
+                r"(?i)(?:^|[/\\])[^/\\\"]*"
+                r"\.(?:png|jpe?g|webp|bmp|gif|ogg|wav|mp3|flac|opus|ttf|otf"
+                r"|woff|woff2|rpy|rpyc|webm|mp4|txt|json|json5)$", v):
             return False
         if "{#" in v:                                 # {#...} 翻译器特殊注释
             return False
@@ -664,6 +687,13 @@ class RpyExtractor:
         explicit_id = None
         arguments = None
         whats = [what]
+
+        # 字典键等代码形式：`"key" : value` / `'key' : value` → 不是 say
+        j = i
+        while j < n and s[j] in " \t":
+            j += 1
+        if j < n and s[j] == ":":
+            return None
 
         # 解析尾部标记
         while i < n:

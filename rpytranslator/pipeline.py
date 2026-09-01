@@ -513,6 +513,17 @@ def run_pipeline(
     unchanged = len(unchanged_d) + len(unchanged_s)
     result.skipped_count = unchanged
 
+    # 若整个汉化过程没有任何翻译错误（无 HTTP/连接/格式/占位符校验失败），
+    # 剩余“译文 == 原文”的文本是模型有意保持原文（专有名词、技术标识符、
+    # 键盘键名、`_()` 标记但无需翻译的内容等），视为已处理，不再生成报告。
+    if unchanged and not client.error_count and not client.error_messages:
+        log(f"无任何翻译错误，{unchanged} 条文本为模型保持原文"
+            f"（专有名词/技术标识符等），视为已处理")
+        unchanged_d = []
+        unchanged_s = []
+        unchanged = 0
+        result.skipped_count = 0
+
     report = out_dir.parent / f"{language}.未翻译报告.txt"
     if unchanged:
         try:
