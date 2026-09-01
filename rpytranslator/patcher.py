@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import ast
 import os
 import re
 import shutil
@@ -562,22 +563,60 @@ def apply_language_ui(game_dir: Path, language: str = "schinese") -> PatchResult
     return res
 
 
+_LANG_DISPLAY_FILE = "zz_language_display.rpy"
+
+
+def _existing_old_strings(tl_dir: Path) -> set[str]:
+    """收集 tl 目录中已生成翻译文件的全部字符串翻译 old（还原为原文本）。
+
+    用于避免语言显示名文件与翻译文件重复定义同一字符串——Ren'Py 的字符串
+    翻译全局唯一，同语言下 `old "Language"` 只能出现一次，否则运行时报
+    "A translation for ... already exists"。
+    """
+    olds: set[str] = set()
+    if not tl_dir.is_dir():
+        return olds
+    for f in tl_dir.glob("*.rpy"):
+        if f.name == _LANG_DISPLAY_FILE:
+            continue
+        try:
+            text = f.read_text(encoding="utf-8-sig", errors="ignore")
+        except OSError:
+            continue
+        for m in re.finditer(r"^\s*old\s+(.+?)\s*$", text, re.M):
+            val = m.group(1).strip()
+            try:
+                olds.add(ast.literal_eval(val))
+            except Exception:
+                olds.add(val)
+    return olds
+
+
 def ensure_language_name(game_dir: Path, language: str) -> PatchResult | None:
-    """生成 tl/<语言>/languages.rpy，让设置里语言显示为中文名。"""
+    """生成 tl/<语言>/zz_language_display.rpy，让设置里语言显示为中文名。
+
+    仅补充「翻译文件未覆盖」的语言名/界面字符串：若源文件中已出现
+    "Language"（Ren'Py 模板的偏好设置里普遍存在），翻译流程会生成
+    `old "Language"`，此处必须跳过，避免字符串翻译重复定义冲突。
+    """
     tl_dir = game_dir / "tl" / language
     if not tl_dir.is_dir():
         return None
     res = PatchResult()
-    f = tl_dir / "languages.rpy"
+    # 用 zz_ 前缀的独立文件名，避免与源文件 languages.rpy 生成的翻译文件同名覆盖
+    f = tl_dir / _LANG_DISPLAY_FILE
     names = _LANGUAGE_DISPLAY.get(language.lower())
     if names is None:
         cn, english = language, ("English",)
     else:
         cn, english = names
+    existing = _existing_old_strings(tl_dir)
     body = f"# 语言显示名（汉化工具自动生成）\ntranslate {language} strings:\n"
     for en in english:
-        body += f"    old {en!r}\n    new {cn!r}\n"
-    body += '    old "Language"\n    new "语言"\n'
+        if en not in existing:
+            body += f"    old {en!r}\n    new {cn!r}\n"
+    if "Language" not in existing:
+        body += '    old "Language"\n    new "语言"\n'
     # 已存在且内容相同 → 跳过
     if f.is_file():
         try:
@@ -596,7 +635,7 @@ def ensure_language_name(game_dir: Path, language: str) -> PatchResult | None:
         return res
     res.files.append(f)
     res.ok = True
-    res.message = f"已设置语言显示名（tl/{language}/languages.rpy）"
+    res.message = f"已设置语言显示名（tl/{language}/{_LANG_DISPLAY_FILE}）"
     return res
 
 

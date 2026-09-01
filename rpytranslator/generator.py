@@ -103,7 +103,11 @@ def build_file_script(
             )
     if strings:
         body: list[str] = []
+        seen: set[str] = set()
         for s in strings:
+            if s.text in seen:
+                continue
+            seen.add(s.text)
             tr = string_translations.get(s.text)
             if tr is None:
                 continue
@@ -148,9 +152,19 @@ def write_translation_files(
 
     grouped = group_by_source_file(dialogues, strings)
     written: list[Path] = []
+    # Ren'Py 的字符串翻译全局唯一：同一字符串（如界面文本 "Language"）出现在
+    # 多个源文件（screens.rpy、languages.rpy）时，只能在一个 tl 文件中定义一次，
+    # 否则运行时报 "A translation for ... already exists"。
+    # 按文件排序顺序，把字符串分配给第一个出现的文件，其余文件跳过。
+    seen_strings: set[str] = set()
     for idx, (src, (ds, ss)) in enumerate(sorted(grouped.items()), 1):
+        ss_dedup: list[StringUnit] = []
+        for s in ss:
+            if s.text not in seen_strings:
+                seen_strings.add(s.text)
+                ss_dedup.append(s)
         script = build_file_script(
-            ds, ss, language, dialogue_translations, string_translations,
+            ds, ss_dedup, language, dialogue_translations, string_translations,
             game_dir=game_dir, updated_at=updated_at,
         )
         if not script:
