@@ -535,7 +535,9 @@ class RpyExtractor:
         if m:
             value, _ = _parse_string_literal(stripped, m.end())
             if value is not None and self._is_translatable_plain_string(value):
-                self._add_string(value, line_no, context="define")
+                # xxxVars.name = '...' 通常是角色名，与 Character 名称一样保留原文
+                ctx = "character" if re.search(r"\w+Vars\.name\s*=", stripped) else "define"
+                self._add_string(value, line_no, context=ctx)
         for cm in _CHARACTER_RE.finditer(stripped):
             sm = _STRING_START.search(stripped, cm.end())
             if sm:

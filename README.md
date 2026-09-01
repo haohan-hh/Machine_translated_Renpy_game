@@ -4,8 +4,10 @@
 
 ## 功能特性
 
-- **自动识别**：解析 Ren'Py 游戏目录，读取 `.rpy` / `.rpyc` 脚本并提取全部对白文本
-- **AI 翻译**：支持任意 OpenAI 兼容接口（OpenAI / DeepSeek / Kimi / 通义千问 / 智谱 GLM / Ollama 本地等），批量翻译、智能重试
+- **自动识别**：解析 Ren'Py 游戏目录，读取 `.rpy` / `.rpyc` 脚本并提取全部对白文本（同文件同时存在 `.rpy` 与 `.rpyc` 时按 Ren'Py 优先级只处理 `.rpy`，避免重复翻译块）
+- **完整覆盖**：按源文件相对路径生成翻译文件（保留子目录结构，`days/route_aelfric/day_6.rpy` 与 `days/route_ulrich/day_6.rpy` 不会互相覆盖）；同文本重复出现也全部写入译文
+- **角色名保留**：角色名（`Character("...")`、`xxxVars.name = "..."`）自动保留原文不翻译；AI 提示词要求人名、角色名一律不译
+- **AI 翻译**：支持任意 OpenAI 兼容接口（OpenAI / DeepSeek / Kimi / 通义千问 / 智谱 GLM / Ollama 本地等），批量翻译、智能重试，失败回退原文并生成「未翻译报告.txt」定位遗漏
 - **一键补丁**：自动生成 `game/tl/<语言>/` 汉化补丁目录，可直接放入游戏生效
 - **中文适配**：可选自动配置中文字体、注入语言切换界面
 - **现代化界面**：WinUI 3 (Fluent Design) 界面，支持拖放选择游戏目录、Mica 磨砂背景
@@ -71,7 +73,8 @@ rpytranslator/
   engine.py                # Ren'Py 游戏扫描与文本提取
   translator.py            # OpenAI 兼容翻译客户端
   pipeline.py              # 汉化流程编排
-  postprocessor.py         # 字体与语言界面注入
+  patcher.py               # 字体与语言界面注入
+  generator.py             # 翻译文件生成
   gui_main.py              # WinUI 3 图形界面
 ```
 

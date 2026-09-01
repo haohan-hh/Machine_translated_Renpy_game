@@ -50,18 +50,38 @@ class PipelineResult:
 
 
 def _dedupe_by_text(units) -> tuple[list, dict[str, list[int]]]:
-    """按文本去重，返回 (去重后单元列表, {文本: 原索引列表})。"""
+    """按文本去重，返回 (去重后单元列表, {文本: 原列表索引列表})。"""
     seen: dict[str, int] = {}
     unique: list = []
     groups: dict[str, list[int]] = {}
-    for u in units:
+    for i, u in enumerate(units):
         key = u.what if isinstance(u, DialogueUnit) else u.text
         if key not in seen:
             seen[key] = len(unique)
             groups[key] = []
             unique.append(u)
-        groups[key].append(seen[key])
+        groups[key].append(i)
     return unique, groups
+
+
+def _norm_filename(filename: str, game_dir) -> str:
+    """把源文件路径规范化为相对 game 目录的 posix 路径。
+
+    统一 .rpy 提取（绝对路径）、.rpyc 反编译（临时目录路径）的表示，
+    保证按源文件分组时，不同子目录的同名文件（days/route_aelfric/day_6.rpy
+    与 days/route_ulrich/day_6.rpy）不会混淆，生成的 tl 文件也不会互相覆盖。
+    """
+    p = Path(filename)
+    try:
+        return p.relative_to(game_dir).as_posix()
+    except (ValueError, TypeError):
+        pass
+    # 含 game/ 前缀的绝对路径
+    parts = p.parts
+    if "game" in parts:
+        return Path(*parts[parts.index("game") + 1:]).as_posix()
+    # 反编译临时文件等：无法定位时退回文件名
+    return p.name
 
 
 def run_pipeline(
@@ -109,24 +129,55 @@ def run_pipeline(
 
     if info.rpy_files:
         r = extract_rpy_files(info.rpy_files)
+        for d in r.dialogues:
+            d.filename = _norm_filename(d.filename, info.game_dir)
+        for s in r.strings:
+            s.filename = _norm_filename(s.filename, info.game_dir)
         dialogues.extend(r.dialogues)
         strings.extend(r.strings)
         skipped.extend(r.skipped)
 
-    # 3. 反编译 .rpyc
+    # 3. 反编译 .rpyc（仅处理没有对应 .rpy 的源文件，与 Ren'Py 加载优先级一致，
+    #    避免同一文件被 .rpy 和 .rpyc 双份提取导致重复 translate 块）
     tmp_dir = None
-    decompiled: list[Path] = []
     if info.rpyc_files:
-        log(f"发现 {len(info.rpyc_files)} 个 .rpyc 文件，正在反编译…")
-        tmp_dir, mapping = decompile_rpyc_files(info.rpyc_files, info.game_dir)
-        if mapping:
-            decompiled = list(mapping.values())
-            r = extract_rpy_files(decompiled)
-            dialogues.extend(r.dialogues)
-            strings.extend(r.strings)
-            skipped.extend(r.skipped)
+        rpy_rel = {_norm_filename(str(p), info.game_dir) for p in info.rpy_files}
+        need_rpyc = [
+            p for p in info.rpyc_files
+            if _norm_filename(str(p), info.game_dir).replace(".rpymc", ".rpy").replace(".rpyc", ".rpy")
+               not in rpy_rel
+        ]
+        if need_rpyc:
+            log(f"发现 {len(need_rpyc)} 个 .rpyc 文件（无对应 .rpy），正在反编译…")
+            tmp_dir, mapping = decompile_rpyc_files(need_rpyc, info.game_dir)
+            if mapping:
+                # 反编译文件的路径映射回原始相对路径，保证与 .rpy 提取一致
+                src_by_decomp = {str(v): k for k, v in mapping.items()}
+                decompiled = list(mapping.values())
+                r = extract_rpy_files(decompiled)
+                for d in r.dialogues:
+                    orig = src_by_decomp.get(d.filename)
+                    d.filename = (_norm_filename(str(orig), info.game_dir)
+                                  .replace(".rpymc", ".rpy").replace(".rpyc", ".rpy")
+                                  if orig else d.filename)
+                for s in r.strings:
+                    orig = src_by_decomp.get(s.filename)
+                    s.filename = (_norm_filename(str(orig), info.game_dir)
+                                  .replace(".rpymc", ".rpy").replace(".rpyc", ".rpy")
+                                  if orig else s.filename)
+                dialogues.extend(r.dialogues)
+                strings.extend(r.strings)
+                skipped.extend(r.skipped)
 
-    # 4. 按文本去重（省 API 调用）
+    # 4. 角色名（Character("名字") 的首个字符串参数）保留原文，
+    #    不参与 AI 翻译、不生成翻译条目，Ren'Py 自然显示原文。
+    kept_names = [u for u in strings if u.context == "character"]
+    strings = [u for u in strings if u.context != "character"]
+    if kept_names:
+        log(f"角色名 {len(kept_names)} 个将保留原文（不翻译）："
+            + "、".join(sorted({u.text for u in kept_names})[:20]))
+
+    # 5. 按文本去重（省 API 调用）
     uniq_d, d_groups = _dedupe_by_text(dialogues)
     uniq_s, s_groups = _dedupe_by_text(strings)
 
@@ -141,7 +192,7 @@ def run_pipeline(
         result.ok = False
         return result
 
-    # 5. 翻译
+    # 6. 翻译
     if client is None:
         client = TranslationClient(config or TranslationConfig())
     target = _guess_language_name(language)
@@ -177,19 +228,27 @@ def run_pipeline(
         log(f"错误详情（{len(client.error_messages)} 类）："
             + " | ".join(client.error_messages[:5]))
 
-    # 6. 组装译文映射
+    # 7. 组装译文映射：同一文本的所有出现（identifier 不同）共享同一译文，
+    #    避免按文本去重后重复出现的对话拿不到译文而被跳过。
     dialogue_translations: dict[str, str] = {}
     for u, tr in zip(uniq_d, d_trans):
-        dialogue_translations[u.identifier] = tr
+        for idx in d_groups.get(u.what, ()):
+            dialogue_translations[dialogues[idx].identifier] = tr
     string_translations: dict[str, str] = {}
     for u, tr in zip(uniq_s, s_trans):
-        string_translations[u.text] = tr
+        for idx in s_groups.get(u.text, ()):
+            string_translations[strings[idx].text] = tr
 
-    result.translated_count = len(dialogue_translations) + len(string_translations)
+    result.translated_count = len(dialogues) + len(strings)
 
-    # 7. 生成文件
+    # 8. 生成文件
     log("正在生成翻译文件…")
     out_dir = info.game_dir / "tl" / language
+    # 清理上次生成的 tl 目录，避免旧的平铺同名文件与新生成的子目录结构
+    # 同时存在（同一 translate id 定义两次）。
+    if out_dir.is_dir():
+        import shutil as _shutil
+        _shutil.rmtree(out_dir, ignore_errors=True)
     written = write_translation_files(
         dialogues, strings, language,
         dialogue_translations, string_translations,
@@ -206,7 +265,7 @@ def run_pipeline(
         result.ok = False
         return result
 
-    # 8. 汉化后处理：中文字体 + 语言切换界面
+    # 9. 汉化后处理：中文字体 + 语言切换界面
     if apply_font_patch or apply_language_ui:
         log("正在执行汉化后处理（中文字体 / 语言切换界面）…")
         result.post_patches = apply_all(
@@ -223,13 +282,33 @@ def run_pipeline(
             else:
                 log(f"  ✓ {pr.message}")
 
-    # 9. 统计
+    # 10. 统计与未翻译报告
     elapsed = time.time() - t0
-    unchanged = sum(
-        1 for u, tr in zip(uniq_d, d_trans) if tr == u.what)
-    unchanged += sum(
-        1 for u, tr in zip(uniq_s, s_trans) if tr == u.text)
+    unchanged_d = [
+        d for d in dialogues if dialogue_translations.get(d.identifier) == d.what]
+    unchanged_s = [
+        s for s in strings if string_translations.get(s.text) == s.text]
+    unchanged = len(unchanged_d) + len(unchanged_s)
     result.skipped_count = unchanged
+
+    if unchanged:
+        report = out_dir.parent / f"{language}.未翻译报告.txt"
+        try:
+            with open(report, "w", encoding="utf-8-sig") as f:
+                f.write("以下文本未能翻译（回退为原文），请检查翻译服务或手动补充：\n\n")
+                f.write("== 对话 ==" if unchanged_d else "")
+                for d in unchanged_d:
+                    f.write(f"\n{d.filename}:{d.line}  {d.what}")
+                f.write("\n\n== 字符串 ==" if unchanged_s else "")
+                for s in unchanged_s:
+                    f.write(f"\n{s.filename}:{s.line}  {s.text}")
+            log(f"未翻译 {unchanged} 条（回退原文），详情见: {report}")
+        except OSError:
+            log(f"未翻译 {unchanged} 条（回退原文）")
+        for d in unchanged_d[:10]:
+            log(f"  未翻译对话: {d.filename}:{d.line} {d.what[:50]}")
+        for s in unchanged_s[:10]:
+            log(f"  未翻译字符串: {s.filename}:{s.line} {s.text[:50]}")
 
     result.ok = True
     lines = [

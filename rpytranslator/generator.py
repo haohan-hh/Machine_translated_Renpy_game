@@ -35,18 +35,25 @@ def _stamp() -> str:
 
 
 def _rel_path(filename: str, game_dir: Path) -> str:
-    """把源文件路径转成相对 game 目录的注释路径（script.rpy，不带 game/ 前缀）。"""
+    """把源文件路径转成相对 game 目录的 posix 路径。
+
+    兼容三种输入：
+    - 绝对路径（D:/Wild Harmonies/game/days/day_6.rpy）
+    - 含 game/ 前缀的路径
+    - 已是相对 game 目录的路径（days/route_ulrich/day_6.rpy，反编译/规范化后）
+    """
     p = Path(filename)
-    try:
-        return p.relative_to(game_dir).as_posix()
-    except ValueError:
-        pass
-    # 若传入路径已含 game/，去掉
-    parts = p.parts
-    if "game" in parts:
-        idx = parts.index("game")
-        return Path(*parts[idx + 1:]).as_posix()
-    return p.name
+    if p.is_absolute():
+        try:
+            return p.relative_to(game_dir).as_posix()
+        except ValueError:
+            pass
+        parts = p.parts
+        if "game" in parts:
+            idx = parts.index("game")
+            return Path(*parts[idx + 1:]).as_posix()
+        return p.name
+    return p.as_posix()
 
 
 def _dialogue_body(unit: DialogueUnit, translated: str) -> str:
@@ -148,8 +155,12 @@ def write_translation_files(
         )
         if not script:
             continue
-        # 目标文件名与源文件名一致（保留扩展名）
-        out_file = out_dir / (Path(src).name)
+        # 目标路径与源文件相对 game 目录的结构一致（保留子目录），
+        # 避免 days/route_aelfric/day_6.rpy 与 days/route_ulrich/day_6.rpy
+        # 等不同目录的同名文件互相覆盖。
+        rel = _rel_path(src, game_dir) if game_dir else Path(src).name
+        out_file = out_dir / rel
+        out_file.parent.mkdir(parents=True, exist_ok=True)
         out_file.write_text(script, encoding="utf-8-sig")
         written.append(out_file)
         if progress_cb:
