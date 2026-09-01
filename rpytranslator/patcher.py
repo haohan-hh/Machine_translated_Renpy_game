@@ -6,6 +6,11 @@
    - 解析字体文件 cmap 表，检测游戏自带字体是否含汉字字形
    - 没有则从系统复制中文字体（Windows 黑体/雅黑等）到 game/fonts/
    - 生成 game/zz_cn_font.rpy：用 FontGroup 让中文走中文字体、英文保留原字体
+   - 关键经验（Wild Harmonies 实测）：仅设置 style.default.font 无法覆盖界面
+     字体——Ren'Py 界面字体来自 gui.*_font 变量（screens.rpy 通过
+     gui.text_properties() 取字体），必须同时覆盖 gui 字体变量 + default +
+     全部命名样式；且中文字体必须是静态字体（可变字体在 SDL_ttf 下
+     字形支持不完整，会导致部分汉字仍为方框）
 
 2. 语言切换界面注入（解决设置里没有语言选项）
    - 检测游戏的 preferences 屏幕是否已含语言按钮
@@ -199,17 +204,64 @@ def find_original_default_font(game_dir: Path) -> str:
 
 
 def _build_font_patch(cjk_font_rel: str, original_font: str) -> str:
+    """生成 zz_cn_font.rpy。
+
+    实测总结（Wild Harmonies 项目验证）：
+    - 仅设置 style.default.font 不够：Ren'Py 界面字体大多来自
+      gui.text_font / gui.interface_text_font 等变量（screens.rpy 通过
+      gui.text_properties() 取字体），显式指定了字体的样式不会继承 default。
+    - 因此必须同时覆盖：① gui.*_font 全部字体变量 ② style.default.font
+      ③ 遍历所有命名样式统一替换为 FontGroup。
+    - gui 不是 Python 模块，不能 import gui，直接在 init python 块中访问即可。
+    - Ren'Py 8 的样式字典在 renpy.game.style.styles。
+    - 中文必须用静态字体：可变字体（*Variable*.ttf）在 Ren'Py/SDL_ttf 下
+      字形支持不完整，会导致部分汉字仍是方框。
+    """
     esc = cjk_font_rel.replace("\\", "/")
+    warn_var = (
+        "\n# 注意：当前中文字体可能是可变字体（Variable Font），Ren'Py 对其支持不完整，\n"
+        "# 若仍有部分汉字显示为方框，请将中文字体换成静态字体（如 SourceHanSansSC / NotoSansSC 静态版）。\n"
+        if "variable" in cjk_font_rel.lower() else ""
+    )
     return (
         "# -*- coding: utf-8 -*-\n"
         "# 中文字体补丁（汉化工具自动生成）：解决中文显示为方框。\n"
         f"# 中文字体: {cjk_font_rel}\n"
+        "# 说明：Ren'Py 界面字体大多来自 gui.*_font 变量与命名样式，仅设置\n"
+        "#       style.default.font 无法覆盖它们，因此这里同时覆盖三者。\n"
+        f"{warn_var}"
         "init 999 python:\n"
-        "    style.default.font = FontGroup()\n"
-        f"        .add(\"{esc}\", 0x2E80, 0x9FFF)   # CJK 部首/标点/统一表意文字\n"
-        f"        .add(\"{esc}\", 0xF900, 0xFAFF)   # CJK 兼容表意文字\n"
-        f"        .add(\"{esc}\", 0xFF00, 0xFFEF)   # 全角符号（中文引号等）\n"
-        f"        .add(\"{original_font}\", 0x0000, 0x2E7F)  # 拉丁等（保留原观感）\n"
+        "    def _zh_cn_font():\n"
+        "        fg = FontGroup()\n"
+        f"        fg.add(\"{esc}\", 0x2E80, 0x9FFF)   # CJK 部首/标点/统一表意文字\n"
+        f"        fg.add(\"{esc}\", 0xF900, 0xFAFF)   # CJK 兼容表意文字\n"
+        f"        fg.add(\"{esc}\", 0xFF00, 0xFFEF)   # 全角符号（中文引号等）\n"
+        f"        fg.add(\"{original_font}\", 0x0000, 0x2E7F)  # 拉丁等（保留原观感）\n"
+        "        return fg\n"
+        "\n"
+        "    _zh_fg = _zh_cn_font()\n"
+        "\n"
+        "    # 1) 覆盖 gui 命名空间中的字体变量（screens.rpy 大量样式通过 gui.text_properties 取字体）\n"
+        "    for _k in (\"text_font\", \"name_text_font\", \"interface_text_font\",\n"
+        "               \"aboutpage_text_font\", \"curse_text_font\", \"button_text_font\",\n"
+        "               \"choice_button_text_font\", \"savemenu_button_text_font\",\n"
+        "               \"startbutton_text_font\"):\n"
+        "        if hasattr(gui, _k):\n"
+        "            setattr(gui, _k, _zh_fg)\n"
+        "\n"
+        "    # 2) 默认样式兜底\n"
+        "    style.default.font = _zh_fg\n"
+        "\n"
+        "    # 3) 其余命名样式兜底（显式指定 Peignot/Vollkorn 等拉丁字体的按钮、菜单）\n"
+        "    try:\n"
+        "        _zh_styles = renpy.game.style.styles\n"
+        "    except Exception:\n"
+        "        _zh_styles = {}\n"
+        "    for _n, _s in _zh_styles.items():\n"
+        "        try:\n"
+        "            _s.font = _zh_fg\n"
+        "        except Exception:\n"
+        "            pass\n"
     )
 
 
@@ -522,10 +574,10 @@ def ensure_language_name(game_dir: Path, language: str) -> PatchResult | None:
         cn, english = language, ("English",)
     else:
         cn, english = names
-    body = f"# 语言显示名（汉化工具自动生成）\ntranslate {language} python:\n"
+    body = f"# 语言显示名（汉化工具自动生成）\ntranslate {language} strings:\n"
     for en in english:
-        body += f"    _({en!r}) = {cn!r}\n"
-    body += '    _("Language") = "语言"\n'
+        body += f"    old {en!r}\n    new {cn!r}\n"
+    body += '    old "Language"\n    new "语言"\n'
     # 已存在且内容相同 → 跳过
     if f.is_file():
         try:

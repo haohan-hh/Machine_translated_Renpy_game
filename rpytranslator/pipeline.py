@@ -155,18 +155,27 @@ def run_pipeline(
         if progress_cb:
             progress_cb("PROGRESS|%d" % pct)
 
+    def report_error(msg: str) -> None:
+        if progress_cb:
+            progress_cb("ERR|" + msg)
+
     d_trans = client.translate_texts(
         [u.what for u in uniq_d], target=target,
-        progress_cb=report_progress, offset=0, total=total)
+        progress_cb=report_progress, offset=0, total=total,
+        error_cb=report_error)
     s_trans = client.translate_texts(
         [u.text for u in uniq_s], target=target,
-        progress_cb=report_progress, offset=len(uniq_d), total=total)
+        progress_cb=report_progress, offset=len(uniq_d), total=total,
+        error_cb=report_error)
     if progress_cb:
         progress_cb("PROGRESS|100")
 
     log(f"API 请求统计：共发出 {client.request_count} 次请求，"
         f"失败 {client.error_count} 次"
         + ("（0 次请求 = 未调用任何 API）" if client.request_count == 0 else ""))
+    if client.error_messages:
+        log(f"错误详情（{len(client.error_messages)} 类）："
+            + " | ".join(client.error_messages[:5]))
 
     # 6. 组装译文映射
     dialogue_translations: dict[str, str] = {}

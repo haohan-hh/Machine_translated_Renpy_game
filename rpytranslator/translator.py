@@ -130,6 +130,7 @@ class TranslationClient:
         self.config = config
         self.request_count = 0       # 实际发出的 API 请求次数
         self.error_count = 0         # 失败的请求次数
+        self.error_messages: list[str] = []  # 去重后的错误详情
 
     # -- 底层请求 ----------------------------------------------------------
 
@@ -139,7 +140,15 @@ class TranslationClient:
             return url
         return url + "/chat/completions"
 
-    def chat(self, messages: list[dict]) -> str:
+    def _record_error(self, msg: str, error_cb=None) -> None:
+        """记录去重的错误消息；首次出现时通过 error_cb 实时上报。"""
+        if msg in self.error_messages:
+            return
+        self.error_messages.append(msg)
+        if error_cb:
+            error_cb(msg)
+
+    def chat(self, messages: list[dict], error_cb=None) -> str:
         """发起一次对话请求，返回 assistant 的文本内容。"""
         self.request_count += 1
         body = {
@@ -164,14 +173,15 @@ class TranslationClient:
                 detail = e.read().decode("utf-8", errors="replace")[:300]
             except Exception:
                 pass
-            raise TranslationError(
-                f"HTTP {e.code} 请求失败: {e.reason}{(' - ' + detail) if detail else ''}"
-            ) from None
+            msg = (f"HTTP {e.code} 请求失败: {e.reason}"
+                   f"{(' - ' + detail) if detail else ''}")
+            self._record_error(msg, error_cb)
+            raise TranslationError(msg) from None
         except urllib.error.URLError as e:
             self.error_count += 1
-            raise TranslationError(
-                f"无法连接翻译服务（{self.config.base_url}）: {e.reason}"
-            ) from None
+            msg = f"无法连接翻译服务（{self.config.base_url}）: {e.reason}"
+            self._record_error(msg, error_cb)
+            raise TranslationError(msg) from None
         try:
             return payload["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as e:
@@ -182,10 +192,12 @@ class TranslationClient:
     def translate_texts(
         self, texts: list[str], target: str = DEFAULT_TARGET,
         progress_cb=None, offset: int = 0, total: int | None = None,
+        error_cb=None,
     ) -> list[str]:
         """批量翻译文本，返回与输入等长的译文列表（失败项回退原文）。
 
         progress_cb(done, total) 在每完成一个批次时回调，用于实时进度显示。
+        error_cb(msg) 在每次请求失败时回调（去重），用于实时错误提示。
         """
         results: list[str] = list(texts)
         indices = [i for i, t in enumerate(texts) if t.strip()]
@@ -199,7 +211,7 @@ class TranslationClient:
         translated: list[str] = []
         done = 0
         for chunk in chunks:
-            translated.extend(self._translate_chunk(chunk, target))
+            translated.extend(self._translate_chunk(chunk, target, error_cb))
             done += len(chunk)
             if progress_cb:
                 progress_cb(offset + done, total)
@@ -224,7 +236,8 @@ class TranslationClient:
             chunks.append(cur)
         return chunks
 
-    def _translate_chunk(self, texts: list[str], target: str) -> list[str]:
+    def _translate_chunk(self, texts: list[str], target: str,
+                         error_cb=None) -> list[str]:
         """翻译一个批次：保护 → JSON 批译 → 校验还原 → 失败重试。"""
         protected = [protect_text(t) for t in texts]
         payload = [p for p, _ in protected]
@@ -233,7 +246,7 @@ class TranslationClient:
         last_err: Exception | None = None
         for attempt in range(self.config.max_retries):
             try:
-                raw = self._request_json_array(payload, target)
+                raw = self._request_json_array(payload, target, error_cb)
                 if len(raw) != len(payload):
                     raise TranslationError(
                         f"返回条目数不符（期望 {len(payload)}，实际 {len(raw)}）")
@@ -247,15 +260,18 @@ class TranslationClient:
                 return out
             except TranslationError as e:
                 last_err = e
+                self._record_error(str(e), error_cb)
             except Exception as e:  # JSON 解析等
                 last_err = e
+                self._record_error(str(e), error_cb)
             if attempt < self.config.max_retries - 1:
                 time.sleep(1.5 * (attempt + 1))
 
         # 批译失败：降级为逐条翻译（每条独立请求）
-        return [self._translate_single(t, target) for t in texts]
+        return [self._translate_single(t, target, error_cb) for t in texts]
 
-    def _request_json_array(self, payload: list[str], target: str) -> list[str]:
+    def _request_json_array(self, payload: list[str], target: str,
+                            error_cb=None) -> list[str]:
         system = _SYSTEM_PROMPT.format(
             target=target, ph=_PH_PREFIX + "0" + _PH_PREFIX)
         user = json.dumps(payload, ensure_ascii=False)
@@ -263,7 +279,7 @@ class TranslationClient:
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
-        resp = self.chat(messages)
+        resp = self.chat(messages, error_cb)
         return self._parse_json_array(resp)
 
     @staticmethod
@@ -283,7 +299,7 @@ class TranslationClient:
 
     # -- 单条翻译 ----------------------------------------------------------
 
-    def _translate_single(self, text: str, target: str) -> str:
+    def _translate_single(self, text: str, target: str, error_cb=None) -> str:
         ptext, ph = protect_text(text)
         if not ptext.strip():
             return text
@@ -294,7 +310,7 @@ class TranslationClient:
                 resp = self.chat([
                     {"role": "system", "content": system},
                     {"role": "user", "content": ptext},
-                ]).strip()
+                ], error_cb).strip()
                 # 模型可能返回带引号的字符串
                 if len(resp) >= 2 and resp[0] == '"' and resp[-1] == '"':
                     try:
@@ -304,10 +320,10 @@ class TranslationClient:
                 restored = restore_text(resp, ph)
                 if _placeholders_preserved(ph, restored):
                     return restored
-            except TranslationError:
-                pass
-            except Exception:
-                pass
+            except TranslationError as e:
+                self._record_error(str(e), error_cb)
+            except Exception as e:
+                self._record_error(str(e), error_cb)
             if attempt < self.config.max_retries - 1:
                 time.sleep(1.5 * (attempt + 1))
         return text  # 回退原文

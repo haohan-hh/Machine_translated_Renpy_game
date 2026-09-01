@@ -10,6 +10,7 @@ import json
 import os
 import queue
 import threading
+import time
 from pathlib import Path
 
 from win32more.winui3 import XamlApplication, XamlLoader
@@ -24,7 +25,7 @@ from win32more import asyncui
 
 from . import engine
 from .pipeline import run_pipeline
-from .translator import TranslationConfig
+from .translator import TranslationClient, TranslationConfig
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -125,12 +126,14 @@ XAML = r'''
                         <TextBlock Text="API Key" FontSize="12" Opacity="0.6"/>
                         <PasswordBox x:Name="ApiKeyBox" PlaceholderText="sk-…"/>
                     </StackPanel>
-                    <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+                    <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="12">
                         <StackPanel Spacing="4">
                             <TextBlock Text="模型" FontSize="12" Opacity="0.6"/>
                             <TextBox x:Name="ModelBox" PlaceholderText="gpt-4o-mini"/>
                         </StackPanel>
-                        <Button Grid.Column="1" x:Name="SaveBtn" Content="保存设置"
+                        <Button Grid.Column="1" x:Name="TestBtn" Content="测试连接"
+                                Click="OnTestConnection" VerticalAlignment="Bottom"/>
+                        <Button Grid.Column="2" x:Name="SaveBtn" Content="保存设置"
                                 Click="OnSaveSettings" VerticalAlignment="Bottom"/>
                     </Grid>
                 </StackPanel>
@@ -214,6 +217,7 @@ class GuiApp(XamlApplication):
         self._timer: DispatcherTimer | None = None
         self._log_lines = 0
         self._last_result: str | None = None
+        self._test_mode = False
 
     # -- 生命周期 ----------------------------------------------------------
 
@@ -249,8 +253,6 @@ class GuiApp(XamlApplication):
 
             def on_tick(sender, e):
                 self._poll_queue()
-                if not self._busy():
-                    timer.Stop()
 
             timer.add_Tick(on_tick)
             timer.Start()
@@ -440,6 +442,8 @@ class GuiApp(XamlApplication):
 
     def OnStart(self, sender, e) -> None:
         if self._busy():
+            self._append_log("上一个任务仍在运行，请等待其完成后再试", "err")
+            self.StatusText.Text = "忙：等待上一任务完成"
             return
         if not self.game_dir:
             self._append_log("请先选择游戏目录", "err")
@@ -453,6 +457,9 @@ class GuiApp(XamlApplication):
             self._msgbox("请填写完整的 API 地址、API Key 与模型名称。", "配置不完整")
             return
         lang = LANGUAGES[self.LangBox.SelectedIndex].split("（")[0]
+        font = self.FontSwitch.IsOn
+        lang_ui = self.LangUiSwitch.IsOn
+        game_dir = self.game_dir
 
         config = TranslationConfig(
             base_url=url,
@@ -461,32 +468,146 @@ class GuiApp(XamlApplication):
         )
         self._save_settings()
 
+        self._test_mode = False
         self.worker = threading.Thread(
             target=self._run_translation,
-            args=(config,),
+            args=(config, lang, game_dir, font, lang_ui),
             daemon=True,
         )
         self.worker.start()
+        self._ensure_timer()
         self._set_busy(True)
         self.ProgressText.Text = "准备中…"
         self.StatusText.Text = "正在翻译…"
         self._append_log("开始汉化: %s → %s" % (self.game_dir, lang), "info")
         self._append_log("目标语言: %s | 模型: %s" % (lang, model), "info")
 
-    def _run_translation(self, config: TranslationConfig) -> None:
-        lang = LANGUAGES[self.LangBox.SelectedIndex].split("（")[0]
+    # -- 事件：测试连接 ----------------------------------------------------
+
+    def OnTestConnection(self, sender, e) -> None:
+        """向 AI 服务商发一个最小请求，验证地址 / Key / 模型是否可用。"""
+        if self._busy():
+            self._append_log("上一个任务仍在运行，请等待其完成后再试", "err")
+            self.StatusText.Text = "忙：等待上一任务完成"
+            return
+        url = self.ApiUrlBox.Text.strip()
+        key = self.ApiKeyBox.Password.strip()
+        model = self.ModelBox.Text.strip()
+        if not url or not key or not model:
+            self._append_log("请填写完整的 API 地址 / Key / 模型", "err")
+            return
+        self._test_mode = True
+        self.worker = threading.Thread(
+            target=self._run_test_connection,
+            args=(TranslationConfig(base_url=url, api_key=key, model=model),),
+            daemon=True,
+        )
+        self.worker.start()
+        self._ensure_timer()
+        self._set_busy(True)
+        self.ProgressText.Text = "测试中…"
+        self.StatusText.Text = "正在测试连接（DNS→TCP→HTTP）…"
+        self._append_log("正在测试连接: %s（模型 %s）…" % (url, model), "info")
+
+    def _run_test_connection(self, config: TranslationConfig) -> None:
+        """分步测试连接：DNS 解析 → TCP 连接 → HTTP 请求，任一步失败立即反馈。
+
+        说明：urlopen 的 timeout 无法限制 DNS 解析耗时，因此 DNS 解析放在
+        独立守护线程中运行，用 join(timeout) 兜底，避免无限等待。
+        """
+        import socket
+        from urllib.parse import urlparse
+
+        try:
+            u = urlparse(config.base_url)
+            if u.scheme not in ("http", "https") or not u.hostname:
+                self.msg_q.put("TEST_ERR|API 地址格式无效: %s" % config.base_url)
+                return
+            host = u.hostname
+            port = u.port or (443 if u.scheme == "https" else 80)
+
+            # 1) DNS 解析（getaddrinfo 无法设超时 → 线程 + join 兜底）
+            resolved: list = []
+
+            def _resolve() -> None:
+                try:
+                    resolved.append(
+                        socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM))
+                except Exception as e:  # noqa: BLE001
+                    resolved.append(e)
+
+            rt = threading.Thread(target=_resolve, daemon=True)
+            rt.start()
+            rt.join(timeout=15)
+            if not resolved:
+                self.msg_q.put(
+                    "TEST_ERR|DNS 解析超时（>15 秒）: %s\n请检查网络连接，或确认该地址在当前网络环境可访问。"
+                    % host)
+                return
+            if isinstance(resolved[0], Exception):
+                self.msg_q.put("TEST_ERR|DNS 解析失败: %s" % resolved[0])
+                return
+
+            # 2) TCP 连接（直连，不走 HTTP 代理）
+            family, stype, proto, _, sockaddr = resolved[0][0]
+            sock = socket.socket(family, stype, proto)
+            sock.settimeout(15)
+            try:
+                sock.connect(sockaddr)
+            except Exception as e:  # noqa: BLE001
+                self.msg_q.put(
+                    "TEST_ERR|TCP 连接失败: %s:%s - %s\n"
+                    "可能原因：网络不通、端口被墙/封锁、或需要代理。"
+                    % (host, port, e))
+                return
+            finally:
+                sock.close()
+
+            # 3) HTTP 请求（含鉴权，验证地址 / Key / 模型）
+            test_cfg = TranslationConfig(
+                base_url=config.base_url,
+                api_key=config.api_key,
+                model=config.model,
+                timeout=30,
+                max_retries=1,
+            )
+            client = TranslationClient(test_cfg)
+            t0 = time.time()
+            resp = client.chat([{"role": "user", "content": "你好"}]).strip()
+            elapsed = int((time.time() - t0) * 1000)
+            snippet = (resp or "")[:60]
+            self.msg_q.put("TEST_OK|连接成功（%d ms）：%s" % (elapsed, snippet))
+        except Exception as exc:
+            self.msg_q.put("TEST_ERR|%s" % exc)
+        finally:
+            self.msg_q.put("__done__")
+
+    def _run_translation(
+        self,
+        config: TranslationConfig,
+        lang: str,
+        game_dir: str,
+        font: bool,
+        lang_ui: bool,
+    ) -> None:
         try:
             result = run_pipeline(
-                game_path=self.game_dir or "",
+                game_path=game_dir or "",
                 config=config,
                 language=lang,
                 progress_cb=lambda text: self.msg_q.put(text),
-                apply_font_patch=self.FontSwitch.IsOn,
-                apply_language_ui=self.LangUiSwitch.IsOn,
+                apply_font_patch=font,
+                apply_language_ui=lang_ui,
             )
             self.msg_q.put("RESULT|%s" % result.message)
         except Exception as exc:
+            import traceback
             self.msg_q.put("ERR|%s" % exc)
+            try:
+                with open("_gui_worker_err.txt", "a", encoding="utf-8") as f:
+                    traceback.print_exc(file=f)
+            except Exception:
+                pass
         finally:
             self.msg_q.put("__done__")
 
@@ -495,12 +616,33 @@ class GuiApp(XamlApplication):
     def _busy(self) -> bool:
         return bool(self.worker and self.worker.is_alive())
 
+    def _ensure_timer(self) -> None:
+        """确保 UI 轮询定时器正在运行（每次启动后台任务时调用）。
+
+        DispatcherTimer 空闲时会被 on_tick 停掉以节省资源；
+        若不在此重新 Start，队列中的消息将永远不会被 UI 消费，
+        界面会卡在“准备中 / 测试中”不刷新。
+        """
+        try:
+            if self._timer is not None:
+                self._timer.Start()
+        except Exception as exc:
+            self._append_log("定时器重启失败: %s" % exc, "err")
+
     def _poll_queue(self) -> None:
         try:
             while True:
                 msg = self.msg_q.get_nowait()
                 if msg == "__done__":
                     self._on_done()
+                    continue
+                if msg.startswith("TEST_OK|"):
+                    self._append_log(msg[8:], "ok")
+                    self.StatusText.Text = "连接成功"
+                    continue
+                if msg.startswith("TEST_ERR|"):
+                    self._append_log(msg[9:], "err")
+                    self.StatusText.Text = "连接失败"
                     continue
                 if msg.startswith("RESULT|"):
                     self._last_result = msg[7:]
@@ -528,6 +670,11 @@ class GuiApp(XamlApplication):
     def _on_done(self) -> None:
         self.worker = None
         self._set_busy(False)
+        if self._test_mode:
+            self._test_mode = False
+            self.ProgressText.Text = "就绪"
+            self.Progress.Value = 0
+            return
         if getattr(self, "_last_result", None):
             self._append_log(self._last_result, "ok")
             self._last_result = None
@@ -536,6 +683,7 @@ class GuiApp(XamlApplication):
 
     def _set_busy(self, busy: bool) -> None:
         self.StartBtn.IsEnabled = not busy
+        self.TestBtn.IsEnabled = not busy
         self.BrowseBtn.IsEnabled = not busy
         self.SaveBtn.IsEnabled = not busy
         self.Progress.IsIndeterminate = busy

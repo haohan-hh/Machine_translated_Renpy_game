@@ -79,6 +79,8 @@ def _launch_cli(args) -> int:
     def _progress(m: str) -> None:
         if m.startswith("PROGRESS|"):
             print("  进度: %s%%" % m.split("|")[1])
+        elif m.startswith("ERR|"):
+            print("  [错误] %s" % m[4:])
         else:
             print("  ", m)
 
