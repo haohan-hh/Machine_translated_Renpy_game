@@ -136,6 +136,12 @@ XAML = r'''
                         <Button Grid.Column="2" x:Name="SaveBtn" Content="保存设置"
                                 Click="OnSaveSettings" VerticalAlignment="Bottom"/>
                     </Grid>
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="保留原文（人名/专有名词，逗号分隔；Character 定义的人名已自动保留）"
+                                   FontSize="12" Opacity="0.6"/>
+                        <TextBox x:Name="KeepTermsBox"
+                                 PlaceholderText="例如: Alex, Eileen, 大图书馆"/>
+                    </StackPanel>
                 </StackPanel>
             </Border>
 
@@ -297,6 +303,7 @@ class GuiApp(XamlApplication):
             self.LangBox.SelectedIndex = 0
         self.FontSwitch.IsOn = bool(data.get("font", True))
         self.LangUiSwitch.IsOn = bool(data.get("lang_ui", True))
+        self.KeepTermsBox.Text = data.get("keep_terms", "")
         self._append_log("已加载配置%s" % ("" if data else "（无）"), "info")
 
     def _save_settings(self) -> None:
@@ -308,6 +315,7 @@ class GuiApp(XamlApplication):
             "model": self.ModelBox.Text,
             "font": self.FontSwitch.IsOn,
             "lang_ui": self.LangUiSwitch.IsOn,
+            "keep_terms": self.KeepTermsBox.Text,
         }
         try:
             _CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2),
@@ -460,6 +468,10 @@ class GuiApp(XamlApplication):
         font = self.FontSwitch.IsOn
         lang_ui = self.LangUiSwitch.IsOn
         game_dir = self.game_dir
+        keep_terms = [
+            t.strip() for t in self.KeepTermsBox.Text.replace("，", ",").split(",")
+            if t.strip()
+        ]
 
         config = TranslationConfig(
             base_url=url,
@@ -471,7 +483,7 @@ class GuiApp(XamlApplication):
         self._test_mode = False
         self.worker = threading.Thread(
             target=self._run_translation,
-            args=(config, lang, game_dir, font, lang_ui),
+            args=(config, lang, game_dir, font, lang_ui, keep_terms),
             daemon=True,
         )
         self.worker.start()
@@ -589,6 +601,7 @@ class GuiApp(XamlApplication):
         game_dir: str,
         font: bool,
         lang_ui: bool,
+        keep_terms: list[str] | None = None,
     ) -> None:
         try:
             result = run_pipeline(
@@ -598,6 +611,7 @@ class GuiApp(XamlApplication):
                 progress_cb=lambda text: self.msg_q.put(text),
                 apply_font_patch=font,
                 apply_language_ui=lang_ui,
+                extra_terms=keep_terms,
             )
             self.msg_q.put("RESULT|%s" % result.message)
         except Exception as exc:

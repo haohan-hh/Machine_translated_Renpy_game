@@ -92,6 +92,7 @@ def run_pipeline(
     progress_cb=None,
     apply_font_patch: bool = True,
     apply_language_ui: bool = True,
+    extra_terms: list[str] | None = None,
 ) -> PipelineResult:
     """执行完整汉化流程，返回结果统计。"""
     def log(msg: str):
@@ -177,6 +178,21 @@ def run_pipeline(
         log(f"角色名 {len(kept_names)} 个将保留原文（不翻译）："
             + "、".join(sorted({u.text for u in kept_names})[:20]))
 
+    # 4.1 人名保护名单：Character 名 / xxxVars.name + 用户额外指定的专有名词。
+    #     这些词在翻译前整体替换为占位符，翻译后还原，杜绝被 AI 翻译。
+    protect_terms: list[str] = []
+    for u in kept_names:
+        t = (u.text or "").strip()
+        if t and len(t) >= 2 and t not in protect_terms:
+            protect_terms.append(t)
+    for t in (extra_terms or []):
+        t = t.strip()
+        if t and t not in protect_terms:
+            protect_terms.append(t)
+    if protect_terms:
+        log(f"已保护 {len(protect_terms)} 个人名/专有名词不被翻译："
+            + "、".join(protect_terms[:20]))
+
     # 5. 按文本去重（省 API 调用）
     uniq_d, d_groups = _dedupe_by_text(dialogues)
     uniq_s, s_groups = _dedupe_by_text(strings)
@@ -211,11 +227,11 @@ def run_pipeline(
             progress_cb("ERR|" + msg)
 
     d_trans = client.translate_texts(
-        [u.what for u in uniq_d], target=target,
+        [u.what for u in uniq_d], target=target, names=protect_terms,
         progress_cb=report_progress, offset=0, total=total,
         error_cb=report_error)
     s_trans = client.translate_texts(
-        [u.text for u in uniq_s], target=target,
+        [u.text for u in uniq_s], target=target, names=protect_terms,
         progress_cb=report_progress, offset=len(uniq_d), total=total,
         error_cb=report_error)
     if progress_cb:

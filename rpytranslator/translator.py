@@ -20,6 +20,9 @@ from dataclasses import dataclass, field
 
 _PH_PREFIX = "\ue000"          # Private Use Area 字符，正常文本几乎不会出现
 _PH_RE = re.compile("\ue000(\\d+)\ue000")
+# 人名/专有名词保护占位符（独立前缀，避免与标签占位符索引冲突）
+_NAMES_PREFIX = "\ue001"
+_NAMES_RE = re.compile("\ue001(\\d+)\ue001")
 
 # Ren'Py 文本标签 {color=#fff} / {b} / {size=+2} 等（不嵌套）
 _TAG_RE = re.compile(r"\{[^{}]*\}")
@@ -73,6 +76,39 @@ def _placeholders_preserved(placeholders: list[str], restored: str) -> bool:
     return all(ph in restored for ph in placeholders)
 
 
+def protect_names(text: str, names: list[str]) -> tuple[str, list[str]]:
+    """把名单中的人名/专有名词整体替换为占位符，防止被 AI 翻译。
+
+    返回 (保护后文本, 占位符列表)。长名优先匹配，避免短名先匹配长名的一部分。
+    """
+    if not names:
+        return text, []
+    placeholders: list[str] = []
+
+    def repl(m: re.Match) -> str:
+        i = len(placeholders)
+        placeholders.append(m.group(0))
+        return f"{_NAMES_PREFIX}{i}{_NAMES_PREFIX}"
+
+    for n in sorted(names, key=len, reverse=True):
+        if not n:
+            continue
+        # 前后不能是字母/数字/下划线/中文，保证整词匹配（Alex 不影响 Alexandra）
+        pat = r"(?<![\w\u4e00-\u9fff])" + re.escape(n) + r"(?![\w\u4e00-\u9fff])"
+        text = re.sub(pat, repl, text)
+    return text, placeholders
+
+
+def restore_names(text: str, placeholders: list[str]) -> str:
+    """把人名占位符还原为原始名字。"""
+    def repl(m: re.Match) -> str:
+        idx = int(m.group(1))
+        if 0 <= idx < len(placeholders):
+            return placeholders[idx]
+        return m.group(0)
+    return _NAMES_RE.sub(repl, text)
+
+
 def check_braces(text: str) -> bool:
     """检查 { } 是否配对（Ren'Py 要求成对，{{ 表示字面 {）。"""
     # 去掉转义对
@@ -88,7 +124,7 @@ _SYSTEM_PROMPT = (
     "你是一位专业的游戏本地化翻译。你的任务是把 Ren'Py 游戏文本翻译成{target}。\n"
     "严格要求：\n"
     "1. 逐条翻译，不遗漏、不合并、不自由发挥。\n"
-    "2. 翻译结果中必须原样保留所有形如 \"{ph}\" 的占位符序列（它们代表游戏内标签/变量/换行），不得删除、修改或移动。\n"
+    "2. 翻译结果中必须原样保留所有形如 \"{ph}\" 的占位符序列（它们代表游戏内标签/变量/换行/人名/专有名词），不得删除、修改或移动。\n"
     "3. 保留原有的换行结构。\n"
     "4. 所有人物名称、角色名、人名一律保留原文，绝不翻译成中文（例如 Eileen 保持 Eileen，Mako 保持 Mako）。\n"
     "5. 地名、组织名等专有名词尽量保留原文，若确需翻译应使用通用译名。\n"
@@ -100,7 +136,7 @@ _SINGLE_SYSTEM_PROMPT = (
     "你是一位专业的游戏本地化翻译。把下面的 Ren'Py 游戏文本翻译成{target}。\n"
     "严格要求：\n"
     "1. 只输出翻译结果，不要输出解释。\n"
-    "2. 原样保留所有形如 \"{ph}\" 的占位符序列（游戏内标签/变量/换行）。\n"
+    "2. 原样保留所有形如 \"{ph}\" 的占位符序列（游戏内标签/变量/换行/人名）。\n"
     "3. 所有人物名称、角色名、人名一律保留原文，绝不翻译成中文。\n"
     "4. 语气自然，符合角色口吻。"
 )
@@ -193,10 +229,11 @@ class TranslationClient:
     def translate_texts(
         self, texts: list[str], target: str = DEFAULT_TARGET,
         progress_cb=None, offset: int = 0, total: int | None = None,
-        error_cb=None,
+        error_cb=None, names: list[str] | None = None,
     ) -> list[str]:
         """批量翻译文本，返回与输入等长的译文列表（失败项回退原文）。
 
+        names: 需整体保留原文的人名/专有名词列表（翻译前保护为占位符）。
         progress_cb(done, total) 在每完成一个批次时回调，用于实时进度显示。
         error_cb(msg) 在每次请求失败时回调（去重），用于实时错误提示。
         """
@@ -212,7 +249,7 @@ class TranslationClient:
         translated: list[str] = []
         done = 0
         for chunk in chunks:
-            translated.extend(self._translate_chunk(chunk, target, error_cb))
+            translated.extend(self._translate_chunk(chunk, target, error_cb, names))
             done += len(chunk)
             if progress_cb:
                 progress_cb(offset + done, total)
@@ -238,11 +275,14 @@ class TranslationClient:
         return chunks
 
     def _translate_chunk(self, texts: list[str], target: str,
-                         error_cb=None) -> list[str]:
-        """翻译一个批次：保护 → JSON 批译 → 校验还原 → 失败重试。"""
-        protected = [protect_text(t) for t in texts]
+                         error_cb=None, names: list[str] | None = None) -> list[str]:
+        """翻译一个批次：人名保护 → 标签保护 → JSON 批译 → 校验还原 → 失败重试。"""
+        names = names or []
+        named = [protect_names(t, names) for t in texts]
+        protected = [protect_text(nt) for nt, _ in named]
         payload = [p for p, _ in protected]
         ph_list = [ph for _, ph in protected]
+        name_ph_list = [nph for _, nph in named]
 
         last_err: Exception | None = None
         for attempt in range(self.config.max_retries):
@@ -252,11 +292,15 @@ class TranslationClient:
                     raise TranslationError(
                         f"返回条目数不符（期望 {len(payload)}，实际 {len(raw)}）")
                 out: list[str] = []
-                for i, (ptext, ph) in enumerate(zip(payload, ph_list)):
+                for i, (ptext, ph, nph) in enumerate(zip(payload, ph_list, name_ph_list)):
                     restored = restore_text(raw[i], ph)
+                    restored = restore_names(restored, nph)
                     if not _placeholders_preserved(ph, restored):
                         raise TranslationError(
                             f"第 {i + 1} 条占位符丢失，原始文本: {texts[i][:60]!r}")
+                    if not _placeholders_preserved(nph, restored):
+                        raise TranslationError(
+                            f"第 {i + 1} 条人名被改动，原始文本: {texts[i][:60]!r}")
                     out.append(restored)
                 return out
             except TranslationError as e:
@@ -269,7 +313,7 @@ class TranslationClient:
                 time.sleep(1.5 * (attempt + 1))
 
         # 批译失败：降级为逐条翻译（每条独立请求）
-        return [self._translate_single(t, target, error_cb) for t in texts]
+        return [self._translate_single(t, target, error_cb, names) for t in texts]
 
     def _request_json_array(self, payload: list[str], target: str,
                             error_cb=None) -> list[str]:
@@ -300,8 +344,10 @@ class TranslationClient:
 
     # -- 单条翻译 ----------------------------------------------------------
 
-    def _translate_single(self, text: str, target: str, error_cb=None) -> str:
-        ptext, ph = protect_text(text)
+    def _translate_single(self, text: str, target: str, error_cb=None,
+                          names: list[str] | None = None) -> str:
+        ntext, nph = protect_names(text, names or [])
+        ptext, ph = protect_text(ntext)
         if not ptext.strip():
             return text
         system = _SINGLE_SYSTEM_PROMPT.format(
@@ -319,7 +365,8 @@ class TranslationClient:
                     except Exception:
                         pass
                 restored = restore_text(resp, ph)
-                if _placeholders_preserved(ph, restored):
+                restored = restore_names(restored, nph)
+                if _placeholders_preserved(ph, restored) and _placeholders_preserved(nph, restored):
                     return restored
             except TranslationError as e:
                 self._record_error(str(e), error_cb)

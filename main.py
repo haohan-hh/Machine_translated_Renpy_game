@@ -11,6 +11,7 @@ CLI 选项:
     --api-key   API Key
     --model     模型名（默认 gpt-4o-mini）
     --lang      目标语言标识（默认 schinese）
+    --keep-terms  额外保留原文的专有名词（人名等），逗号分隔
     --no-font-patch  跳过自动配置中文字体
     --no-lang-ui     跳过注入语言切换界面
 """
@@ -34,6 +35,8 @@ def main(argv=None) -> int:
     parser.add_argument("--model", default="gpt-4o-mini", help="模型名")
     parser.add_argument("--lang", default="schinese",
                         help="目标语言（schinese / tchinese / zh_cn …）")
+    parser.add_argument("--keep-terms", default="",
+                        help="额外保留原文的专有名词（人名等），逗号分隔")
     parser.add_argument("--no-font-patch", action="store_true",
                         help="跳过自动配置中文字体")
     parser.add_argument("--no-lang-ui", action="store_true",
@@ -84,10 +87,15 @@ def _launch_cli(args) -> int:
         else:
             print("  ", m)
 
+    extra_terms = [
+        t.strip() for t in args.keep_terms.replace("，", ",").split(",")
+        if t.strip()
+    ]
     result = run_pipeline(game, config=cfg, language=args.lang,
                           progress_cb=_progress,
                           apply_font_patch=not args.no_font_patch,
-                          apply_language_ui=not args.no_lang_ui)
+                          apply_language_ui=not args.no_lang_ui,
+                          extra_terms=extra_terms or None)
     print("\n" + "=" * 50)
     print(result.message)
     if not result.ok:
