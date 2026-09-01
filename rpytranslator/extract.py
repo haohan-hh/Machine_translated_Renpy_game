@@ -308,6 +308,9 @@ _TRANSLATE = "translate"
 
 # 屏幕文本控件：text / textbutton / label 后紧跟字符串字面量
 _SCREEN_TEXT_RE = re.compile(r'^(text|textbutton|label)\s+(["\'])')
+# screen 内属性文本：tooltip / alt / text / title 等（如 imagebutton 的 tooltip "Save"）
+_SCREEN_PROP_RE = re.compile(
+    r'\b(?:tooltip|alt|text|title|subtitle)\s+(["\'])', re.I)
 # define/default 中的 Character 调用
 _CHARACTER_RE = re.compile(r'\b\w*Character\s*\(')
 
@@ -437,6 +440,11 @@ class RpyExtractor:
             sm = _SCREEN_TEXT_RE.match(stripped)
             if sm:
                 value, _ = _parse_string_literal(stripped, sm.start(2))
+                if value is not None:
+                    self._add_string(value, ll.line, context="screen")
+            # 同时提取 screen 内属性文本：tooltip / alt / text / title 等
+            for pm in _SCREEN_PROP_RE.finditer(stripped):
+                value, _ = _parse_string_literal(stripped, pm.start(1))
                 if value is not None:
                     self._add_string(value, ll.line, context="screen")
             return

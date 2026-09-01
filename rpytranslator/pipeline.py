@@ -138,18 +138,28 @@ def run_pipeline(
         strings.extend(r.strings)
         skipped.extend(r.skipped)
 
-    # 3. 反编译 .rpyc（仅处理没有对应 .rpy 的源文件，与 Ren'Py 加载优先级一致，
-    #    避免同一文件被 .rpy 和 .rpyc 双份提取导致重复 translate 块）
+    # 3. 反编译 .rpyc：Ren'Py 运行时优先加载 .rpyc，所以生成翻译文件时
+    #    也以 .rpyc 为准。同名的 .rpy 会被跳过，避免 .rpy/.rpyc 内容不一致
+    #    导致翻译 identifier 不匹配而翻译不生效。
     tmp_dir = None
     if info.rpyc_files:
-        rpy_rel = {_norm_filename(str(p), info.game_dir) for p in info.rpy_files}
-        need_rpyc = [
-            p for p in info.rpyc_files
-            if _norm_filename(str(p), info.game_dir).replace(".rpymc", ".rpy").replace(".rpyc", ".rpy")
-               not in rpy_rel
+        rpy_rel = {_norm_filename(str(p), info.game_dir): p for p in info.rpy_files}
+        rpyc_rel = {_norm_filename(str(p), info.game_dir): p for p in info.rpyc_files}
+        need_rpyc: list[Path] = []
+        rpy_to_skip: set[str] = set()
+        for rel, rpyc in rpyc_rel.items():
+            need_rpyc.append(rpyc)
+            rpy_equiv = rel.replace(".rpymc", ".rpy").replace(".rpyc", ".rpy")
+            if rpy_equiv in rpy_rel:
+                rpy_to_skip.add(rpy_equiv)
+        # 只保留没有对应 .rpyc 的 .rpy
+        info.rpy_files = [
+            p for p in info.rpy_files
+            if _norm_filename(str(p), info.game_dir) not in rpy_to_skip
         ]
         if need_rpyc:
-            log(f"发现 {len(need_rpyc)} 个 .rpyc 文件（无对应 .rpy），正在反编译…")
+            log(f"发现 {len(need_rpyc)} 个 .rpyc 文件"
+                f"（其中 {len(rpy_to_skip)} 个优先于同名 .rpy），正在反编译…")
             tmp_dir, mapping = decompile_rpyc_files(need_rpyc, info.game_dir)
             if mapping:
                 # 反编译文件的路径映射回原始相对路径，保证与 .rpy 提取一致
