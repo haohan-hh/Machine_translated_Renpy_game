@@ -15,6 +15,7 @@ from .extract import (
     DialogueUnit, ExtractionResult, extract_rpy_file, extract_rpy_files,
 )
 from .generator import write_translation_files
+from .housekeeping import dedupe_translate_blocks, remove_stale_rpyc
 from .patcher import PatchResult, apply_all
 from .rpyc_loader import cleanup, decompile_rpyc_files
 from .translator import TranslationClient, TranslationConfig
@@ -49,6 +50,8 @@ class PipelineResult:
     output_files: list[Path] = field(default_factory=list)
     output_dir: Path | None = None
     post_patches: list[PatchResult] = field(default_factory=list)
+    removed_rpyc: int = 0
+    removed_dup_blocks: int = 0
     message: str = ""
     errors: list[str] = field(default_factory=list)
 
@@ -88,8 +91,15 @@ def _norm_filename(filename: str, game_dir) -> str:
     return p.name
 
 
+# Ren'Py 编译 translate 块时插入的位置标记（unrpyc 反编译后残留），
+# 如 `balto "@@p0@@p这样自我介绍可能不是最好的方式。"`。游戏运行时无害，
+# 但会污染译文、干扰增量匹配，解析已有 tl 时统一剥离。
+_ART_PAT = re.compile(r"@@p\d+@@p")
+
+
 def _decode_say(raw: str) -> str:
-    """反向还原 encode_say_string：\\n→换行、\\"→"、\\ →空格、\\\\→\\。"""
+    """反向还原 encode_say_string：\\n→换行、\\"→"、\\ →空格、\\\\→\\，
+    并剥离 @@pN@@p 编译残留标记。"""
     out: list[str] = []
     i, n = 0, len(raw)
     while i < n:
@@ -108,7 +118,7 @@ def _decode_say(raw: str) -> str:
         else:
             out.append(c)
             i += 1
-    return "".join(out)
+    return _ART_PAT.sub("", "".join(out))
 
 
 def _parse_untran_report(path: Path) -> list[str]:
@@ -236,7 +246,13 @@ def run_pipeline(
             (l for l in info.languages if engine.is_chinese_language(l)),
             info.languages[0],
         )
-        result.message = f"游戏已自带中文翻译（tl/{zh}），无需汉化"
+        # 中文翻译已存在：仍清理一次过期的 .rpyc 缓存，让现有翻译立即生效
+        # （游戏显示英文原文的常见根因——Ren'Py 优先加载不含翻译的旧 .rpyc）。
+        removed_rpyc = remove_stale_rpyc(info.game_dir)
+        extra = (f"；已删除 {removed_rpyc} 个过期 .rpyc 缓存，"
+                 f"下次启动游戏将自动重新编译" if removed_rpyc else "")
+        result.message = f"游戏已自带中文翻译（tl/{zh}），无需汉化{extra}"
+        result.removed_rpyc = removed_rpyc
         result.ok = True
         return result
 
@@ -258,14 +274,34 @@ def run_pipeline(
             except OSError:
                 pass
 
-    # 2.1 提取
+    # 2.0 前置：确定 .rpyc 优先的文件清单。
+    #     Ren'Py 运行时优先加载 .rpyc，翻译以 .rpyc 反编译内容为准；
+    #     有对应 .rpyc 的 .rpy 不再提取，避免同一文件双份提取（.rpy +
+    #     .rpyc 反编译）导致 tl 中同一 translate identifier 重复定义两次，
+    #     Ren'Py 编译 tl 时报错并使该文件翻译全部失效。
+    need_rpyc: list[Path] = []
+    rpy_to_skip: set[str] = set()
+    if info.rpyc_files:
+        rpy_rel = {_norm_filename(str(p), info.game_dir): p for p in info.rpy_files}
+        rpyc_rel = {_norm_filename(str(p), info.game_dir): p for p in info.rpyc_files}
+        for rel, rpyc in rpyc_rel.items():
+            need_rpyc.append(rpyc)
+            rpy_equiv = rel.replace(".rpymc", ".rpy").replace(".rpyc", ".rpy")
+            if rpy_equiv in rpy_rel:
+                rpy_to_skip.add(rpy_equiv)
+
+    # 2.1 提取（只提取没有对应 .rpyc 的 .rpy）
     log("正在提取游戏文本…")
     dialogues: list[DialogueUnit] = []
     strings: list = []
     skipped: list[str] = []
 
-    if info.rpy_files:
-        r = extract_rpy_files(info.rpy_files)
+    rpy_to_extract = [
+        p for p in info.rpy_files
+        if _norm_filename(str(p), info.game_dir) not in rpy_to_skip
+    ]
+    if rpy_to_extract:
+        r = extract_rpy_files(rpy_to_extract)
         for d in r.dialogues:
             d.filename = _norm_filename(d.filename, info.game_dir)
         for s in r.strings:
@@ -274,47 +310,44 @@ def run_pipeline(
         strings.extend(r.strings)
         skipped.extend(r.skipped)
 
-    # 3. 反编译 .rpyc：Ren'Py 运行时优先加载 .rpyc，所以生成翻译文件时
-    #    也以 .rpyc 为准。同名的 .rpy 会被跳过，避免 .rpy/.rpyc 内容不一致
-    #    导致翻译 identifier 不匹配而翻译不生效。
+    # 3. 反编译 .rpyc（无对应 .rpy 的 .rpyc 在这里提取）
     tmp_dir = None
-    if info.rpyc_files:
-        rpy_rel = {_norm_filename(str(p), info.game_dir): p for p in info.rpy_files}
-        rpyc_rel = {_norm_filename(str(p), info.game_dir): p for p in info.rpyc_files}
-        need_rpyc: list[Path] = []
-        rpy_to_skip: set[str] = set()
-        for rel, rpyc in rpyc_rel.items():
-            need_rpyc.append(rpyc)
-            rpy_equiv = rel.replace(".rpymc", ".rpy").replace(".rpyc", ".rpy")
-            if rpy_equiv in rpy_rel:
-                rpy_to_skip.add(rpy_equiv)
-        # 只保留没有对应 .rpyc 的 .rpy
-        info.rpy_files = [
-            p for p in info.rpy_files
-            if _norm_filename(str(p), info.game_dir) not in rpy_to_skip
-        ]
-        if need_rpyc:
-            log(f"发现 {len(need_rpyc)} 个 .rpyc 文件"
-                f"（其中 {len(rpy_to_skip)} 个优先于同名 .rpy），正在反编译…")
-            tmp_dir, mapping = decompile_rpyc_files(need_rpyc, info.game_dir)
-            if mapping:
-                # 反编译文件的路径映射回原始相对路径，保证与 .rpy 提取一致
-                src_by_decomp = {str(v): k for k, v in mapping.items()}
-                decompiled = list(mapping.values())
-                r = extract_rpy_files(decompiled)
-                for d in r.dialogues:
-                    orig = src_by_decomp.get(d.filename)
-                    d.filename = (_norm_filename(str(orig), info.game_dir)
-                                  .replace(".rpymc", ".rpy").replace(".rpyc", ".rpy")
-                                  if orig else d.filename)
-                for s in r.strings:
-                    orig = src_by_decomp.get(s.filename)
-                    s.filename = (_norm_filename(str(orig), info.game_dir)
-                                  .replace(".rpymc", ".rpy").replace(".rpyc", ".rpy")
-                                  if orig else s.filename)
-                dialogues.extend(r.dialogues)
-                strings.extend(r.strings)
-                skipped.extend(r.skipped)
+    if need_rpyc:
+        log(f"发现 {len(need_rpyc)} 个 .rpyc 文件"
+            f"（其中 {len(rpy_to_skip)} 个优先于同名 .rpy），正在反编译…")
+        tmp_dir, mapping = decompile_rpyc_files(need_rpyc, info.game_dir)
+        if mapping:
+            # 反编译文件的路径映射回原始相对路径，保证与 .rpy 提取一致
+            src_by_decomp = {str(v): k for k, v in mapping.items()}
+            decompiled = list(mapping.values())
+            r = extract_rpy_files(decompiled)
+            for d in r.dialogues:
+                orig = src_by_decomp.get(d.filename)
+                d.filename = (_norm_filename(str(orig), info.game_dir)
+                              .replace(".rpymc", ".rpy").replace(".rpyc", ".rpy")
+                              if orig else d.filename)
+            for s in r.strings:
+                orig = src_by_decomp.get(s.filename)
+                s.filename = (_norm_filename(str(orig), info.game_dir)
+                              .replace(".rpymc", ".rpy").replace(".rpyc", ".rpy")
+                              if orig else s.filename)
+            dialogues.extend(r.dialogues)
+            strings.extend(r.strings)
+            skipped.extend(r.skipped)
+
+    # 3.1 全局 identifier 去重（防御）：跨提取批次（.rpy 与 .rpyc 反编译）
+    #     可能产生相同 identifier，同一 identifier 只保留首次出现的单元，
+    #     确保生成的 tl 中每个 translate identifier 唯一。
+    seen_ids: set[str] = set()
+    dedup_d: list[DialogueUnit] = []
+    for d in dialogues:
+        if d.identifier in seen_ids:
+            continue
+        seen_ids.add(d.identifier)
+        dedup_d.append(d)
+    if len(dedup_d) != len(dialogues):
+        log(f"检测到 {len(dialogues) - len(dedup_d)} 个重复 identifier，已去重")
+    dialogues = dedup_d
 
     # 4. 角色名（Character("名字") 的首个字符串参数）保留原文，
     #    不参与 AI 翻译、不生成翻译条目，Ren'Py 自然显示原文。
@@ -452,6 +485,24 @@ def run_pipeline(
         info.game_dir / "tl" / language, language)
     dialogue_translations: dict[str, str] = dict(existing_d)
     string_translations: dict[str, str] = dict(existing_s)
+    # 增量兼容（identifier 前缀修正）：命名 menu 是 Ren'Py 的隐式 label，
+    # 早期提取器不处理它，导致旧 tl 中 menu 作用域对话的 identifier 前缀缺失
+    # （如 day_1_xxx 而非 day1_balto_intro_feeling_xxx）。翻译 ID 的摘要段
+    # （md5 前 8 位）只由文本内容决定、与 label 无关，因此完整 identifier
+    # 匹配不到时，按摘要段兜底复用已有译文，避免修正前缀后旧翻译丢失、
+    # 游戏重新显示英文原文。
+    digest_map: dict[str, str] = {}
+    for _ident, _tr in existing_d.items():
+        _seg = _ident.split("_")[-1]
+        if re.fullmatch(r"[0-9a-f]{8}", _seg):
+            digest_map.setdefault(_seg, _tr)
+    if digest_map:
+        for _d in dialogues:
+            if _d.identifier in dialogue_translations:
+                continue
+            _tr = digest_map.get(_d.identifier.split("_")[-1])
+            if _tr is not None:
+                dialogue_translations[_d.identifier] = _tr
     for u in todo_d:
         tr = d_by_text[u.what]
         for idx in d_groups.get(u.what, ()):
@@ -480,6 +531,12 @@ def run_pipeline(
     result.output_files = written
     result.output_dir = out_dir
 
+    # 8.1 防御性清理：即使旧版平铺 tl 文件与新目录结构并存（历史上曾导致
+    #     同一 translate identifier 定义两次），也保证生成结果无重复块。
+    result.removed_dup_blocks = dedupe_translate_blocks(out_dir)
+    if result.removed_dup_blocks:
+        log(f"已清理翻译文件中 {result.removed_dup_blocks} 个重复 translate 块")
+
     cleanup(tmp_dir)
 
     if not written:
@@ -503,6 +560,15 @@ def run_pipeline(
                 log(f"  - {pr.message}")
             else:
                 log(f"  ✓ {pr.message}")
+
+    # 9.1 清理过期的 .rpyc：Ren'Py 运行时优先加载 .rpyc，旧缓存里没有本次
+    #     生成的翻译（identifier 不匹配），会导致游戏仍显示英文原文。
+    #     删除“有对应 .rpy 源文件”的缓存后，Ren'Py 下次启动会从源文件 +
+    #     tl/ 翻译文件重新编译，保证翻译生效。
+    result.removed_rpyc = remove_stale_rpyc(info.game_dir)
+    if result.removed_rpyc:
+        log(f"已删除 {result.removed_rpyc} 个过期编译缓存（.rpyc），"
+            f"Ren'Py 下次启动将自动重新编译")
 
     # 10. 统计与未翻译报告
     elapsed = time.time() - t0
@@ -567,6 +633,11 @@ def run_pipeline(
             lines.append("· " + pr.message)
         elif not pr.ok:
             lines.append("· 警告: " + pr.message)
+    if result.removed_rpyc:
+        lines.append(f"· 已删除 {result.removed_rpyc} 个过期 .rpyc 缓存，"
+                     f"下次启动游戏将自动重新编译，翻译即可生效")
+    if result.removed_dup_blocks:
+        lines.append(f"· 已清理 {result.removed_dup_blocks} 个重复翻译块")
     if result.post_patches and any(pr.ok and pr.detail for pr in result.post_patches):
         details = "；".join(pr.detail for pr in result.post_patches if pr.detail)
         if details:

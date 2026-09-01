@@ -18,3 +18,7 @@ build_log.txt
 
 # 测试残留
 _unittest_results.txt
+_tmp_*.py
+
+# 本地汉化备份（不入库）
+schinese_old_backup/

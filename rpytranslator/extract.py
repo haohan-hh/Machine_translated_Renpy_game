@@ -514,6 +514,7 @@ class RpyExtractor:
             self._stack.append(_Ctx(_TRANSLATE, indent))
             return
         if keyword == "menu":
+            self._handle_menu(stripped)
             self._stack.append(_Ctx(_MENU, indent))
             return
         if keyword == "screen":
@@ -578,6 +579,14 @@ class RpyExtractor:
     @staticmethod
     def _is_bare_string_start(stripped: str) -> bool:
         return bool(_STRING_START.match(stripped))
+
+    def _handle_menu(self, stripped: str):
+        # Ren'Py 会把命名 menu 当作隐式 label：menu 块内以及 menu 之后、
+        # 直到下一个显式 label 之前的所有 say，identifier 前缀都是 menu 名。
+        m = re.match(r"^menu\s+([A-Za-z_]\w*)\s*:", stripped)
+        if m:
+            self._label = m.group(1)
+            self._alternate = None
 
     def _handle_menu_string(self, stripped: str, line_no: int):
         value, _ = _parse_string_literal(stripped, 0)

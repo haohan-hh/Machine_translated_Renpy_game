@@ -91,7 +91,13 @@ def build_file_script(
     if updated_at is None:
         updated_at = _stamp()
     if dialogues:
+        seen_ids: set[str] = set()
         for d in dialogues:
+            # 同一 translate identifier 只输出一次，避免 Ren'Py 编译 tl 时
+            # 因重复定义报错导致整个文件的翻译失效（游戏显示英文原文）。
+            if d.identifier in seen_ids:
+                continue
+            seen_ids.add(d.identifier)
             tr = dialogue_translations.get(d.identifier)
             if tr is None:
                 continue
