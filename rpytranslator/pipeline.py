@@ -328,6 +328,10 @@ def run_pipeline(
                 f.write("\n\n== 字符串 ==" if unchanged_s else "")
                 for s in unchanged_s:
                     f.write(f"\n{s.filename}:{s.line}  {s.text}")
+                if client.error_messages:
+                    f.write("\n\n== 翻译错误详情（去重） ==\n")
+                    for em in client.error_messages[:20]:
+                        f.write(f"\n- {em}")
             log(f"未翻译 {unchanged} 条（回退原文），详情见: {report}")
         except OSError:
             log(f"未翻译 {unchanged} 条（回退原文）")

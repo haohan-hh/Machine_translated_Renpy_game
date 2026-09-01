@@ -313,6 +313,9 @@ _SCREEN_PROP_RE = re.compile(
     r'\b(?:tooltip|alt|text|title|subtitle)\s+(["\'])', re.I)
 # define/default 中的 Character 调用
 _CHARACTER_RE = re.compile(r'\b\w*Character\s*\(')
+# 判断字符串是否值得翻译时，剥离 {标签} / [插值] / {#...} 特殊标记
+_STRIP_TAG_RE = re.compile(r"\{[^{}]*\}")
+_STRIP_INSERT_RE = re.compile(r"\[[^\[\]]*\]")
 
 
 @dataclass
@@ -346,8 +349,35 @@ class RpyExtractor:
         if unit.what:
             self.dialogues.append(unit)
 
+    @staticmethod
+    def _is_translatable_text(value: str) -> bool:
+        """判断字符串是否值得送去翻译。
+
+        过滤版本号、颜色、纯插值/标签、单字符等无实际翻译意义的内容，
+        避免浪费 API 请求并在未翻译报告中产生噪音。
+        """
+        if not value:
+            return False
+        v = value.strip()
+        if not v or len(v) <= 1:
+            return False
+        if re.fullmatch(r"\d+(?:\.\d+)*", v):        # 版本号 / 数字
+            return False
+        if re.fullmatch(r"#[0-9a-fA-F]{3,8}", v):    # 颜色
+            return False
+        if "{#" in v:                                 # {#...} 翻译器特殊注释
+            return False
+        plain = _STRIP_TAG_RE.sub("", v)
+        plain = _STRIP_INSERT_RE.sub("", plain)
+        plain = plain.strip()
+        if not plain:                                 # 纯标签/插值，如 [page]
+            return False
+        return True
+
     def _add_string(self, text, line_no, context=""):
         if not text or text in self.seen_strings:
+            return
+        if not self._is_translatable_text(text):
             return
         self.seen_strings.add(text)
         self.strings.append(StringUnit(text=text, filename=self.filename,
@@ -713,6 +743,8 @@ def scan_underscore_strings(text: str, filename: str) -> list[StringUnit]:
             value, end = _parse_string_literal(ll.text, m.start("quote"))
             if value is not None and value not in seen and 0 < len(value) <= 2000:
                 seen.add(value)
+                if not RpyExtractor._is_translatable_text(value):
+                    continue
                 result.append(StringUnit(text=value, filename=filename,
                                          line=ll.line, context="_()"))
             i = end if end > m.start() else m.start() + 1

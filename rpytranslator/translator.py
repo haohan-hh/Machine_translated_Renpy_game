@@ -18,11 +18,13 @@ from dataclasses import dataclass, field
 # 占位符保护
 # ---------------------------------------------------------------------------
 
-_PH_PREFIX = "\ue000"          # Private Use Area 字符，正常文本几乎不会出现
-_PH_RE = re.compile("\ue000(\\d+)\ue000")
-# 人名/专有名词保护占位符（独立前缀，避免与标签占位符索引冲突）
-_NAMES_PREFIX = "\ue001"
-_NAMES_RE = re.compile("\ue001(\\d+)\ue001")
+# 占位符使用可见 ASCII 标记（@@p0@@ / @@n0@@）：
+# 私有区字符（\ue000 等）在很多模型的 tokenizer 中不可见，翻译时容易被
+# 直接丢弃，导致占位符校验失败、整批回退。可见符号可显著降低丢失概率。
+_PH_PREFIX = "@@p"            # 标签/插值/换行占位符
+_PH_RE = re.compile("@@p(\\d+)@@")
+_NAMES_PREFIX = "@@n"         # 人名/专有名词占位符
+_NAMES_RE = re.compile("@@n(\\d+)@@")
 
 # Ren'Py 文本标签 {color=#fff} / {b} / {size=+2} 等（不嵌套）
 _TAG_RE = re.compile(r"\{[^{}]*\}")
@@ -31,7 +33,10 @@ _INSERT_RE = re.compile(r"\[[^\[\]]*\]")
 
 
 def _placeholder(i: int) -> str:
-    return f"{_PH_PREFIX}{i}{_PH_PREFIX}"
+    return f"{_PH_PREFIX}{i}@@"
+
+def _name_placeholder(i: int) -> str:
+    return f"{_NAMES_PREFIX}{i}@@"
 
 
 def protect_text(text: str) -> tuple[str, list[str]]:
@@ -88,7 +93,7 @@ def protect_names(text: str, names: list[str]) -> tuple[str, list[str]]:
     def repl(m: re.Match) -> str:
         i = len(placeholders)
         placeholders.append(m.group(0))
-        return f"{_NAMES_PREFIX}{i}{_NAMES_PREFIX}"
+        return _name_placeholder(i)
 
     for n in sorted(names, key=len, reverse=True):
         if not n:
@@ -276,7 +281,11 @@ class TranslationClient:
 
     def _translate_chunk(self, texts: list[str], target: str,
                          error_cb=None, names: list[str] | None = None) -> list[str]:
-        """翻译一个批次：人名保护 → 标签保护 → JSON 批译 → 校验还原 → 失败重试。"""
+        """翻译一个批次：人名保护 → 标签保护 → JSON 批译 → 逐条校验还原。
+
+        部分条目校验失败时只重试失败条目，避免“一条失败拖垮整批”导致
+        请求量爆炸（整批降级为逐条会放大 40 倍请求数，极易触发限流）。
+        """
         names = names or []
         named = [protect_names(t, names) for t in texts]
         protected = [protect_text(nt) for nt, _ in named]
@@ -284,36 +293,52 @@ class TranslationClient:
         ph_list = [ph for _, ph in protected]
         name_ph_list = [nph for _, nph in named]
 
-        last_err: Exception | None = None
-        for attempt in range(self.config.max_retries):
-            try:
-                raw = self._request_json_array(payload, target, error_cb)
-                if len(raw) != len(payload):
-                    raise TranslationError(
-                        f"返回条目数不符（期望 {len(payload)}，实际 {len(raw)}）")
-                out: list[str] = []
-                for i, (ptext, ph, nph) in enumerate(zip(payload, ph_list, name_ph_list)):
-                    restored = restore_text(raw[i], ph)
-                    restored = restore_names(restored, nph)
-                    if not _placeholders_preserved(ph, restored):
-                        raise TranslationError(
-                            f"第 {i + 1} 条占位符丢失，原始文本: {texts[i][:60]!r}")
-                    if not _placeholders_preserved(nph, restored):
-                        raise TranslationError(
-                            f"第 {i + 1} 条人名被改动，原始文本: {texts[i][:60]!r}")
-                    out.append(restored)
-                return out
-            except TranslationError as e:
-                last_err = e
-                self._record_error(str(e), error_cb)
-            except Exception as e:  # JSON 解析等
-                last_err = e
-                self._record_error(str(e), error_cb)
-            if attempt < self.config.max_retries - 1:
-                time.sleep(1.5 * (attempt + 1))
+        out: list[str] = [""] * len(texts)
+        pending = list(range(len(texts)))     # 尚未翻译成功的原索引
 
-        # 批译失败：降级为逐条翻译（每条独立请求）
-        return [self._translate_single(t, target, error_cb, names) for t in texts]
+        for attempt in range(self.config.max_retries):
+            if not pending:
+                break
+            sub_payload = [payload[i] for i in pending]
+            try:
+                raw = self._request_json_array(sub_payload, target, error_cb)
+                if len(raw) != len(sub_payload):
+                    raise TranslationError(
+                        f"返回条目数不符（期望 {len(sub_payload)}，实际 {len(raw)}）")
+            except TranslationError as e:
+                self._record_error(str(e), error_cb)
+                if attempt < self.config.max_retries - 1:
+                    time.sleep(1.5 * (attempt + 1))
+                continue
+            except Exception as e:  # JSON 解析等
+                self._record_error(str(e), error_cb)
+                if attempt < self.config.max_retries - 1:
+                    time.sleep(1.5 * (attempt + 1))
+                continue
+
+            still_failed: list[int] = []
+            for si, orig_i in enumerate(pending):
+                ph, nph = ph_list[orig_i], name_ph_list[orig_i]
+                restored = restore_text(raw[si], ph)
+                restored = restore_names(restored, nph)
+                if not _placeholders_preserved(ph, restored):
+                    still_failed.append(orig_i)
+                elif not _placeholders_preserved(nph, restored):
+                    still_failed.append(orig_i)
+                else:
+                    out[orig_i] = restored
+            if still_failed and len(still_failed) < len(pending):
+                self._record_error(
+                    f"本批 {len(pending)} 条中有 {len(still_failed)} 条占位符校验失败"
+                    f"（已单独重试），示例: {texts[still_failed[0]][:50]!r}", error_cb)
+            pending = still_failed
+            if pending and attempt < self.config.max_retries - 1:
+                time.sleep(1.2 * (attempt + 1))
+
+        # 剩余失败条目：逐条翻译（单条请求，失败回退原文）
+        for i in pending:
+            out[i] = self._translate_single(texts[i], target, error_cb, names)
+        return out
 
     def _request_json_array(self, payload: list[str], target: str,
                             error_cb=None) -> list[str]:
