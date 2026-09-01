@@ -19,6 +19,9 @@ from .rpyc_loader import cleanup, decompile_rpyc_files
 from .translator import TranslationClient, TranslationConfig
 
 DEFAULT_LANGUAGE = "schinese"
+# 未翻译文本的自动补译轮数上限：每轮只重译上一轮仍然失败的文本，
+# 全部完成后不再生成“未翻译报告”；达到上限仍有残留则保留报告供手动处理。
+MAX_RETRY_ROUNDS = 5
 LANGUAGE_LABELS = {
     "schinese": "简体中文",
     "tchinese": "繁体中文",
@@ -218,7 +221,9 @@ def run_pipeline(
         result.ok = False
         return result
 
-    # 6. 翻译
+    # 6. 翻译 + 自动补译：第一次翻译后，凡译文仍等于原文（失败回退）的
+    #    文本会自动进入下一轮，只重译这些文本；重复直到全部翻译完成
+    #    （或达到 MAX_RETRY_ROUNDS 上限，此时保留“未翻译报告”供手动处理）。
     if client is None:
         client = TranslationClient(config or TranslationConfig())
     target = _guess_language_name(language)
@@ -236,6 +241,7 @@ def run_pipeline(
         if progress_cb:
             progress_cb("ERR|" + msg)
 
+    # 第 1 轮：翻译全部去重文本
     d_trans = client.translate_texts(
         [u.what for u in uniq_d], target=target, names=protect_terms,
         progress_cb=report_progress, offset=0, total=total,
@@ -244,6 +250,45 @@ def run_pipeline(
         [u.text for u in uniq_s], target=target, names=protect_terms,
         progress_cb=report_progress, offset=len(uniq_d), total=total,
         error_cb=report_error)
+
+    # 按文本保存译文（多轮补译期间持续更新）
+    d_by_text: dict[str, str] = {u.what: tr for u, tr in zip(uniq_d, d_trans)}
+    s_by_text: dict[str, str] = {u.text: tr for u, tr in zip(uniq_s, s_trans)}
+
+    # 第 2+ 轮：只重译仍未翻译（译文 == 原文）的文本
+    retry_round = 0
+    while True:
+        todo_d = [u for u in uniq_d if d_by_text.get(u.what) == u.what]
+        todo_s = [u for u in uniq_s if s_by_text.get(u.text) == u.text]
+        if not todo_d and not todo_s:
+            break
+        retry_round += 1
+        if retry_round > MAX_RETRY_ROUNDS:
+            log(f"补译 {MAX_RETRY_ROUNDS} 轮后仍有 {len(todo_d)} 条对话、"
+                f"{len(todo_s)} 条字符串未翻译，保留未翻译报告供手动处理")
+            break
+        sub_total = len(todo_d) + len(todo_s)
+        log(f"补译第 {retry_round}/{MAX_RETRY_ROUNDS} 轮：剩余 "
+            f"{len(todo_d)} 条对话、{len(todo_s)} 条字符串，重新翻译…")
+        time.sleep(2)   # 间隔片刻，缓解限流
+
+        def sub_progress(done: int, total: int) -> None:
+            pct = int(done * 100 / total) if total else 100
+            if progress_cb:
+                progress_cb("PROGRESS|%d" % pct)
+
+        d2 = client.translate_texts(
+            [u.what for u in todo_d], target=target, names=protect_terms,
+            progress_cb=sub_progress, offset=0, total=sub_total,
+            error_cb=report_error)
+        s2 = client.translate_texts(
+            [u.text for u in todo_s], target=target, names=protect_terms,
+            progress_cb=sub_progress, offset=len(todo_d), total=sub_total,
+            error_cb=report_error)
+        for u, tr in zip(todo_d, d2):
+            d_by_text[u.what] = tr
+        for u, tr in zip(todo_s, s2):
+            s_by_text[u.text] = tr
     if progress_cb:
         progress_cb("PROGRESS|100")
 
@@ -257,11 +302,13 @@ def run_pipeline(
     # 7. 组装译文映射：同一文本的所有出现（identifier 不同）共享同一译文，
     #    避免按文本去重后重复出现的对话拿不到译文而被跳过。
     dialogue_translations: dict[str, str] = {}
-    for u, tr in zip(uniq_d, d_trans):
+    for u in uniq_d:
+        tr = d_by_text[u.what]
         for idx in d_groups.get(u.what, ()):
             dialogue_translations[dialogues[idx].identifier] = tr
     string_translations: dict[str, str] = {}
-    for u, tr in zip(uniq_s, s_trans):
+    for u in uniq_s:
+        tr = s_by_text[u.text]
         for idx in s_groups.get(u.text, ()):
             string_translations[strings[idx].text] = tr
 
@@ -317,8 +364,8 @@ def run_pipeline(
     unchanged = len(unchanged_d) + len(unchanged_s)
     result.skipped_count = unchanged
 
+    report = out_dir.parent / f"{language}.未翻译报告.txt"
     if unchanged:
-        report = out_dir.parent / f"{language}.未翻译报告.txt"
         try:
             with open(report, "w", encoding="utf-8-sig") as f:
                 f.write("以下文本未能翻译（回退为原文），请检查翻译服务或手动补充：\n\n")
@@ -339,6 +386,14 @@ def run_pipeline(
             log(f"  未翻译对话: {d.filename}:{d.line} {d.what[:50]}")
         for s in unchanged_s[:10]:
             log(f"  未翻译字符串: {s.filename}:{s.line} {s.text[:50]}")
+    else:
+        # 全部翻译完成：删除可能残留的旧报告，以“报告是否存在”判断是否已完成
+        try:
+            if report.exists():
+                report.unlink()
+                log(f"全部文本翻译完成，已删除旧的未翻译报告: {report}")
+        except OSError:
+            pass
 
     result.ok = True
     lines = [
