@@ -13,6 +13,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import rpa_loader
+
 # 常见的中文语言标识（tl 目录名）
 CHINESE_LANGUAGE_NAMES = {
     "chinese", "chinese_simplified", "simplifiedchinese", "simplified_chinese",
@@ -36,10 +38,14 @@ class GameInfo:
     has_chinese: bool = False
     version_hint: str = ""
     notes: list[str] = field(default_factory=list)
+    # 脚本打包在 .rpa 归档中（游戏目录无松散 .rpy/.rpyc）时的归档信息
+    rpa_files: list[Path] = field(default_factory=list)
+    archive_scripts: list[str] = field(default_factory=list)
 
     @property
     def text_count(self) -> int:
-        return len(self.rpy_files) + len(self.rpyc_files)
+        n = len(self.rpy_files) + len(self.rpyc_files)
+        return n if n else len(self.archive_scripts)
 
 
 def is_chinese_language(name: str) -> bool:
@@ -146,14 +152,25 @@ def _detect_version(game_dir: Path, root: Path) -> str:
             except OSError:
                 pass
 
-    # 2. 通过可执行文件判断（8.x 通常使用 renpy 可执行文件，7.x 为 .exe）
+    # 2. game/script_version.txt（部分发行版携带，格式如 "(8, 2, 0)"）
+    sv = game_dir / "script_version.txt"
+    if sv.is_file():
+        try:
+            m = re.search(r"\(?\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)",
+                          sv.read_text(encoding="utf-8", errors="ignore"))
+            if m:
+                return f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
+        except OSError:
+            pass
+
+    # 3. 通过可执行文件判断（8.x 通常使用 renpy 可执行文件，7.x 为 .exe）
     for ext in (".exe", ""):
         for name in ("renpy", "game", root.name):
             p = root / (name + ext)
             if p.is_file():
                 return "Ren'Py (8.x/7.x 系列)"
 
-    # 3. rpyc 文件头判断
+    # 4. rpyc 文件头判断
     if game_dir:
         for f in list(game_dir.glob("*.rpyc"))[:5]:
             try:
@@ -164,6 +181,44 @@ def _detect_version(game_dir: Path, root: Path) -> str:
                 pass
 
     return "未知"
+
+
+def _detect_rpa_archives(info: GameInfo, game_dir: Path) -> None:
+    """当游戏目录没有松散脚本时，尝试从 .rpa 归档中识别脚本。
+
+    Ren'Py 发行版常见做法是把全部脚本（连同资源）打包进 game/archive.rpa，
+    game 目录只剩缓存与资源文件。此处只读取归档索引、统计脚本清单，
+    实际物化脚本的工作由 pipeline 在开始汉化时执行。
+    """
+    try:
+        rpas = list(game_dir.glob("*.rpa")) + list(game_dir.glob("*.RPA"))
+    except OSError:
+        return
+    if not rpas:
+        return
+    seen: set[str] = set()
+    rpas = [p for p in rpas if p.name not in seen and not seen.add(p.name)]
+    rpas.sort(key=lambda p: str(p).lower())
+
+    scripts: list[str] = []
+    for rpa in rpas:
+        try:
+            names = rpa_loader.list_script_names(rpa)
+        except (ValueError, OSError):
+            continue
+        # 多个归档同名脚本：后处理的归档覆盖先前的（Ren'Py config.archives
+        # 顺序），以最后一个归档为准。
+        for n in names:
+            scripts = [s for s in scripts if s.lower() != n.lower()]
+            scripts.append(n)
+    if scripts:
+        info.rpa_files = rpas
+        info.archive_scripts = scripts
+        info.notes.append(
+            f"发现脚本归档：{'、'.join(p.name for p in rpas)}"
+            f"（内含 {len(scripts)} 个脚本，汉化时自动解包处理）")
+    else:
+        info.notes.append("发现 .rpa 归档，但其中不包含 .rpy/.rpyc 脚本")
 
 
 def scan_game(path: str | Path) -> GameInfo:
@@ -191,6 +246,9 @@ def scan_game(path: str | Path) -> GameInfo:
     info.version_hint = _detect_version(game_dir, root)
 
     if not info.rpy_files and not info.rpyc_files:
+        # 脚本可能打包在 .rpa 归档中（Ren'Py 发行版常见做法）
+        _detect_rpa_archives(info, game_dir)
+    if not info.rpy_files and not info.rpyc_files and not info.archive_scripts:
         info.notes.append("游戏目录中未发现任何文本脚本文件")
 
     return info

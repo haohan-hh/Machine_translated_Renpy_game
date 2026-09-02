@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import engine
+from . import engine, rpa_loader
 from .extract import (
     DialogueUnit, ExtractionResult, extract_rpy_file, extract_rpy_files,
 )
@@ -224,6 +224,11 @@ def run_pipeline(
         if progress_cb:
             progress_cb(msg)
 
+    def cleanup_all():
+        # 反编译临时目录 + .rpa 解包临时目录 统一清理
+        cleanup(tmp_dir)
+        cleanup(materialized_dir)
+
     result = PipelineResult()
 
     # 1. 扫描
@@ -238,6 +243,37 @@ def run_pipeline(
         return result
 
     result.game_dir = info.game_dir
+
+    # 1.1 脚本打包在 .rpa 归档中（game 目录无松散 .rpy/.rpyc）：
+    #     物化 .rpyc（Ren'Py 实际加载的编译产物，identifier 与之对齐）
+    #     到临时目录，再走常规“反编译 → 提取”流程。
+    materialized_dir: Path | None = None
+    if (not info.rpy_files and not info.rpyc_files) and info.rpa_files:
+        import tempfile as _tempfile
+        log(f"检测到脚本归档（{len(info.archive_scripts)} 个脚本文件），正在解包…")
+        materialized_dir = Path(_tempfile.mkdtemp(prefix="rpy_archive_"))
+        extracted = rpa_loader.extract_all_scripts_to(
+            info.rpa_files, materialized_dir, prefer="rpyc")
+        if extracted:
+            rpyc_ok = [p for p in extracted
+                       if p.suffix.lower() in (".rpyc", ".rpymc")]
+            rpy_ok = [p for p in extracted
+                      if p.suffix.lower() in (".rpy", ".rpym")]
+            # 与松散文件规则一致：有 .rpyc 时以 .rpyc 反编译为准，
+            # 避免同一文件双份提取导致 tl 中 translate identifier 重复。
+            if rpyc_ok:
+                info.rpyc_files = rpyc_ok
+                info.rpy_files = []
+            else:
+                info.rpy_files = rpy_ok
+                info.rpyc_files = []
+            log(f"已从归档解出 {len(extracted)} 个脚本（临时目录），开始提取…")
+        else:
+            log("无法从 .rpa 归档中解出脚本文件")
+            result.message = "无法从 .rpa 归档中解出脚本文件"
+            result.ok = False
+            return result
+
     report_path = info.game_dir / "tl" / f"{language}.未翻译报告.txt"
     # 游戏自带中文且没有未翻译报告 → 无需汉化；
     # 若仍留有未翻译报告（上次汉化未完成），继续增量汉化补齐。
@@ -382,7 +418,7 @@ def run_pipeline(
         f"（去重后 {len(uniq_d)} + {len(uniq_s)}）")
 
     if not dialogues and not strings:
-        cleanup(tmp_dir)
+        cleanup_all()
         result.message = "未提取到可翻译的文本"
         result.ok = False
         return result
@@ -537,7 +573,7 @@ def run_pipeline(
     if result.removed_dup_blocks:
         log(f"已清理翻译文件中 {result.removed_dup_blocks} 个重复 translate 块")
 
-    cleanup(tmp_dir)
+    cleanup_all()
 
     if not written:
         result.message = "没有可写出的翻译文件（翻译全部失败？）"

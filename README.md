@@ -5,6 +5,7 @@
 ## 功能特性
 
 - **自动识别**：解析 Ren'Py 游戏目录，读取 `.rpy` / `.rpyc` 脚本并提取全部对白文本（同文件同时存在 `.rpy` 与 `.rpyc` 时按 Ren'Py 优先级只处理 `.rpy`，避免重复翻译块）
+- **RPA 归档支持**：脚本被打包进 `.rpa` 归档（game 目录无松散脚本）的发行版也能汉化——自动解析 RPA-3.0/2.0 归档索引，抽取其中的 `.rpyc` 编译脚本（Ren'Py 实际加载的产物，翻译 identifier 与之对齐），资源文件（图片/音频）不解出
 - **命名菜单识别**：`menu 名字:` 是 Ren'Py 的隐式 label，其作用域内（含菜单之后到下一个 `label` 前）的对话 identifier 前缀为菜单名，提取器与 Ren'Py 实际编译结果逐字节一致，翻译必定命中
 - **增量翻译复用**：再次汉化时自动加载已有 `tl/` 译文；即使提取逻辑升级导致 identifier 前缀变化，也能按翻译 ID 的摘要段（md5 前 8 位，由文本内容决定、与 label 无关）兜底匹配，旧译文不会丢失
 - **编译残留清理**：解析已有译文时自动剥离 Ren'Py 编译产物（如 unrpyc 反编译）中残留的 `@@pN@@p` 块位置标记，保留 `@@nN@@` / `@@pN@@` 插值占位符，保证译文干净且插值完整
@@ -82,6 +83,7 @@ rpytranslator/
   patcher.py               # 字体与语言界面注入
   generator.py             # 翻译文件生成
   housekeeping.py          # 汉化后自动化：清理过期 .rpyc 缓存、去重 translate 块
+  rpa_loader.py            # .rpa 归档解析与脚本抽取（RPA-3.0 / RPA-2.0）
   gui_main.py              # WinUI 3 图形界面
 ```
 
