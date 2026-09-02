@@ -338,40 +338,77 @@ _LANG_UI_SNIPPET = (
     "        vbox:\n"
     '            style_prefix "radio"\n'
     '            label _("Language")\n'
-    "            for i in renpy.translation.get_languages():\n"
-    "                $ _language = i\n"
-    '                textbutton _language action Preference("language", i) '
-    'style "radio_button"\n'
+    "            $ _lang_ui_names = _lang_ui_languages()\n"
+    "            for _lang_ui_i in _lang_ui_names:\n"
+    '                $ _lang_ui_label = "English" if _lang_ui_i is None else _lang_ui_i\n'
+    '                textbutton _(_lang_ui_label) action '
+    'Preference("language", _lang_ui_i) style "radio_button"\n'
+)
+
+# 语言列表辅助函数：Ren'Py 8.2+ 提供 renpy.translation.known_languages()，
+# get_languages() 为更新版本 API，老版本需回退扫描 game/tl 目录。
+_LANG_UI_HELPER = (
+    "\n\n"
+    "init python:\n"
+    "    # 可用语言列表（含默认英文 None）。跨 Ren'Py 版本兼容。\n"
+    "    def _lang_ui_languages():\n"
+    "        langs = []\n"
+    "        found = False\n"
+    "        for _fn_name in ('known_languages', 'get_languages'):\n"
+    "            _fn = getattr(renpy.translation, _fn_name, None)\n"
+    "            if _fn is None:\n"
+    "                continue\n"
+    "            try:\n"
+    "                _langs = [_i for _i in _fn() if _i is not None]\n"
+    "            except Exception:\n"
+    "                continue\n"
+    "            langs = sorted(_langs)\n"
+    "            found = True\n"
+    "            break\n"
+    "        if not found:\n"
+    "            import os\n"
+    "            _tl_dir = os.path.join(config.gamedir, 'tl')\n"
+    "            if os.path.isdir(_tl_dir):\n"
+    "                for _name in sorted(os.listdir(_tl_dir)):\n"
+    "                    if _name.lower() != 'none' and os.path.isdir(\n"
+    "                            os.path.join(_tl_dir, _name)):\n"
+    "                        langs.append(_name)\n"
+    "        return [None] + langs\n"
 )
 
 # 各语言语言码对应的「Ren'Py 语言显示名 → 中文显示名」
 # 注意：English 不能统一译为目标语言名，否则语言切换菜单里会全是“简体中文”。
 _LANGUAGE_DISPLAY: dict[str, dict[str, str]] = {
     "schinese": {
+        "schinese": "简体中文",
         "Simplified Chinese": "简体中文",
         "Chinese (Simplified)": "简体中文",
         "Chinese": "中文",
         "English": "英语",
     },
     "tchinese": {
+        "tchinese": "繁體中文",
         "Traditional Chinese": "繁体中文",
         "Chinese (Traditional)": "繁体中文",
         "Chinese": "中文",
         "English": "英语",
     },
     "zh_cn": {
+        "zh_cn": "简体中文",
         "Simplified Chinese": "简体中文",
         "Chinese (Simplified)": "简体中文",
         "Chinese": "中文",
         "English": "英语",
     },
     "zh_hans": {
+        "zh_hans": "简体中文",
         "Simplified Chinese": "简体中文",
         "Chinese (Simplified)": "简体中文",
         "Chinese": "中文",
         "English": "英语",
     },
     "zh": {
+        "zh": "中文",
         "Chinese": "中文",
         "Simplified Chinese": "简体中文",
         "English": "英语",
@@ -380,7 +417,7 @@ _LANGUAGE_DISPLAY: dict[str, dict[str, str]] = {
 
 _LANG_UI_PATTERNS = (
     r'Preference\(\s*["\']language["\']',
-    r"renpy\.translation\.get_languages\s*\(",
+    r"renpy\.translation\.(?:get_languages|known_languages)\s*\(",
     r"\blanguage_button\b",
 )
 
@@ -564,7 +601,7 @@ def _build_language_ui(source_text: str) -> str | None:
     if _LANG_UI_MARKER in block:
         return None  # 已注入
     block = block.rstrip() + "\n"
-    return block + _LANG_UI_SNIPPET
+    return block + _LANG_UI_SNIPPET + _LANG_UI_HELPER
 
 
 def apply_language_ui(game_dir: Path, language: str = "schinese") -> PatchResult:
