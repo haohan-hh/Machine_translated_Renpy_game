@@ -249,15 +249,17 @@ def _build_font_patch(cjk_font_rel: str, original_font: str) -> str:
 
     实测总结（Wild Harmonies / Dawn Chorus 项目验证）：
     - 仅设置 style.default.font 不够：Ren'Py 界面字体大多来自
-      gui.text_font / gui.interface_text_font 等变量，screens.rpy 通过
-      gui.text_properties() 在 init 0 阶段构建样式，把字体字符串直接写死
-      进样式对象。
-    - 因此必须在**样式构建之前**（init -1）就把 gui.*_font 替换成
-      FontGroup；init 999 再兜底：重新覆盖 gui 变量、style.default.font，
-      并遍历所有命名样式统一替换（覆盖不经过 gui 变量、直接指定字体的
-      样式，如游戏自定义 say/name/button 样式）。
+      gui.text_font / gui.interface_text_font 等变量，screens.rpy 在 init 阶段
+      通过 gui.text_properties() 构建样式，把字体字符串直接写死进样式对象。
+    - 因此必须在**样式构建之前**（init -1）就把 gui.*_font 换成中文字体；
+      init 999 再兜底：重新覆盖 gui 变量、style.default.font。
     - gui 不是 Python 模块，不能 import gui，直接在 init python 块中访问即可。
-    - Ren'Py 8 的样式字典在 renpy.game.style.styles。
+    - Dawn Chorus(Ren'Py 8.2.0) 实测：样式字体挂 FontGroup 对象后，标题界面
+      中文仍全是方框（8.2 渲染端未采用 FontGroup）；而 init -1 覆盖 gui 变量
+      后样式.font 已被确认改写成功。因此**直接给字体路径字符串**（引擎最
+      成熟路径），前提是中文字体同时覆盖 ASCII + 中文 + 全角标点。
+    - 遍历样式注册表用 .items() 即可（8.2 中 renpy.style.styles 是类映射对象
+      而非 dict，len=207；renpy/lint.py 正是用其 .items() 遍历）。
     - 中文必须用静态字体：可变字体（*Variable*.ttf）在 Ren'Py/SDL_ttf 下
       字形支持不完整，会导致部分汉字仍是方框。
     """
@@ -278,18 +280,12 @@ def _build_font_patch(cjk_font_rel: str, original_font: str) -> str:
         "# -*- coding: utf-8 -*-\n"
         "# 中文字体补丁（汉化工具自动生成）：解决中文显示为方框。\n"
         f"# 中文字体: {cjk_font_rel}\n"
-        "# 说明：界面样式在 init 0 读取 gui.*_font 构建并写死字体，因此先于样式\n"
-        "#       构建（init -1）替换 gui.*_font 为 FontGroup；init 999 再兜底\n"
-        "#       遍历所有命名样式与 style.default.font。\n"
+        "# 说明：界面样式在 init 阶段读取 gui.*_font 构建并写死字体，因此先于\n"
+        "#       样式构建（init -1）把 gui.*_font 换成中文字体路径；init 999\n"
+        "#       再兜底覆盖 gui 变量、style.default.font 并遍历命名样式。\n"
         f"{warn_var}"
         "init -1 python:\n"
-        "    def _zh_cn_font():\n"
-        "        fg = FontGroup()\n"
-        f"        fg.add(\"{esc}\", 0x2E80, 0x9FFF)   # CJK 部首/标点/统一表意文字\n"
-        f"        fg.add(\"{esc}\", 0xF900, 0xFAFF)   # CJK 兼容表意文字\n"
-        f"        fg.add(\"{esc}\", 0xFF00, 0xFFEF)   # 全角符号（中文引号等）\n"
-        f"        fg.add(\"{original_font}\", 0x0000, 0x2E7F)  # 拉丁等（保留原观感）\n"
-        "        return fg\n"
+        f"    _zh_cn_font = \"{esc}\"\n"
         "\n"
         "    # 抢在 screens 样式构建前替换 gui 字体变量（定义于 init -2）\n"
         "    try:\n"
@@ -299,10 +295,10 @@ def _build_font_patch(cjk_font_rel: str, original_font: str) -> str:
         "    if _zh_gui is not None:\n"
         f"        for _k in ({gui_keys_lit}):\n"
         "            if hasattr(_zh_gui, _k):\n"
-        "                setattr(_zh_gui, _k, _zh_cn_font())\n"
+        "                setattr(_zh_gui, _k, _zh_cn_font)\n"
         "\n"
         "init 999 python:\n"
-        "    # 1) 重新覆盖 gui 变量（应对游戏在 init 阶段重设字体的情况）\n"
+        "    # 1) 重新覆盖 gui 变量（应对游戏在 init 阶段重设字体）\n"
         "    try:\n"
         "        _zh_gui2 = gui\n"
         "    except Exception:\n"
@@ -310,32 +306,32 @@ def _build_font_patch(cjk_font_rel: str, original_font: str) -> str:
         "    if _zh_gui2 is not None:\n"
         f"        for _k in ({gui_keys_lit}):\n"
         "            if hasattr(_zh_gui2, _k):\n"
-        "                setattr(_zh_gui2, _k, _zh_cn_font())\n"
+        "                setattr(_zh_gui2, _k, _zh_cn_font)\n"
         "\n"
         "    # 2) 默认样式兜底\n"
-        "    style.default.font = _zh_cn_font()\n"
+        "    style.default.font = _zh_cn_font\n"
         "\n"
-        "    # 3) 其余命名样式兜底（显式指定拉丁字体的按钮、菜单、对话样式）\n"
-        "    #    Ren'Py 8.2 的样式注册表是 renpy.style.styles（模块级 dict）；\n"
-        "    #    其他版本/结构回退到 renpy.game.style.styles。\n"
-        "    _zh_styles = {}\n"
+        "    # 3) 其余命名样式兜底（覆盖绕过 gui 变量直接指定字体的样式）\n"
+        "    #    Ren'Py 8.2 的 renpy.style.styles 是类映射对象（非 dict），\n"
+        "    #    lint.py 即用其 .items() 遍历；低版本回退 game.style.styles。\n"
+        "    _zh_items = None\n"
         "    try:\n"
         "        import renpy.style as _zh_style_mod\n"
-        "        if isinstance(_zh_style_mod.styles, dict):\n"
-        "            _zh_styles = _zh_style_mod.styles\n"
+        "        if hasattr(_zh_style_mod, 'styles') and hasattr(\n"
+        "                _zh_style_mod.styles, 'items'):\n"
+        "            _zh_items = _zh_style_mod.styles.items()\n"
         "    except Exception:\n"
         "        pass\n"
-        "    if not _zh_styles:\n"
+        "    if _zh_items is None:\n"
         "        try:\n"
-        "            if isinstance(renpy.game.style.styles, dict):\n"
-        "                _zh_styles = renpy.game.style.styles\n"
+        "            if hasattr(renpy.game.style.styles, 'items'):\n"
+        "                _zh_items = renpy.game.style.styles.items()\n"
         "        except Exception:\n"
         "            pass\n"
-        "    if _zh_styles:\n"
-        "        _zh_fg = _zh_cn_font()\n"
-        "        for _n, _s in _zh_styles.items():\n"
+        "    if _zh_items:\n"
+        "        for _zh_n, _zh_s in _zh_items:\n"
         "            try:\n"
-        "                _s.font = _zh_fg\n"
+        "                _zh_s.font = _zh_cn_font\n"
         "            except Exception:\n"
         "                pass\n"
     )
@@ -391,7 +387,7 @@ def apply_font_patch(game_dir: Path) -> PatchResult:
         return res
     res.files.append(patch)
     res.ok = True
-    res.detail = f"中文字体: {rel}；英文保留原字体 {original_font}"
+    res.detail = f"中文字体: {rel}（直接覆盖 gui.*_font 与全部样式 font）"
     res.message = f"已配置中文字体（{res.message}）"
     return res
 
