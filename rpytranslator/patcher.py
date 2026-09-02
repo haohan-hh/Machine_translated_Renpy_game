@@ -341,17 +341,21 @@ _LANG_UI_SNIPPET = (
     "            $ _lang_ui_names = _lang_ui_languages()\n"
     "            for _lang_ui_i in _lang_ui_names:\n"
     '                $ _lang_ui_label = "English" if _lang_ui_i is None else _lang_ui_i\n'
-    '                textbutton _(_lang_ui_label) action '
-    'Preference("language", _lang_ui_i) style "radio_button"\n'
+    "                textbutton _(_lang_ui_label) selected "
+    "(_preferences.language == _lang_ui_i) action "
+    "Function(_lang_ui_switch, _lang_ui_i) style \"radio_button\"\n"
 )
 
-# 语言列表辅助函数：Ren'Py 8.2+ 提供 renpy.translation.known_languages()，
-# get_languages() 为更新版本 API，老版本需回退扫描 game/tl 目录。
+# 语言辅助函数：
+# - 语言列表：Ren'Py 8.2+ 提供 renpy.translation.known_languages()；
+#   get_languages() 为更新版本 API，老版本需回退扫描 game/tl 目录。
+# - 切换：Ren'Py 8.2 的 Preference() 尚无 language 分支，直接调
+#   renpy.change_language()（None 表示恢复默认英文）。
 _LANG_UI_HELPER = (
     "\n\n"
     "init python:\n"
-    "    # 可用语言列表（含默认英文 None）。跨 Ren'Py 版本兼容。\n"
     "    def _lang_ui_languages():\n"
+    "        # 可用语言列表（含默认英文 None）。跨 Ren'Py 版本兼容。\n"
     "        langs = []\n"
     "        found = False\n"
     "        for _fn_name in ('known_languages', 'get_languages'):\n"
@@ -374,6 +378,10 @@ _LANG_UI_HELPER = (
     "                            os.path.join(_tl_dir, _name)):\n"
     "                        langs.append(_name)\n"
     "        return [None] + langs\n"
+    "\n"
+    "    def _lang_ui_switch(language):\n"
+    "        # 老版 Ren'Py 无 Preference('language')，直接切换语言。\n"
+    "        renpy.change_language(language)\n"
 )
 
 # 各语言语言码对应的「Ren'Py 语言显示名 → 中文显示名」
