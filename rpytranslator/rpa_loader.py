@@ -148,3 +148,34 @@ def extract_all_scripts_to(
         except (OSError, ValueError):
             continue
     return all_files
+
+
+def read_script_data(
+    rpa_files: list[str | Path],
+    name: str,
+) -> bytes | None:
+    """从 .rpa 归档中读取单个脚本的原始数据（供补丁等只读场景使用）。
+
+    - name 为脚本相对名（如 "screens.rpyc"）；与归档内路径匹配不区分大小写。
+    - 若指定名字在归档中不存在，自动回退到同源编译对
+      （screens.rpyc ↔ screens.rpy），方便拿任一形式做分析。
+    - 多个归档按顺序取第一个命中者。
+    - 不物化到磁盘、不解出资源。
+    """
+    base, ext = name.rsplit(".", 1)
+    candidates = {name.lower(), base.lower() + "." + ext.lower()}
+    pairs = {"rpyc": "rpy", "rpy": "rpyc", "rpymc": "rpym", "rpym": "rpymc"}
+    if ext.lower() in pairs:
+        candidates.add(base.lower() + "." + pairs[ext.lower()])
+    for rpa in rpa_files:
+        try:
+            index = parse_rpa_index(rpa)
+        except (OSError, ValueError):
+            continue
+        hit: tuple[int, int, bytes] | None = None
+        for idx_name, entry in index.items():
+            if idx_name.lower() in candidates:
+                hit = entry  # 归档内同名后者覆盖前者
+        if hit is not None:
+            return _read_entry(Path(rpa), hit)
+    return None

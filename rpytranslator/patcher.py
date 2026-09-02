@@ -63,6 +63,12 @@ _CJK_TEST_CODEPOINTS = (0x4E00, 0x4E2D, 0x6587, 0x6C49)
 _SKIP_DIRS = {"tl", "renpy", "cache", "saves", "log", "errors",
               "__pycache__", ".git", "lib"}
 
+# preferences 屏幕定义行。兼容两种形式：
+#   screen preferences():                      # .rpy 源码
+#   init -501 screen preferences():            # 反编译 .rpyc 所得
+_PREF_SCREEN_RE = re.compile(
+    r"(?m)^ *(?:init\s+[+-]?\d+\s+)?screen\s+preferences\b")
+
 
 def _read_u16(data: bytes, off: int) -> int:
     return struct.unpack_from(">H", data, off)[0]
@@ -380,15 +386,21 @@ _LANG_UI_PATTERNS = (
 
 
 def _extract_screen_block(text: str, screen_name: str) -> str | None:
-    """提取 text 中 `screen <name>...:` 的完整定义块（含 screen 行）。"""
+    """提取 text 中 `screen <name>...:` 的完整定义块（含 screen 行）。
+
+    兼容 `.rpy` 源码（`screen xxx():`）与反编译 `.rpyc`
+    （`init -501 screen xxx():`）两种形式。
+    """
     lines = text.splitlines(keepends=True)
     start = None
     indent = 0
+    pat = re.compile(
+        r"( *)(?:init\s+[+-]?\d+\s+)?screen\s+" + re.escape(screen_name) + r"\b")
     for idx, line in enumerate(lines):
-        m = re.match(r"( *screen\s+" + re.escape(screen_name) + r"\b)", line)
+        m = pat.match(line)
         if m:
             start = idx
-            indent = len(m.group(1)) - len(m.group(1).lstrip())
+            indent = len(m.group(1))
             break
     if start is None:
         return None
@@ -446,28 +458,34 @@ def _has_language_ui(game_dir: Path, language: str = "schinese") -> bool:
         p = game_dir / fn
         if not p.is_file():
             continue
-        text = _decompile_to_text(p)
+        text = _decompile_rpyc_source(p, p.name)
         if text and _check(text):
             return True
     return False
 
 
-def _decompile_to_text(rpyc_path: Path) -> str | None:
-    """反编译单个 .rpyc 为文本（临时目录，用完即删）。"""
+def _decompile_rpyc_source(src: Path | bytes, name: str) -> str | None:
+    """反编译单个 .rpyc（磁盘文件或内存字节）为脚本文本。
+
+    name 用于生成临时文件与目标文件名（如 "screens.rpyc"）。用完即删。
+    """
     try:
         unrpyc = _load_unrpyc()
     except RuntimeError:
         return None
     with tempfile.TemporaryDirectory(prefix="rpy_scr_") as td:
         base = Path(td)
-        tmp_in = base / rpyc_path.name
+        tmp_in = base / name
         try:
-            shutil.copy2(rpyc_path, tmp_in)
+            if isinstance(src, bytes):
+                tmp_in.write_bytes(src)
+            else:
+                shutil.copy2(src, tmp_in)
             ctx = unrpyc.Context()
             unrpyc.decompile_rpyc(tmp_in, ctx)
         except Exception:
             return None
-        target = base / (rpyc_path.stem + ".rpy")
+        target = base / (Path(name).stem + ".rpy")
         if target.is_file():
             try:
                 return target.read_text(encoding="utf-8-sig", errors="ignore")
@@ -486,14 +504,14 @@ def _find_preferences_source(game_dir: Path) -> tuple[str | None, Path | None]:
         p = game_dir / fn
         if p.is_file():
             text = p.read_text(encoding="utf-8-sig", errors="ignore")
-            if re.search(r"(?m)^ *screen\s+preferences\b", text):
+            if re.search(_PREF_SCREEN_RE, text):
                 return text, p
     # 2. screens.rpyc / screens.rpymc
     for fn in ("screens.rpyc", "screens.rpymc"):
         p = game_dir / fn
         if p.is_file():
             text = _decompile_to_text(p)
-            if text and re.search(r"(?m)^ *screen\s+preferences\b", text):
+            if text and re.search(_PREF_SCREEN_RE, text):
                 return text, p
     # 3. 全目录搜索（源码）
     for dirpath, dirnames, filenames in os.walk(game_dir):
@@ -506,7 +524,7 @@ def _find_preferences_source(game_dir: Path) -> tuple[str | None, Path | None]:
                 text = p.read_text(encoding="utf-8-sig", errors="ignore")
             except OSError:
                 continue
-            if re.search(r"(?m)^ *screen\s+preferences\b", text):
+            if re.search(_PREF_SCREEN_RE, text):
                 return text, p
     # 4. 全目录搜索（编译文件）
     for dirpath, dirnames, filenames in os.walk(game_dir):
@@ -515,9 +533,26 @@ def _find_preferences_source(game_dir: Path) -> tuple[str | None, Path | None]:
             if os.path.splitext(fn)[1].lower() not in (".rpyc", ".rpymc"):
                 continue
             p = Path(dirpath) / fn
-            text = _decompile_to_text(p)
-            if text and re.search(r"(?m)^ *screen\s+preferences\b", text):
+            text = _decompile_rpyc_source(p, p.name)
+            if text and re.search(_PREF_SCREEN_RE, text):
                 return text, p
+    # 5. 脚本打包在 .rpa 归档中：game 目录没有 screens 源码/编译文件，
+    #    从归档读取 screens.rpyc（或同源 .rpy）反编译提取屏幕定义。
+    rpas = [p for p in game_dir.glob("*.rpa")
+            if p.is_file() and p.suffix.lower() == ".rpa"]
+    if rpas:
+        from . import rpa_loader
+        for cand in ("screens.rpyc", "screens.rpymc",
+                     "screens.rpy", "screens.rpym"):
+            data = rpa_loader.read_script_data(rpas, cand)
+            if not data:
+                continue
+            if cand.endswith((".rpy", ".rpym")):
+                text = data.decode("utf-8-sig", errors="ignore")
+            else:
+                text = _decompile_rpyc_source(data, cand)
+            if text and re.search(_PREF_SCREEN_RE, text):
+                return text, None  # 来源归档内（无磁盘路径）
     return None, None
 
 
@@ -570,7 +605,7 @@ def apply_language_ui(game_dir: Path, language: str = "schinese") -> PatchResult
         header = (
             "# -*- coding: utf-8 -*-\n"
             "# 语言切换界面（汉化工具自动生成）：为无语言按钮的游戏补上语言选择。\n"
-            f"# 来源: {src_path.name}\n\n"
+            f"# 来源: {src_path.name if src_path else '归档内 screens 脚本'}\n\n"
         )
         patch.write_text(header + new_block, encoding="utf-8-sig")
     except OSError as e:
