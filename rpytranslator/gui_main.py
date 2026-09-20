@@ -489,6 +489,10 @@ class GuiApp(XamlApplication):
         self.worker.start()
         self._ensure_timer()
         self._set_busy(True)
+        # ETA 倒计时起点：任务启动时刻（含解包/反编译阶段），并清空旧任务状态
+        self._eta_start = time.monotonic()
+        self._eta_smooth = None
+        self._eta_max_pct = 0
         self.ProgressText.Text = "准备中…"
         self.StatusText.Text = "正在翻译…"
         self._append_log("开始汉化: %s → %s" % (self.game_dir, lang), "info")
@@ -675,15 +679,55 @@ class GuiApp(XamlApplication):
             pass
 
     def _update_progress(self, pct: int) -> None:
-        """对接成功后：把“就绪”替换为实时百分比进度。"""
+        """对接成功后：把“就绪”替换为实时百分比进度 + 预计剩余时间。"""
         pct = max(0, min(100, pct))
         self.Progress.IsIndeterminate = False
         self.Progress.Value = pct
-        self.ProgressText.Text = "%d%%" % pct
+        # 进度只增不减（流水线分阶段上报时可能回退），保证 ETA 单调收敛
+        if pct > getattr(self, "_eta_max_pct", 0):
+            self._eta_max_pct = pct
+        eta = self._estimate_remaining(pct)
+        self.ProgressText.Text = "%d%%%s" % (
+            pct, " · 剩余约 %s" % eta if eta else "")
+
+    def _estimate_remaining(self, pct: int) -> str | None:
+        """根据已耗时与当前进度估算剩余时间，指数平滑抑制抖动。
+
+        - 起点取任务启动时刻（含解包/反编译等前期阶段），避免整体低估；
+        - 进度过早（<3%）或刚起步（<5 秒）时估算极不稳定，暂不显示；
+        - 用历史值的指数加权平均（0.7 旧 + 0.3 新）平滑吞吐波动。
+        """
+        start = getattr(self, "_eta_start", None)
+        if start is None or pct >= 100:
+            return None
+        elapsed = time.monotonic() - start
+        if elapsed < 5 or pct < 3:
+            return None
+        raw = elapsed * (100 - pct) / pct
+        prev = getattr(self, "_eta_smooth", None)
+        smooth = raw if prev is None else prev * 0.7 + raw * 0.3
+        self._eta_smooth = smooth
+        return self._format_duration(smooth)
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        """把秒数格式化为人类友好的时长，如 ``1时02分`` / ``3分20秒`` / ``45秒``。"""
+        total = max(1, int(round(seconds)))
+        h, rem = divmod(total, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return "%d时%02d分" % (h, m)
+        if m:
+            return "%d分%02d秒" % (m, s)
+        return "%d秒" % s
 
     def _on_done(self) -> None:
         self.worker = None
         self._set_busy(False)
+        # 清空 ETA 状态，避免下次任务继承上次的起点/平滑值
+        self._eta_start = None
+        self._eta_smooth = None
+        self._eta_max_pct = 0
         if self._test_mode:
             self._test_mode = False
             self.ProgressText.Text = "就绪"
