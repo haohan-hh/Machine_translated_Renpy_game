@@ -5,6 +5,8 @@ CLI 与 GUI 共用；progress_cb(阶段, 消息) 用于界面刷新。
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -12,7 +14,11 @@ from pathlib import Path
 
 from . import engine, rpa_loader
 from .extract import (
-    DialogueUnit, ExtractionResult, extract_rpy_file, extract_rpy_files,
+    DialogueUnit, ExtractionResult, decode_say_string, extract_rpy_file,
+    extract_rpy_files,
+)
+from .verify import (
+    build_missing_fix, runtime_report_path, write_verification_patch,
 )
 from .generator import write_translation_files
 from .housekeeping import dedupe_translate_blocks, remove_stale_rpyc
@@ -93,32 +99,8 @@ def _norm_filename(filename: str, game_dir) -> str:
 
 # Ren'Py 编译 translate 块时插入的位置标记（unrpyc 反编译后残留），
 # 如 `balto "@@p0@@p这样自我介绍可能不是最好的方式。"`。游戏运行时无害，
-# 但会污染译文、干扰增量匹配，解析已有 tl 时统一剥离。
-_ART_PAT = re.compile(r"@@p\d+@@p")
-
-
-def _decode_say(raw: str) -> str:
-    """反向还原 encode_say_string：\\n→换行、\\"→"、\\ →空格、\\\\→\\，
-    并剥离 @@pN@@p 编译残留标记。"""
-    out: list[str] = []
-    i, n = 0, len(raw)
-    while i < n:
-        c = raw[i]
-        if c == "\\" and i + 1 < n:
-            nxt = raw[i + 1]
-            if nxt == "n":
-                out.append("\n")
-            elif nxt == " ":
-                out.append(" ")
-            elif nxt == '"':
-                out.append('"')
-            else:
-                out.append(nxt)          # \\ → \
-            i += 2
-        else:
-            out.append(c)
-            i += 1
-    return _ART_PAT.sub("", "".join(out))
+# 但会污染译文、干扰增量匹配，解析已有 tl 时统一剥离。decode_say_string
+# 已内建该剥离逻辑，故此处只需复用 extract 模块的实现。
 
 
 def _parse_untran_report(path: Path) -> list[str]:
@@ -140,6 +122,71 @@ def _parse_untran_report(path: Path) -> list[str]:
         if m:
             texts.append(m.group(1).strip())
     return texts
+
+
+# ---------------------------------------------------------------------------
+# 断点续译缓存
+# ---------------------------------------------------------------------------
+
+# 缓存中“已翻译文本集合”的指纹标识键
+_CACHE_FP_KEY = "__fp__"
+
+
+def _progress_fingerprint(uniq_d, uniq_s) -> str:
+    """基于本次待翻译文本全集计算的指纹。
+
+    源脚本变化（游戏更新）会导致文本集合变化 → 指纹变化 → 旧缓存作废，
+    避免把旧文本的译文错误套用到更新后的游戏上。
+    """
+    h = hashlib.md5()
+    for u in uniq_d:
+        h.update(("d:" + u.what + "\x00").encode("utf-8", "ignore"))
+    for u in uniq_s:
+        h.update(("s:" + u.text + "\x00").encode("utf-8", "ignore"))
+    return h.hexdigest()
+
+
+def _load_progress_cache(path: Path, fingerprint: str) -> tuple[dict[str, str], dict[str, str]]:
+    """读取断点续译缓存；指纹不一致（源文本已变）时视为无效并删除。"""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if raw.get(_CACHE_FP_KEY) != fingerprint:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return {}, {}
+        d, s = raw.get("dialogues", {}), raw.get("strings", {})
+        if isinstance(d, dict) and isinstance(s, dict):
+            return (
+                {str(k): str(v) for k, v in d.items()},
+                {str(k): str(v) for k, v in s.items()},
+            )
+    except (OSError, ValueError):
+        pass
+    return {}, {}
+
+
+def _save_progress_cache(path: Path, fingerprint: str,
+                         d_by_text: dict[str, str],
+                         s_by_text: dict[str, str]) -> None:
+    """把翻译进度实时写入缓存（供断点续译）。失败静默（不影响主流程）。"""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {_CACHE_FP_KEY: fingerprint,
+                "dialogues": d_by_text, "strings": s_by_text}
+        path.write_text(json.dumps(data, ensure_ascii=False),
+                        encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _drop_progress_cache(path: Path) -> None:
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError:
+        pass
 
 
 _TRANS_RE = re.compile(r"translate\s+(\S+)\s+(\S+):\s*$")
@@ -182,9 +229,9 @@ def _parse_existing_tl(tl_dir: Path, language: str) -> tuple[dict[str, str], dic
                     mo = re.match(r'old\s+"(.*)"\s*$', ln)
                     mn = re.match(r'new\s+"(.*)"\s*$', ln)
                     if mo:
-                        cur_old = _decode_say(mo.group(1))
+                        cur_old = decode_say_string(mo.group(1))
                     elif mn and cur_old is not None:
-                        s_map[cur_old] = _decode_say(mn.group(1))
+                        s_map[cur_old] = decode_say_string(mn.group(1))
                         cur_old = None
                     i += 1
             else:
@@ -200,7 +247,7 @@ def _parse_existing_tl(tl_dir: Path, language: str) -> tuple[dict[str, str], dic
                         q = ln.find('"')
                         rq = ln.rfind('"')
                         if q != -1 and rq > q:
-                            d_map[block_id] = _decode_say(ln[q + 1:rq])
+                            d_map[block_id] = decode_say_string(ln[q + 1:rq])
                         break
                     i += 1
                 # 跳过本块其余行，直到下一个 translate 块
@@ -217,6 +264,7 @@ def run_pipeline(
     progress_cb=None,
     apply_font_patch: bool = True,
     apply_language_ui: bool = True,
+    apply_verification: bool = True,
     extra_terms: list[str] | None = None,
 ) -> PipelineResult:
     """执行完整汉化流程，返回结果统计。"""
@@ -275,22 +323,12 @@ def run_pipeline(
             return result
 
     report_path = info.game_dir / "tl" / f"{language}.未翻译报告.txt"
-    # 游戏自带中文且没有未翻译报告 → 无需汉化；
-    # 若仍留有未翻译报告（上次汉化未完成），继续增量汉化补齐。
-    if info.has_chinese and not report_path.exists():
-        zh = next(
-            (l for l in info.languages if engine.is_chinese_language(l)),
-            info.languages[0],
-        )
-        # 中文翻译已存在：仍清理一次过期的 .rpyc 缓存，让现有翻译立即生效
-        # （游戏显示英文原文的常见根因——Ren'Py 优先加载不含翻译的旧 .rpyc）。
-        removed_rpyc = remove_stale_rpyc(info.game_dir)
-        extra = (f"；已删除 {removed_rpyc} 个过期 .rpyc 缓存，"
-                 f"下次启动游戏将自动重新编译" if removed_rpyc else "")
-        result.message = f"游戏已自带中文翻译（tl/{zh}），无需汉化{extra}"
-        result.removed_rpyc = removed_rpyc
-        result.ok = True
-        return result
+    # 断点续译缓存：翻译过程中实时保存 (原文→译文)；中断后重跑时跳过
+    # 已翻译文本。Ren'Py 只加载 tl 下的 .rpy，.json 文件不会被当作翻译。
+    progress_cache = info.game_dir / "tl" / f".{language}.汉化进度.json"
+    # 说明：游戏“已含中文 tl”时的判断不能放在提取之前——否则游戏更新后
+    # 只会看到旧 tl 而直接返回，永远发现不了新增剧情。真正的“已是最新 /
+    # 需要补译更新部分”要在提取并做文本级 diff 之后判断（见 5.2）。
 
     # 2. 增量汉化检测：拖入已汉化过的游戏时，检查是否仍存有未翻译报告。
     #    有则本次只翻译报告中列出的文本，保留已有译文，完成后自动更新报告，
@@ -433,7 +471,125 @@ def run_pipeline(
     else:
         todo_d, todo_s = uniq_d, uniq_s
 
-    # 6. 翻译 + 自动补译：第一次翻译后，凡译文仍等于原文（失败回退）的
+    # 5.2 游戏更新检测：游戏已有本工具/标准格式的汉化文件（tl/<语言>）时，
+    #     现有 tl 中已覆盖的文本全部沿用，本次只翻译「新增 / 未覆盖」文本。
+    #     游戏升级（更新脚本、新增剧情）后会自动命中这里 → 旧译文 100%
+    #     保留，只补译更新带来的新文本，不会误判“无需汉化”或全量重译。
+    # 5.2 与 7 步组装共用一份解析结果，避免对同一目录解析两次。
+    existing_d: dict[str, str] = {}
+    existing_s: dict[str, str] = {}
+    if info.has_chinese and not retry_texts and (todo_d or todo_s):
+        parsed_d, parsed_s = _parse_existing_tl(
+            info.game_dir / "tl" / language, language)
+        existing_d.update(parsed_d)
+        existing_s.update(parsed_s)
+        # 保护：tl 目录里有 .rpy 却解析不出任何标准翻译块（如官方译文打包
+        # 在 .rpa、目录内容异常）→ 无法安全沿用/增量，避免 rmtree 重建时
+        # 误覆盖原目录，按旧版语义返回“游戏已自带中文翻译”。
+        if not existing_d and not existing_s and any(
+                (info.game_dir / "tl" / language).rglob("*.rpy")):
+            removed_rpyc = remove_stale_rpyc(info.game_dir)
+            extra = (f"；已删除 {removed_rpyc} 个过期 .rpyc 缓存，"
+                     f"下次启动游戏将自动重新编译" if removed_rpyc else "")
+            zh = next(
+                (l for l in info.languages
+                 if engine.is_chinese_language(l)),
+                language,
+            )
+            result.removed_rpyc = removed_rpyc
+            log(f"tl/{zh} 已有文件但无法解析为翻译块，本次跳过汉化以避免覆盖")
+            result.message = f"游戏已自带中文翻译（tl/{zh}），无需汉化{extra}"
+            result.ok = True
+            return result
+        existing_digests = {i.split("_")[-1] for i in existing_d}
+
+        def _tl_covered(d: DialogueUnit) -> bool:
+            """该对话是否已有现成译文（identifier 精确匹配 / 摘要段匹配 /
+            重复后缀 …_digest_N 的摘要段匹配）。原文被修改 → 摘要段变化 →
+            判定为未覆盖 → 重新翻译。"""
+            if d.identifier in existing_d:
+                return True
+            seg = d.identifier.rsplit("_", 1)[-1]
+            if seg in existing_digests:
+                return True
+            if "_" in d.identifier:
+                prev = d.identifier.rsplit("_", 2)[-2]
+                if prev in existing_digests:
+                    return True
+            return False
+
+        new_d_whats = {d.what for d in dialogues if not _tl_covered(d)}
+        new_s_texts = {s.text for s in strings if s.text not in existing_s}
+        if new_d_whats or new_s_texts:
+            todo_d = [u for u in uniq_d if u.what in new_d_whats]
+            todo_s = [u for u in uniq_s if u.text in new_s_texts]
+            log(f"检测到游戏更新/新增文本：本次需补译 {len(todo_d)} 条对话、"
+                f"{len(todo_s)} 条字符串；其余 {len(uniq_d) - len(todo_d)} 条对话、"
+                f"{len(uniq_s) - len(todo_s)} 条字符串已有译文，将全部保留")
+        else:
+            # 5.2.1 现有汉化已覆盖当前版本全部文本 → 无需再翻译
+            log("现有汉化已覆盖当前版本全部文本，无需新增翻译")
+            _drop_progress_cache(progress_cache)
+            removed_rpyc = remove_stale_rpyc(info.game_dir)
+            extra = (f"；已删除 {removed_rpyc} 个过期 .rpyc 缓存，"
+                     f"下次启动游戏将自动重新编译" if removed_rpyc else "")
+            zh = next(
+                (l for l in info.languages
+                 if engine.is_chinese_language(l)),
+                language,
+            )
+            result.removed_rpyc = removed_rpyc
+            # 仍可能“运行时缺翻译”（提取覆盖不到的对话，表现为部分英文），
+            # 因此继续做运行时验证 / 按运行时 identifier 自动补译。
+            if apply_verification:
+                result.post_patches.append(
+                    write_verification_patch(info.game_dir, language, log_cb=log))
+            if runtime_report_path(info.game_dir, language).is_file():
+                log("检测到运行时缺失报告（游戏内仍有对话缺少翻译），"
+                    "正在按运行时 identifier 自动补译…")
+                if client is None:
+                    client = TranslationClient(config or TranslationConfig())
+                result.post_patches.append(build_missing_fix(
+                    info.game_dir, language, client=client, log_cb=log))
+                removed = remove_stale_rpyc(info.game_dir)
+                result.removed_rpyc += removed
+                if removed:
+                    log(f"已删除 {removed} 个过期 .rpyc 缓存，"
+                        f"下次启动游戏将自动重新编译")
+                result.ok = True
+                lines = [p.message for p in result.post_patches
+                         if p.ok and p.message]
+                lines.append("提示：重新启动一次游戏，运行时校验会自动更新缺失报告；"
+                             "报告只剩空对话/符号（无实际文本）即视为汉化完整")
+                result.message = "\n".join(lines)
+                return result
+            result.message = f"汉化已是最新：tl/{zh} 已覆盖当前版本全部文本{extra}"
+            result.ok = True
+            return result
+
+    # 6. 断点续译：加载上次汉化中断前实时保存的缓存（原文→译文）。
+    #    文本全集指纹一致时，命中缓存的文本本次直接跳过，不再重复调用 API。
+    #    （指纹变化 = 源脚本已更新，旧缓存作废，自动走全新汉化。）
+    fingerprint = _progress_fingerprint(uniq_d, uniq_s)
+    cached_d, cached_s = _load_progress_cache(progress_cache, fingerprint)
+    d_by_text: dict[str, str] = dict(cached_d)
+    s_by_text: dict[str, str] = dict(cached_s)
+    if cached_d or cached_s:
+        log(f"检测到上次汉化进度缓存（对话 {len(cached_d)} 条、"
+            f"字符串 {len(cached_s)} 条），本次将从中断处继续…")
+
+    # 真正需要调用 API 的文本 = 待翻译列表中「缓存缺失」或「缓存译文仍
+    # 等于原文（上次失败回退，需重试）」的条目
+    need_d = [u for u in todo_d
+              if u.what not in d_by_text or d_by_text[u.what] == u.what]
+    need_s = [u for u in todo_s
+              if u.text not in s_by_text or s_by_text[u.text] == u.text]
+    if len(need_d) < len(todo_d) or len(need_s) < len(todo_s):
+        log(f"缓存命中：跳过 {len(todo_d) - len(need_d)} 条对话、"
+            f"{len(todo_s) - len(need_s)} 条字符串，本次待翻译 "
+            f"{len(need_d)} 条对话、{len(need_s)} 条字符串")
+
+    # 6.1 翻译 + 自动补译：第一次翻译后，凡译文仍等于原文（失败回退）的
     #    文本会自动进入下一轮，只重译这些文本；重复直到全部翻译完成
     #    （或达到 MAX_RETRY_ROUNDS 上限，此时保留“未翻译报告”供手动处理）。
     if client is None:
@@ -443,7 +599,7 @@ def run_pipeline(
     log(f"开始 AI 翻译（目标语言：{target}）…")
     t0 = time.time()
 
-    total = len(todo_d) + len(todo_s)
+    total = len(need_d) + len(need_s)
     def report_progress(done: int, total: int) -> None:
         pct = int(done * 100 / total) if total else 100
         if progress_cb:
@@ -453,23 +609,42 @@ def run_pipeline(
         if progress_cb:
             progress_cb("ERR|" + msg)
 
+    # 实时落盘：每翻译完若干条写一次缓存（中断最多丢最近一小批）
+    _pt_writes = [0]
+    _PT_FLUSH_EVERY = 50
+
+    def _flush_pt_cache() -> None:
+        _save_progress_cache(progress_cache, fingerprint, d_by_text, s_by_text)
+
+    def _make_item_cb(table: dict[str, str]):
+        def item_cb(text: str, result: str) -> None:
+            if not text.strip():
+                return
+            table[text] = result
+            _pt_writes[0] += 1
+            if _pt_writes[0] >= _PT_FLUSH_EVERY:
+                _pt_writes[0] = 0
+                _flush_pt_cache()
+        return item_cb
+
     # 第 1 轮：翻译本轮待翻译的去重文本
     d_trans = client.translate_texts(
-        [u.what for u in todo_d], target=target, names=protect_terms,
+        [u.what for u in need_d], target=target, names=protect_terms,
         progress_cb=report_progress, offset=0, total=total,
-        error_cb=report_error)
+        error_cb=report_error, item_cb=_make_item_cb(d_by_text))
     s_trans = client.translate_texts(
-        [u.text for u in todo_s], target=target, names=protect_terms,
-        progress_cb=report_progress, offset=len(todo_d), total=total,
-        error_cb=report_error)
-
-    # 按文本保存译文（多轮补译期间持续更新）
-    d_by_text: dict[str, str] = {u.what: tr for u, tr in zip(todo_d, d_trans)}
-    s_by_text: dict[str, str] = {u.text: tr for u, tr in zip(todo_s, s_trans)}
+        [u.text for u in need_s], target=target, names=protect_terms,
+        progress_cb=report_progress, offset=len(need_d), total=total,
+        error_cb=report_error, item_cb=_make_item_cb(s_by_text))
+    for u, tr in zip(need_d, d_trans):
+        d_by_text[u.what] = tr
+    for u, tr in zip(need_s, s_trans):
+        s_by_text[u.text] = tr
+    _flush_pt_cache()
 
     # 第 2+ 轮：只重译仍未翻译（译文 == 原文）的文本
-    # 注意：这里使用 retry_d/retry_s，不要复用上面的 todo_d/todo_s，
-    # 后者在增量汉化里表示“本次要翻译的条目”，后面组装映射还要用到。
+    # 注意：这里使用 retry_d/retry_s，不要复用上面的 need_d/need_s，
+    # 后者表示“本轮真正调用了 API 的条目”，后面组装映射还要用到 todo_d。
     retry_round = 0
     while True:
         retry_d = [u for u in uniq_d if d_by_text.get(u.what) == u.what]
@@ -494,15 +669,16 @@ def run_pipeline(
         d2 = client.translate_texts(
             [u.what for u in retry_d], target=target, names=protect_terms,
             progress_cb=sub_progress, offset=0, total=sub_total,
-            error_cb=report_error)
+            error_cb=report_error, item_cb=_make_item_cb(d_by_text))
         s2 = client.translate_texts(
             [u.text for u in retry_s], target=target, names=protect_terms,
             progress_cb=sub_progress, offset=len(retry_d), total=sub_total,
-            error_cb=report_error)
+            error_cb=report_error, item_cb=_make_item_cb(s_by_text))
         for u, tr in zip(retry_d, d2):
             d_by_text[u.what] = tr
         for u, tr in zip(retry_s, s2):
             s_by_text[u.text] = tr
+        _flush_pt_cache()
     if progress_cb:
         progress_cb("PROGRESS|100")
 
@@ -517,8 +693,10 @@ def run_pipeline(
     #    避免全量重写后丢失），再写入本次翻译结果。同一文本的所有出现
     #    （identifier 不同）共享同一译文，避免按文本去重后重复出现的对话
     #    拿不到译文而被跳过。
-    existing_d, existing_s = _parse_existing_tl(
-        info.game_dir / "tl" / language, language)
+    if not existing_d and not existing_s:
+        # 全新游戏或 5.2 未执行的场景：未持有任何解析结果时再补一次解析
+        existing_d, existing_s = _parse_existing_tl(
+            info.game_dir / "tl" / language, language)
     dialogue_translations: dict[str, str] = dict(existing_d)
     string_translations: dict[str, str] = dict(existing_s)
     # 增量兼容（identifier 前缀修正）：命名 menu 是 Ren'Py 的隐式 label，
@@ -573,6 +751,9 @@ def run_pipeline(
     if result.removed_dup_blocks:
         log(f"已清理翻译文件中 {result.removed_dup_blocks} 个重复 translate 块")
 
+    # 翻译文件已成功生成 → 断点缓存已完成使命，删除以免下次误判为“未完成”
+    _drop_progress_cache(progress_cache)
+
     cleanup_all()
 
     if not written:
@@ -605,6 +786,23 @@ def run_pipeline(
     if result.removed_rpyc:
         log(f"已删除 {result.removed_rpyc} 个过期编译缓存（.rpyc），"
             f"Ren'Py 下次启动将自动重新编译")
+
+    # 9.2 运行时翻译验证闭环：注入验证补丁（下次启动游戏自动导出“运行时
+    #     缺失报告”）；若已有报告（上次启动生成），按运行时 identifier 自动
+    #     补译提取器覆盖不到、主流程无法感知的漏译对话。
+    if apply_verification:
+        result.post_patches.append(
+            write_verification_patch(info.game_dir, language, log_cb=log))
+    if runtime_report_path(info.game_dir, language).is_file():
+        result.post_patches.append(build_missing_fix(
+            info.game_dir, language, client=client,
+            names=protect_terms, log_cb=log))
+        if result.post_patches and result.post_patches[-1].files:
+            removed = remove_stale_rpyc(info.game_dir)
+            result.removed_rpyc += removed
+            if removed:
+                log(f"已删除 {removed} 个过期编译缓存（.rpyc），"
+                    f"Ren'Py 下次启动将自动重新编译")
 
     # 10. 统计与未翻译报告
     elapsed = time.time() - t0

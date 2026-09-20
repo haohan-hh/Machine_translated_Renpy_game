@@ -12,6 +12,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
@@ -159,6 +160,7 @@ class TranslationConfig:
     max_retries: int = 3
     chunk_chars: int = 1200          # 每个批量请求的字符上限
     chunk_items: int = 40            # 每个批量请求的条目上限
+    max_workers: int = 1             # 并发批次数（>1 显著加速，注意服务端限流）
 
 
 class TranslationError(Exception):
@@ -235,12 +237,15 @@ class TranslationClient:
         self, texts: list[str], target: str = DEFAULT_TARGET,
         progress_cb=None, offset: int = 0, total: int | None = None,
         error_cb=None, names: list[str] | None = None,
+        item_cb=None,
     ) -> list[str]:
         """批量翻译文本，返回与输入等长的译文列表（失败项回退原文）。
 
         names: 需整体保留原文的人名/专有名词列表（翻译前保护为占位符）。
         progress_cb(done, total) 在每完成一个批次时回调，用于实时进度显示。
         error_cb(msg) 在每次请求失败时回调（去重），用于实时错误提示。
+        item_cb(text, result) 每翻译完一条文本即回调 (原文, 译文)，
+            供调用方实时落盘缓存实现断点续译（中断后跳过已翻译文本）。
         """
         results: list[str] = list(texts)
         indices = [i for i, t in enumerate(texts) if t.strip()]
@@ -251,17 +256,61 @@ class TranslationClient:
         payload_texts = [texts[i] for i in indices]
 
         chunks = self._chunk(payload_texts)
-        translated: list[str] = []
-        done = 0
-        for chunk in chunks:
-            translated.extend(self._translate_chunk(chunk, target, error_cb, names))
-            done += len(chunk)
-            if progress_cb:
-                progress_cb(offset + done, total)
+        if self.config.max_workers > 1 and len(chunks) > 1:
+            translated = self._translate_chunks_parallel(
+                chunks, target, error_cb, names, progress_cb, offset, total,
+                item_cb=item_cb)
+        else:
+            translated = []
+            done = 0
+            for chunk in chunks:
+                chunk_out = self._translate_chunk(
+                    chunk, target, error_cb, names)
+                if item_cb:
+                    for t, r in zip(chunk, chunk_out):
+                        item_cb(t, r)
+                translated.extend(chunk_out)
+                done += len(chunk)
+                if progress_cb:
+                    progress_cb(offset + done, total)
 
         for idx, val in zip(indices, translated):
             results[idx] = val
         return results
+
+    def _translate_chunks_parallel(
+        self, chunks: list[list[str]], target: str, error_cb=None,
+        names: list[str] | None = None, progress_cb=None,
+        offset: int = 0, total: int | None = None,
+        item_cb=None,
+    ) -> list[str]:
+        """并发翻译多个批次（按提交顺序收集，保持结果稳定）。"""
+        done_prefix: list[int] = []
+        acc = 0
+        for c in chunks:
+            acc += len(c)
+            done_prefix.append(acc)
+
+        results: list[list[str]] = [None] * len(chunks)  # type: ignore[list-item]
+
+        def worker(i: int, chunk: list[str]) -> tuple[int, list[str]]:
+            return i, self._translate_chunk(chunk, target, error_cb, names)
+
+        with ThreadPoolExecutor(max_workers=self.config.max_workers) as ex:
+            futures = [ex.submit(worker, i, c) for i, c in enumerate(chunks)]
+            for f in futures:  # 按提交顺序取结果，避免多线程期间列表错位
+                i, out = f.result()
+                results[i] = out
+                if item_cb:
+                    for t, r in zip(chunks[i], out):
+                        item_cb(t, r)
+                if progress_cb:
+                    progress_cb(offset + done_prefix[i], total)
+
+        flat: list[str] = []
+        for o in results:
+            flat.extend(o)
+        return flat
 
     def _chunk(self, texts: list[str]) -> list[list[str]]:
         cfg = self.config

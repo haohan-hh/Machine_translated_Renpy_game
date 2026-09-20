@@ -197,7 +197,13 @@ def _detect_rpa_archives(info: GameInfo, game_dir: Path) -> None:
     if not rpas:
         return
     seen: set[str] = set()
-    rpas = [p for p in rpas if p.name not in seen and not seen.add(p.name)]
+    unique: list[Path] = []
+    for p in rpas:
+        if p.name in seen:
+            continue
+        seen.add(p.name)
+        unique.append(p)
+    rpas = unique
     rpas.sort(key=lambda p: str(p).lower())
 
     scripts: list[str] = []

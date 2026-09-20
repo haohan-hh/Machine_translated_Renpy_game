@@ -20,5 +20,15 @@ build_log.txt
 _unittest_results.txt
 _tmp_*.py
 
+# 运行时临时日志 / 错误输出（不入库，git status 易刷屏）
+_*.err
+_*.log
+*.err
+*.log
+_gui_worker_err.txt
+_append_log_err.txt
+after_class_hanhua.err
+after_class_hanhua.log
+
 # 本地汉化备份（不入库）
 schinese_old_backup/

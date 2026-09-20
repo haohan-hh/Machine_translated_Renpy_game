@@ -14,6 +14,7 @@ CLI 选项:
     --keep-terms  额外保留原文的专有名词（人名等），逗号分隔
     --no-font-patch  跳过自动配置中文字体
     --no-lang-ui     跳过注入语言切换界面
+    --no-verify      跳过注入运行时翻译验证补丁
 """
 from __future__ import annotations
 
@@ -41,6 +42,8 @@ def main(argv=None) -> int:
                         help="跳过自动配置中文字体")
     parser.add_argument("--no-lang-ui", action="store_true",
                         help="跳过注入语言切换界面")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="跳过注入运行时翻译验证补丁")
 
     args = parser.parse_args(argv)
 
@@ -95,6 +98,7 @@ def _launch_cli(args) -> int:
                           progress_cb=_progress,
                           apply_font_patch=not args.no_font_patch,
                           apply_language_ui=not args.no_lang_ui,
+                          apply_verification=not args.no_verify,
                           extra_terms=extra_terms or None)
     print("\n" + "=" * 50)
     print(result.message)

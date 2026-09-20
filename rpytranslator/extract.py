@@ -63,6 +63,40 @@ def encode_say_string(s: str) -> str:
     return '"' + s + '"'
 
 
+# Ren'Py 编译 translate 块时插入的位置标记（unrpyc 反编译后残留），如
+# `balto "@@p0@@p这样自我介绍可能不是最好的方式。"`。游戏运行时无害，
+# 但会污染译文、干扰增量匹配，解析已有 tl 时统一剥离。
+_SAY_POS_MARKER = re.compile(r"@@p\d+@@p")
+
+
+def decode_say_string(raw: str) -> str:
+    """反向还原 ``encode_say_string``：\\n → 换行、\\" → "、\\ → 空格、\\\\ → \\，
+    并剥离 @@pN@@p 编译残留的位置标记。
+
+    解析既有 tl 时复用本函数，与生成器输出格式一致；剥离位置标记可避免
+    Ren'Py 编译残留干扰译文增量匹配（同一原文出现两条生成式与以不同形式）。
+    """
+    out: list[str] = []
+    i, n = 0, len(raw)
+    while i < n:
+        c = raw[i]
+        if c == "\\" and i + 1 < n:
+            nxt = raw[i + 1]
+            if nxt == "n":
+                out.append("\n")
+            elif nxt == " ":
+                out.append(" ")
+            elif nxt == '"':
+                out.append('"')
+            else:
+                out.append(nxt)          # \\ → \
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return _SAY_POS_MARKER.sub("", "".join(out))
+
+
 def make_say_code(
     who: str | None,
     what: str,
@@ -656,14 +690,15 @@ class RpyExtractor:
         temporary: list[str] = []
         who = None
 
-        # 已给出 who 时解析属性
+        # 已给出 who 时解析属性（Ren'Py 官方语法：可选 - 前缀的裸词，
+        # 如 `Mikko strained "..."`；unrpyc 反编译输出即此格式）
         if pos > 0:
             who = s[:pos].strip()
             while True:
                 j = i
                 while j < n and s[j] in " \t":
                     j += 1
-                m = re.match(r"([+-][A-Za-z_]\w*)", s[j:])
+                m = re.match(r"([+-]?[A-Za-z_]\w*)", s[j:])
                 if not m:
                     break
                 attributes.append(m.group(1))
@@ -678,7 +713,7 @@ class RpyExtractor:
                     j = i
                     while j < n and s[j] in " \t":
                         j += 1
-                    m = re.match(r"([+-][A-Za-z_]\w*)", s[j:])
+                    m = re.match(r"([+-]?[A-Za-z_]\w*)", s[j:])
                     if not m:
                         break
                     temporary.append(m.group(1))

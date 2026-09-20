@@ -230,7 +230,7 @@ class GuiApp(XamlApplication):
     def OnLaunched(self, args) -> None:
         win = Window()
         self._win = win
-        win.Title = "Ren'Py 自动汉化工具"
+        win.Title = "Ren'Py 自动汉化工具 v0.1.4"
 
         # Mica 背景（类 Win11 深色磨砂）
         try:
