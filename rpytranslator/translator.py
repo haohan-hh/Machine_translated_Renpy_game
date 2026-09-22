@@ -183,9 +183,15 @@ _SINGLE_SYSTEM_PROMPT = (
     "4. 语气自然，符合角色口吻。"
 )
 
-# 面向「纯机器翻译模型」（如 Hunyuan-MT / hy-mt2、Sakura）的精简系统提示词。
-# 这类模型未经指令微调：实测长中文系统提示会使批译完全失败（模型转而"聊天"），
-# 而极简英文指令 + 严格 JSON/占位符约束可稳定输出正确数组。
+# 精简系统提示词：用于「无法按常规指令返回结构化结果」的模型。
+#
+# 部分机器翻译模型（含本地部署的各类 MT 模型）未经指令微调，对较长的中文
+# 系统提示不耐受——会退化成自由"聊天"而不返回 JSON 数组，导致整批翻译失败；
+# 改用极简英文指令 + 严格 JSON/占位符约束后可稳定输出。
+#
+# 何时启用由运行时的**实际返回行为**自动判定（见
+# TranslationClient._request_json_array），不依赖模型名称、厂商或是否本地部署，
+# 因此对任意本地/云端模型通用。
 _COMPACT_SYSTEM_PROMPT = (
     "You are a professional game localization translator. Translate each item "
     "of the input JSON array into {target}.\n"
@@ -207,7 +213,7 @@ _COMPACT_SINGLE_PROMPT = (
     "proper names in original form."
 )
 
-# 精简提示词使用英文语言名（与 MT 模型的训练指令一致，效果更稳定）
+# 精简提示词使用英文语言名（与多数机器翻译模型的训练指令一致，效果更稳定）
 _COMPACT_TARGETS = {
     "简体中文": "Simplified Chinese",
     "繁体中文": "Traditional Chinese",
@@ -215,23 +221,6 @@ _COMPACT_TARGETS = {
     "日本語": "Japanese",
     "English": "English",
 }
-
-
-def is_local_mt_model(config: TranslationConfig) -> bool:
-    """判断是否为「本地部署的纯机器翻译模型」。
-
-    仅当端点指向本机（localhost / 127.0.0.1 / ::1）且模型名带 mt / sakura
-    等机器翻译特征时才启用精简提示词；云端大模型与通用本地模型
-    （qwen、llama 等）保持原有详细提示词，行为不变。
-    """
-    try:
-        host = (urlparse(config.base_url).hostname or "").lower()
-    except Exception:  # noqa: BLE001
-        return False
-    if host not in ("localhost", "127.0.0.1", "::1", ""):
-        return False
-    name = (config.model or "").lower()
-    return any(k in name for k in ("mt", "sakura", "hunyuan"))
 
 
 DEFAULT_TARGET = "简体中文"
@@ -248,11 +237,21 @@ class TranslationConfig:
     chunk_chars: int = 1200          # 每个批量请求的字符上限
     chunk_items: int = 40            # 每个批量请求的条目上限
     max_workers: int = 1             # 并发批次数（>1 显著加速，注意服务端限流）
-    compact_prompt: bool = False     # 强制使用精简提示词（本地 MT 模型自动启用）
+    # 提示词风格：None=按模型实际返回行为自动适配（默认，通用）；
+    # True=始终使用精简提示词；False=始终使用详细提示词（关闭自动切换）。
+    compact_prompt: bool | None = None
 
 
 class TranslationError(Exception):
     """翻译过程中不可恢复的错误。"""
+
+
+class ResponseFormatError(TranslationError):
+    """模型返回内容不符合预期结构（非 JSON 数组 / 条目数不符等）。
+
+    单独成类是为了与「网络 / HTTP 失败」区分开：只有这类错误才意味着
+    可能是提示词风格与模型不匹配，值得换一种提示词风格再试。
+    """
 
 
 class PauseRequested(Exception):
@@ -270,6 +269,9 @@ class TranslationClient:
         self.error_messages: list[str] = []  # 去重后的错误详情
         # 暂停信号（threading.Event，置位即暂停）。由 GUI 注入。
         self.pause_event = None
+        # 会话内自适应的提示词风格：False=详细（初始值），True=精简。
+        # 一旦观测到模型无法按详细提示词返回结构化结果，即切换并记住。
+        self._compact_style = False
 
     def _check_pause(self) -> None:
         ev = self.pause_event
@@ -327,12 +329,10 @@ class TranslationClient:
             # 统一附上可操作的中文排查提示。
             self.error_count += 1
             reason = getattr(e, "reason", e)
-            host = ""
             try:
-                from urllib.parse import urlparse
                 host = urlparse(self.config.base_url).hostname or ""
             except Exception:  # noqa: BLE001
-                pass
+                host = ""
             msg = (f"无法连接翻译服务（{self.config.base_url}）: {reason}"
                    f"\n{tcp_error_hint(reason, host)}")
             self._record_error(msg, error_cb)
@@ -399,9 +399,9 @@ class TranslationClient:
         if n >= 3 and n >= len(texts) * 0.4:
             self._record_error(
                 f"警告：{n}/{len(texts)} 条译文与原文完全相同——模型"
-                f" {self.config.model} 可能不支持该语言方向的翻译"
-                "（如 sakura 仅支持日→中，英文游戏会原样返回）。"
-                "建议更换为 qwen2.5 / glm4 等通用模型。", error_cb)
+                f" {self.config.model} 可能不支持翻译到 {target}"
+                "（部分机器翻译模型只支持特定语向，其他语言会原样返回）。"
+                "建议改用支持该语言的通用指令模型。", error_cb)
 
     def _translate_chunks_parallel(
         self, chunks: list[list[str]], target: str, error_cb=None,
@@ -477,10 +477,8 @@ class TranslationClient:
             self._check_pause()
             sub_payload = [payload[i] for i in pending]
             try:
+                # 条数校验与提示词风格自动切换都在 _request_json_array 内完成
                 raw = self._request_json_array(sub_payload, target, error_cb)
-                if len(raw) != len(sub_payload):
-                    raise TranslationError(
-                        f"返回条目数不符（期望 {len(sub_payload)}，实际 {len(raw)}）")
             except TranslationError as e:
                 self._record_error(str(e), error_cb)
                 if attempt < self.config.max_retries - 1:
@@ -518,23 +516,64 @@ class TranslationClient:
         return out
 
     def _use_compact(self) -> bool:
-        return self.config.compact_prompt or is_local_mt_model(self.config)
+        """当前是否使用精简提示词（True=精简，False=详细）。
+
+        ``config.compact_prompt`` 显式指定时以其为准（True 强制精简、
+        False 强制详细且不自动切换）；默认（None）按会话内观测到的模型
+        行为自适应。
+        """
+        if self.config.compact_prompt is not None:
+            return self.config.compact_prompt
+        return self._compact_style
+
+    @staticmethod
+    def _build_array_messages(payload: list[str], target: str,
+                              compact: bool) -> list[dict]:
+        """组装批量翻译的 messages，按风格选用精简 / 详细系统提示词。"""
+        template = _COMPACT_SYSTEM_PROMPT if compact else _SYSTEM_PROMPT
+        tgt = _COMPACT_TARGETS.get(target, target) if compact else target
+        system = template.format(target=tgt, ph=_PH_PREFIX + "0" + _PH_PREFIX)
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
 
     def _request_json_array(self, payload: list[str], target: str,
                             error_cb=None) -> list[str]:
-        template = (_COMPACT_SYSTEM_PROMPT if self._use_compact()
-                    else _SYSTEM_PROMPT)
-        tgt = _COMPACT_TARGETS.get(target, target) if self._use_compact() \
-            else target
-        system = template.format(
-            target=tgt, ph=_PH_PREFIX + "0" + _PH_PREFIX)
-        user = json.dumps(payload, ensure_ascii=False)
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
-        resp = self.chat(messages, error_cb)
-        return self._parse_json_array(resp)
+        """请求并解析 JSON 数组；结构不符时自动换提示词风格各试一次。
+
+        自适应依据是模型的**实际返回行为**（能否给出条数正确的 JSON 数组），
+        与模型名称、厂商、是否本地部署无关，因此对任意模型通用：
+        默认先用详细提示词；若模型返回的不是可解析的 JSON 数组（未经过
+        指令微调的机器翻译模型的典型表现），自动改用精简提示词重试；
+        精简风格一旦成功即记住，本会话后续请求直接走精简提示词。
+        """
+        styles = [self._use_compact()]
+        if self.config.compact_prompt is None:
+            styles.append(not styles[0])   # 自动模式：允许换一种风格再试
+        last_err: Exception | None = None
+        for i, compact in enumerate(styles):
+            try:
+                arr = self._parse_json_array(
+                    self.chat(self._build_array_messages(payload, target, compact),
+                              error_cb))
+                if len(arr) != len(payload):
+                    raise ResponseFormatError(
+                        f"返回条目数不符（期望 {len(payload)}，实际 {len(arr)}）")
+            except ResponseFormatError as e:
+                last_err = e
+                if i + 1 < len(styles):
+                    self._record_error(
+                        "模型未按%s提示词返回结构化结果，自动改用%s提示词重试…"
+                        % ("精简" if compact else "详细",
+                           "详细" if compact else "精简"), error_cb)
+                continue
+            # 只「升级」不「降级」：确认精简提示词有效后长期沿用，
+            # 避免偶发的单次格式异常把结论反复改回详细提示词。
+            if compact and self.config.compact_prompt is None:
+                self._compact_style = True
+            return arr
+        raise last_err if last_err is not None else TranslationError("批译失败")
 
     @staticmethod
     def _parse_json_array(text: str) -> list[str]:
@@ -546,12 +585,27 @@ class TranslationClient:
         start, end = text.find("["), text.rfind("]")
         if start != -1 and end > start:
             text = text[start:end + 1]
-        arr = json.loads(text)
+        try:
+            arr = json.loads(text)
+        except ValueError as e:
+            raise ResponseFormatError(
+                f"模型返回内容不是合法 JSON 数组（{str(e)[:80]}），"
+                f"响应片段: {text[:120]!r}") from None
         if not isinstance(arr, list):
-            raise TranslationError("翻译服务未返回 JSON 数组")
+            raise ResponseFormatError("模型未返回 JSON 数组")
         return [str(x) for x in arr]
 
     # -- 单条翻译 ----------------------------------------------------------
+
+    @staticmethod
+    def _build_single_prompt(target: str, compact: bool) -> str:
+        """组装单条翻译的系统提示词，按风格选用精简 / 详细版本。"""
+        if compact:
+            return _COMPACT_SINGLE_PROMPT.format(
+                target=_COMPACT_TARGETS.get(target, target),
+                ph=_PH_PREFIX + "0" + _PH_PREFIX)
+        return _SINGLE_SYSTEM_PROMPT.format(
+            target=target, ph=_PH_PREFIX + "0" + _PH_PREFIX)
 
     def _translate_single(self, text: str, target: str, error_cb=None,
                           names: list[str] | None = None) -> str:
@@ -559,35 +613,39 @@ class TranslationClient:
         ptext, ph = protect_text(ntext)
         if not ptext.strip():
             return text
-        if self._use_compact():
-            system = _COMPACT_SINGLE_PROMPT.format(
-                target=_COMPACT_TARGETS.get(target, target),
-                ph=_PH_PREFIX + "0" + _PH_PREFIX)
-        else:
-            system = _SINGLE_SYSTEM_PROMPT.format(
-                target=target, ph=_PH_PREFIX + "0" + _PH_PREFIX)
-        for attempt in range(self.config.max_retries):
-            try:
-                resp = self.chat([
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": ptext},
-                ], error_cb).strip()
-                # 模型可能返回带引号的字符串
-                if len(resp) >= 2 and resp[0] == '"' and resp[-1] == '"':
-                    try:
-                        resp = json.loads(resp)
-                    except Exception:
-                        pass
-                restored = restore_text(resp, ph)
-                restored = restore_names(restored, nph)
-                if _placeholders_preserved(ph, restored) and _placeholders_preserved(nph, restored):
-                    return restored
-            except TranslationError as e:
-                self._record_error(str(e), error_cb)
-            except Exception as e:
-                self._record_error(str(e), error_cb)
-            if attempt < self.config.max_retries - 1:
-                time.sleep(1.5 * (attempt + 1))
+        # 与批量路径一致：默认用详细提示词，失败则换精简提示词再试一次
+        styles = [self._use_compact()]
+        if self.config.compact_prompt is None:
+            styles.append(not styles[0])
+        for style_i, compact in enumerate(styles):
+            system = self._build_single_prompt(target, compact)
+            # 首选风格沿用完整重试次数，换风格后只再试一次
+            tries = self.config.max_retries if style_i == 0 else 1
+            for attempt in range(tries):
+                try:
+                    resp = self.chat([
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": ptext},
+                    ], error_cb).strip()
+                    # 模型可能返回带引号的字符串
+                    if len(resp) >= 2 and resp[0] == '"' and resp[-1] == '"':
+                        try:
+                            resp = json.loads(resp)
+                        except Exception:
+                            pass
+                    restored = restore_text(resp, ph)
+                    restored = restore_names(restored, nph)
+                    if (_placeholders_preserved(ph, restored)
+                            and _placeholders_preserved(nph, restored)):
+                        if compact and self.config.compact_prompt is None:
+                            self._compact_style = True
+                        return restored
+                except TranslationError as e:
+                    self._record_error(str(e), error_cb)
+                except Exception as e:
+                    self._record_error(str(e), error_cb)
+                if attempt < tries - 1:
+                    time.sleep(1.5 * (attempt + 1))
         return text  # 回退原文
 
 
