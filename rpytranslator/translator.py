@@ -122,6 +122,41 @@ def check_braces(text: str) -> bool:
     return stripped.count("{") == stripped.count("}")
 
 
+_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+
+
+def _looks_untranslated(source: str, result: str) -> bool:
+    """译文与原文一致、原文含拉丁字母且无 CJK → 疑似模型未翻译。"""
+    if result != source or not _LATIN_RE.search(source):
+        return False
+    return not _CJK_RE.search(source)
+
+
+def tcp_error_hint(err: object, host: str = "") -> str:
+    """把连接类错误翻译成可操作的中文提示（本地模型场景尤其常见）。
+
+    - WinError 10061 / Connection refused：端口上没有服务在监听。本地模型
+      服务（Ollama / LM Studio）未启动，或只监听 IPv4 而地址解析成了 ::1，
+      或服务端口与填写的地址不一致。
+    - timed out：主机无响应，多为防火墙丢弃或地址/端口错误。
+    """
+    text = str(err).lower()
+    if "10061" in text or "refused" in text:
+        tip = ("目标端口没有服务在监听。使用本地模型时请先启动推理服务"
+               "（Ollama: `ollama serve`；LM Studio: Developer → Start Server），"
+               "并确认服务端口与 API 地址一致（Ollama 默认 11434，LM Studio 默认 1234）。")
+        if host.lower() in ("localhost", "::1", ""):
+            tip += " 若地址写的是 localhost，可改成 127.0.0.1（本地服务多只监听 IPv4）。"
+        return "可能原因：" + tip
+    if "timed out" in text or "timeout" in text:
+        return ("可能原因：目标主机无响应——服务未启动、被防火墙拦截，"
+                "或本地模型推理过慢。本地模型可适当调大超时时间。")
+    if "10013" in text or "permission" in text:
+        return "可能原因：端口访问被系统/安全软件拦截（WinError 10013）。"
+    return "可能原因：网络不通、端口被防火墙拦截、或需要代理。"
+
+
 # ---------------------------------------------------------------------------
 # API 客户端
 # ---------------------------------------------------------------------------
@@ -167,6 +202,11 @@ class TranslationError(Exception):
     """翻译过程中不可恢复的错误。"""
 
 
+class PauseRequested(Exception):
+    """用户请求暂停：立即停止翻译。已完成的条目经 item_cb 实时落盘，
+    缓存里保留了断点，下次运行可从暂停处继续。"""
+
+
 class TranslationClient:
     """OpenAI 兼容 Chat Completions 客户端。"""
 
@@ -175,6 +215,13 @@ class TranslationClient:
         self.request_count = 0       # 实际发出的 API 请求次数
         self.error_count = 0         # 失败的请求次数
         self.error_messages: list[str] = []  # 去重后的错误详情
+        # 暂停信号（threading.Event，置位即暂停）。由 GUI 注入。
+        self.pause_event = None
+
+    def _check_pause(self) -> None:
+        ev = self.pause_event
+        if ev is not None and ev.is_set():
+            raise PauseRequested()
 
     # -- 底层请求 ----------------------------------------------------------
 
@@ -221,9 +268,20 @@ class TranslationClient:
                    f"{(' - ' + detail) if detail else ''}")
             self._record_error(msg, error_cb)
             raise TranslationError(msg) from None
-        except urllib.error.URLError as e:
+        except OSError as e:
+            # URLError（连接被拒/DNS 失败）、TimeoutError（读取超时，读取阶段
+            # 由 http.client 直接抛出、不被 URLError 包裹）等都归到这里，
+            # 统一附上可操作的中文排查提示。
             self.error_count += 1
-            msg = f"无法连接翻译服务（{self.config.base_url}）: {e.reason}"
+            reason = getattr(e, "reason", e)
+            host = ""
+            try:
+                from urllib.parse import urlparse
+                host = urlparse(self.config.base_url).hostname or ""
+            except Exception:  # noqa: BLE001
+                pass
+            msg = (f"无法连接翻译服务（{self.config.base_url}）: {reason}"
+                   f"\n{tcp_error_hint(reason, host)}")
             self._record_error(msg, error_cb)
             raise TranslationError(msg) from None
         try:
@@ -264,6 +322,7 @@ class TranslationClient:
             translated = []
             done = 0
             for chunk in chunks:
+                self._check_pause()
                 chunk_out = self._translate_chunk(
                     chunk, target, error_cb, names)
                 if item_cb:
@@ -276,7 +335,20 @@ class TranslationClient:
 
         for idx, val in zip(indices, translated):
             results[idx] = val
+        self._warn_if_untranslated(payload_texts, translated, target, error_cb)
         return results
+
+    def _warn_if_untranslated(self, texts, translated, target, error_cb=None):
+        if "中文" not in target and "chinese" not in target.lower():
+            return
+        n = sum(1 for t, r in zip(texts, translated)
+                if _looks_untranslated(t, r))
+        if n >= 3 and n >= len(texts) * 0.4:
+            self._record_error(
+                f"警告：{n}/{len(texts)} 条译文与原文完全相同——模型"
+                f" {self.config.model} 可能不支持该语言方向的翻译"
+                "（如 sakura 仅支持日→中，英文游戏会原样返回）。"
+                "建议更换为 qwen2.5 / glm4 等通用模型。", error_cb)
 
     def _translate_chunks_parallel(
         self, chunks: list[list[str]], target: str, error_cb=None,
@@ -294,6 +366,7 @@ class TranslationClient:
         results: list[list[str]] = [None] * len(chunks)  # type: ignore[list-item]
 
         def worker(i: int, chunk: list[str]) -> tuple[int, list[str]]:
+            self._check_pause()
             return i, self._translate_chunk(chunk, target, error_cb, names)
 
         with ThreadPoolExecutor(max_workers=self.config.max_workers) as ex:
@@ -348,6 +421,7 @@ class TranslationClient:
         for attempt in range(self.config.max_retries):
             if not pending:
                 break
+            self._check_pause()
             sub_payload = [payload[i] for i in pending]
             try:
                 raw = self._request_json_array(sub_payload, target, error_cb)
@@ -386,6 +460,7 @@ class TranslationClient:
 
         # 剩余失败条目：逐条翻译（单条请求，失败回退原文）
         for i in pending:
+            self._check_pause()
             out[i] = self._translate_single(texts[i], target, error_cb, names)
         return out
 

@@ -24,7 +24,7 @@ from .generator import write_translation_files
 from .housekeeping import dedupe_translate_blocks, remove_stale_rpyc
 from .patcher import PatchResult, apply_all
 from .rpyc_loader import cleanup, decompile_rpyc_files
-from .translator import TranslationClient, TranslationConfig
+from .translator import PauseRequested, TranslationClient, TranslationConfig
 
 DEFAULT_LANGUAGE = "schinese"
 # 未翻译文本的自动补译轮数上限：每轮只重译上一轮仍然失败的文本，
@@ -58,6 +58,7 @@ class PipelineResult:
     post_patches: list[PatchResult] = field(default_factory=list)
     removed_rpyc: int = 0
     removed_dup_blocks: int = 0
+    paused: bool = False
     message: str = ""
     errors: list[str] = field(default_factory=list)
 
@@ -256,6 +257,55 @@ def _parse_existing_tl(tl_dir: Path, language: str) -> tuple[dict[str, str], dic
     return d_map, s_map
 
 
+def _pause_and_save(language, info, todo_d, todo_s, d_by_text, s_by_text,
+                    result, log, progress_cb, cleanup_all):
+    """用户暂停：已译条目已实时落盘（调用方 _flush_pt_cache），这里负责
+    写「未完成段落标记」并按“已暂停”状态返回。
+
+    标记文件 tl/.{语言}.暂停标记.txt 按原提取顺序列出全部未完成条目；
+    下次 run_pipeline 会自动加载进度缓存跳过已译条目，等于从标记处
+    顺序续译，且与暂停前的译文风格/术语表完全一致（同一套提示词）。
+    """
+    import datetime
+    marker = info.game_dir / "tl" / f".{language}.暂停标记.txt"
+    pend_d = [u for u in todo_d if d_by_text.get(u.what) in (None, u.what)]
+    pend_s = [u for u in todo_s if s_by_text.get(u.text) in (None, u.text)]
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            "汉化暂停标记（汉化工具自动生成，续译完成后自动删除）",
+            f"游戏目录: {info.game_dir}",
+            f"语言: {language}",
+            f"暂停时间: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}",
+            f"已完成并保存: {len(todo_d) - len(pend_d)} 条对话、"
+            f"{len(todo_s) - len(pend_s)} 条字符串",
+            f"未完成（按顺序续译）: {len(pend_d)} 条对话、"
+            f"{len(pend_s)} 条字符串",
+            "",
+            "未完成对话（文件:行号 原文）:",
+        ]
+        lines += [f"  {u.filename}:{u.line}  {u.what}" for u in pend_d]
+        lines += ["", "未完成字符串（文件:行号 原文）:"]
+        lines += [f"  {u.filename}:{u.line}  {u.text}" for u in pend_s]
+        marker.write_text("\n".join(lines), encoding="utf-8")
+    except OSError as e:
+        log(f"! 写暂停标记失败（不影响进度缓存）: {e}")
+    done_d = len(todo_d) - len(pend_d)
+    done_s = len(todo_s) - len(pend_s)
+    log(f"已暂停：本次完成 {done_d} 条对话、{done_s} 条字符串，"
+        f"剩余 {len(pend_d)} 条对话、{len(pend_s)} 条字符串已标记。"
+        f"进度已保存：{marker.parent / f'.{language}.汉化进度.json'}"
+        f"（未完成清单：{marker}）")
+    log("重新打开程序点击「开始汉化」即可从标记处自动继续，无需从头开始。")
+    cleanup_all()
+    result.paused = True
+    result.ok = False
+    result.message = (f"已暂停：完成 {done_d + done_s} 条，"
+                      f"剩余 {len(pend_d) + len(pend_s)} 条已标记，"
+                      "可随时从断点继续")
+    return result
+
+
 def run_pipeline(
     game_path: str | Path,
     config: TranslationConfig | None = None,
@@ -266,6 +316,7 @@ def run_pipeline(
     apply_language_ui: bool = True,
     apply_verification: bool = True,
     extra_terms: list[str] | None = None,
+    pause_event=None,
 ) -> PipelineResult:
     """执行完整汉化流程，返回结果统计。"""
     def log(msg: str):
@@ -577,6 +628,9 @@ def run_pipeline(
     if cached_d or cached_s:
         log(f"检测到上次汉化进度缓存（对话 {len(cached_d)} 条、"
             f"字符串 {len(cached_s)} 条），本次将从中断处继续…")
+        pause_marker = info.game_dir / "tl" / f".{language}.暂停标记.txt"
+        if pause_marker.exists():
+            log("识别到上一次的暂停标记：将按标记顺序续译未完成的段落")
 
     # 真正需要调用 API 的文本 = 待翻译列表中「缓存缺失」或「缓存译文仍
     # 等于原文（上次失败回退，需重试）」的条目
@@ -594,6 +648,8 @@ def run_pipeline(
     #    （或达到 MAX_RETRY_ROUNDS 上限，此时保留“未翻译报告”供手动处理）。
     if client is None:
         client = TranslationClient(config or TranslationConfig())
+    if pause_event is not None:
+        client.pause_event = pause_event
     target = _guess_language_name(language)
 
     log(f"开始 AI 翻译（目标语言：{target}）…")
@@ -627,58 +683,67 @@ def run_pipeline(
                 _flush_pt_cache()
         return item_cb
 
-    # 第 1 轮：翻译本轮待翻译的去重文本
-    d_trans = client.translate_texts(
-        [u.what for u in need_d], target=target, names=protect_terms,
-        progress_cb=report_progress, offset=0, total=total,
-        error_cb=report_error, item_cb=_make_item_cb(d_by_text))
-    s_trans = client.translate_texts(
-        [u.text for u in need_s], target=target, names=protect_terms,
-        progress_cb=report_progress, offset=len(need_d), total=total,
-        error_cb=report_error, item_cb=_make_item_cb(s_by_text))
-    for u, tr in zip(need_d, d_trans):
-        d_by_text[u.what] = tr
-    for u, tr in zip(need_s, s_trans):
-        s_by_text[u.text] = tr
-    _flush_pt_cache()
+    # 第 1 轮：翻译本轮待翻译的去重文本。翻译期间用户可随时暂停：
+    # PauseRequested 在请求间隙抛出 → 落盘缓存 + 写暂停标记后按“已暂停”
+    # 状态返回；已译条目保存在 tl/.{语言}.汉化进度.json，重开程序再点
+    # 「开始汉化」即可自动从标记处继续，无需从头开始。
+    try:
+        d_trans = client.translate_texts(
+            [u.what for u in need_d], target=target, names=protect_terms,
+            progress_cb=report_progress, offset=0, total=total,
+            error_cb=report_error, item_cb=_make_item_cb(d_by_text))
+        s_trans = client.translate_texts(
+            [u.text for u in need_s], target=target, names=protect_terms,
+            progress_cb=report_progress, offset=len(need_d), total=total,
+            error_cb=report_error, item_cb=_make_item_cb(s_by_text))
+        for u, tr in zip(need_d, d_trans):
+            d_by_text[u.what] = tr
+        for u, tr in zip(need_s, s_trans):
+            s_by_text[u.text] = tr
+        _flush_pt_cache()
 
     # 第 2+ 轮：只重译仍未翻译（译文 == 原文）的文本
     # 注意：这里使用 retry_d/retry_s，不要复用上面的 need_d/need_s，
     # 后者表示“本轮真正调用了 API 的条目”，后面组装映射还要用到 todo_d。
-    retry_round = 0
-    while True:
-        retry_d = [u for u in uniq_d if d_by_text.get(u.what) == u.what]
-        retry_s = [u for u in uniq_s if s_by_text.get(u.text) == u.text]
-        if not retry_d and not retry_s:
-            break
-        retry_round += 1
-        if retry_round > MAX_RETRY_ROUNDS:
-            log(f"补译 {MAX_RETRY_ROUNDS} 轮后仍有 {len(retry_d)} 条对话、"
-                f"{len(retry_s)} 条字符串未翻译，保留未翻译报告供手动处理")
-            break
-        sub_total = len(retry_d) + len(retry_s)
-        log(f"补译第 {retry_round}/{MAX_RETRY_ROUNDS} 轮：剩余 "
-            f"{len(retry_d)} 条对话、{len(retry_s)} 条字符串，重新翻译…")
-        time.sleep(2)   # 间隔片刻，缓解限流
+        retry_round = 0
+        while True:
+            retry_d = [u for u in uniq_d if d_by_text.get(u.what) == u.what]
+            retry_s = [u for u in uniq_s if s_by_text.get(u.text) == u.text]
+            if not retry_d and not retry_s:
+                break
+            retry_round += 1
+            if retry_round > MAX_RETRY_ROUNDS:
+                log(f"补译 {MAX_RETRY_ROUNDS} 轮后仍有 {len(retry_d)} 条对话、"
+                    f"{len(retry_s)} 条字符串未翻译，保留未翻译报告供手动处理")
+                break
+            sub_total = len(retry_d) + len(retry_s)
+            log(f"补译第 {retry_round}/{MAX_RETRY_ROUNDS} 轮：剩余 "
+                f"{len(retry_d)} 条对话、{len(retry_s)} 条字符串，重新翻译…")
+            time.sleep(2)   # 间隔片刻，缓解限流
 
-        def sub_progress(done: int, total: int) -> None:
-            pct = int(done * 100 / total) if total else 100
-            if progress_cb:
-                progress_cb("PROGRESS|%d" % pct)
+            def sub_progress(done: int, total: int) -> None:
+                pct = int(done * 100 / total) if total else 100
+                if progress_cb:
+                    progress_cb("PROGRESS|%d" % pct)
 
-        d2 = client.translate_texts(
-            [u.what for u in retry_d], target=target, names=protect_terms,
-            progress_cb=sub_progress, offset=0, total=sub_total,
-            error_cb=report_error, item_cb=_make_item_cb(d_by_text))
-        s2 = client.translate_texts(
-            [u.text for u in retry_s], target=target, names=protect_terms,
-            progress_cb=sub_progress, offset=len(retry_d), total=sub_total,
-            error_cb=report_error, item_cb=_make_item_cb(s_by_text))
-        for u, tr in zip(retry_d, d2):
-            d_by_text[u.what] = tr
-        for u, tr in zip(retry_s, s2):
-            s_by_text[u.text] = tr
+            d2 = client.translate_texts(
+                [u.what for u in retry_d], target=target, names=protect_terms,
+                progress_cb=sub_progress, offset=0, total=sub_total,
+                error_cb=report_error, item_cb=_make_item_cb(d_by_text))
+            s2 = client.translate_texts(
+                [u.text for u in retry_s], target=target, names=protect_terms,
+                progress_cb=sub_progress, offset=len(retry_d), total=sub_total,
+                error_cb=report_error, item_cb=_make_item_cb(s_by_text))
+            for u, tr in zip(retry_d, d2):
+                d_by_text[u.what] = tr
+            for u, tr in zip(retry_s, s2):
+                s_by_text[u.text] = tr
+            _flush_pt_cache()
+    except PauseRequested:
         _flush_pt_cache()
+        return _pause_and_save(
+            language, info, todo_d, todo_s, d_by_text, s_by_text,
+            result, log, progress_cb, cleanup_all)
     if progress_cb:
         progress_cb("PROGRESS|100")
 
@@ -753,6 +818,8 @@ def run_pipeline(
 
     # 翻译文件已成功生成 → 断点缓存已完成使命，删除以免下次误判为“未完成”
     _drop_progress_cache(progress_cache)
+    _drop_progress_cache(
+        info.game_dir / "tl" / f".{language}.暂停标记.txt")
 
     cleanup_all()
 

@@ -25,7 +25,7 @@ from win32more import asyncui
 
 from . import engine
 from .pipeline import run_pipeline
-from .translator import TranslationClient, TranslationConfig
+from .translator import TranslationClient, TranslationConfig, tcp_error_hint
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -76,7 +76,7 @@ XAML = r'''
             <FontIcon Glyph="&#xE8F1;" FontSize="20" Foreground="#60CDFF"/>
         </Border>
         <StackPanel VerticalAlignment="Center" Spacing="1">
-            <TextBlock Text="Ren'Py 自动汉化工具" FontSize="24" FontWeight="SemiBold"/>
+            <TextBlock Text="Ren'Py 自动汉化工具 v0.1.5" FontSize="24" FontWeight="SemiBold"/>
             <TextBlock Text="识别游戏文本 → AI 翻译 → 一键生成汉化补丁"
                        FontSize="12" Opacity="0.55"/>
         </StackPanel>
@@ -169,8 +169,18 @@ XAML = r'''
                         <Button Grid.Column="2" x:Name="OpenOutBtn" Content="打开输出目录"
                                 Click="OnOpenOutput" IsEnabled="False"/>
                     </Grid>
-                    <Button x:Name="StartBtn" Content="开始汉化" Click="OnStart"
-                            Height="42" FontSize="15" FontWeight="SemiBold"/>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="10"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Button x:Name="StartBtn" Content="开始汉化" Click="OnStart"
+                                Height="42" FontSize="15" FontWeight="SemiBold"/>
+                        <Button x:Name="PauseBtn" Grid.Column="2" Content="⏸ 暂停"
+                                Click="OnPause" Height="42" FontSize="15"
+                                FontWeight="SemiBold" IsEnabled="False"/>
+                    </Grid>
                 </StackPanel>
             </Border>
 
@@ -224,13 +234,15 @@ class GuiApp(XamlApplication):
         self._log_lines = 0
         self._last_result: str | None = None
         self._test_mode = False
+        self._paused_mode = False
+        self._pause_event = threading.Event()
 
     # -- 生命周期 ----------------------------------------------------------
 
     def OnLaunched(self, args) -> None:
         win = Window()
         self._win = win
-        win.Title = "Ren'Py 自动汉化工具 v0.1.4"
+        win.Title = "Ren'Py 自动汉化工具 v0.1.5"
 
         # Mica 背景（类 Win11 深色磨砂）
         try:
@@ -481,9 +493,11 @@ class GuiApp(XamlApplication):
         self._save_settings()
 
         self._test_mode = False
+        self._pause_event = threading.Event()
         self.worker = threading.Thread(
             target=self._run_translation,
-            args=(config, lang, game_dir, font, lang_ui, keep_terms),
+            args=(config, lang, game_dir, font, lang_ui, keep_terms,
+                  self._pause_event),
             daemon=True,
         )
         self.worker.start()
@@ -565,26 +579,43 @@ class GuiApp(XamlApplication):
                 return
 
             # 2) TCP 连接（直连，不走 HTTP 代理）
-            family, stype, proto, _, sockaddr = resolved[0][0]
-            sock = socket.socket(family, stype, proto)
-            sock.settimeout(15)
-            try:
-                sock.connect(sockaddr)
-            except Exception as e:  # noqa: BLE001
+            #    localhost 在 Windows 上常同时解析出 IPv6(::1) 与 IPv4(127.0.0.1)，
+            #    而本地模型服务（Ollama / LM Studio）通常只监听 IPv4；只尝试首个
+            #    地址会误报“目标计算机积极拒绝”(WinError 10061)。逐个地址尝试，
+            #    并在全部失败后短暂等待重试一轮（服务可能刚启动）。
+            last_err: Exception | None = None
+            connected = False
+            for round_no in range(2):
+                for family, stype, proto, _, sockaddr in resolved[0]:
+                    sock = socket.socket(family, stype, proto)
+                    sock.settimeout(15)
+                    try:
+                        sock.connect(sockaddr)
+                        connected = True
+                    except Exception as e:  # noqa: BLE001
+                        last_err = e
+                    finally:
+                        sock.close()
+                    if connected:
+                        break
+                if connected or round_no == 1:
+                    break
+                time.sleep(0.8)
+            if not connected:
                 self.msg_q.put(
-                    "TEST_ERR|TCP 连接失败: %s:%s - %s\n"
-                    "可能原因：网络不通、端口被墙/封锁、或需要代理。"
-                    % (host, port, e))
+                    "TEST_ERR|TCP 连接失败: %s:%s - %s\n%s"
+                    % (host, port, last_err, tcp_error_hint(last_err, host)))
                 return
-            finally:
-                sock.close()
 
-            # 3) HTTP 请求（含鉴权，验证地址 / Key / 模型）
+            # 3) HTTP 请求（含鉴权，验证地址 / Key / 模型）。
+            #    本地模型首次请求需把权重加载进显存，可能耗时 10~60 秒，
+            #    故测试超时放宽到 120 秒，避免“服务正常但被误判失败”。
+            self.msg_q.put("TCP 已连通，正在发送测试请求（本地模型首次加载可能较慢）…")
             test_cfg = TranslationConfig(
                 base_url=config.base_url,
                 api_key=config.api_key,
                 model=config.model,
-                timeout=30,
+                timeout=120,
                 max_retries=1,
             )
             client = TranslationClient(test_cfg)
@@ -606,6 +637,7 @@ class GuiApp(XamlApplication):
         font: bool,
         lang_ui: bool,
         keep_terms: list[str] | None = None,
+        pause_event=None,
     ) -> None:
         try:
             result = run_pipeline(
@@ -616,8 +648,10 @@ class GuiApp(XamlApplication):
                 apply_font_patch=font,
                 apply_language_ui=lang_ui,
                 extra_terms=keep_terms,
+                pause_event=pause_event,
             )
-            self.msg_q.put("RESULT|%s" % result.message)
+            prefix = "PAUSED|" if result.paused else "RESULT|"
+            self.msg_q.put(prefix + result.message)
         except Exception as exc:
             import traceback
             self.msg_q.put("ERR|%s" % exc)
@@ -664,6 +698,10 @@ class GuiApp(XamlApplication):
                     continue
                 if msg.startswith("RESULT|"):
                     self._last_result = msg[7:]
+                    continue
+                if msg.startswith("PAUSED|"):
+                    self._last_result = msg[7:]
+                    self._paused_mode = True
                     continue
                 if msg.startswith("ERR|"):
                     self._append_log(msg[4:], "err")
@@ -721,6 +759,17 @@ class GuiApp(XamlApplication):
             return "%d分%02d秒" % (m, s)
         return "%d秒" % s
 
+    def OnPause(self, sender, e) -> None:
+        """暂停：立即置位信号，翻译线程在当前请求完成的间隙停止。"""
+        if self._test_mode or self.worker is None:
+            return
+        self._pause_event.set()
+        self.PauseBtn.IsEnabled = False
+        self.StatusText.Text = "正在暂停…"
+        self._append_log(
+            "已请求暂停：等待当前请求完成即停止，已译内容自动保存，"
+            "未完成段落将写入暂停标记。", "info")
+
     def _on_done(self) -> None:
         self.worker = None
         self._set_busy(False)
@@ -736,12 +785,24 @@ class GuiApp(XamlApplication):
         if getattr(self, "_last_result", None):
             self._append_log(self._last_result, "ok")
             self._last_result = None
+        if getattr(self, "_paused_mode", False):
+            self._paused_mode = False
+            self._append_log(
+                "已暂停。关闭程序后重新打开，点击「开始汉化」会自动从"
+                "暂停标记处继续，无需从头开始。", "info")
+            self.ProgressText.Text = "已暂停"
+            self.StatusText.Text = "已暂停（可从断点继续）"
+            return
         self.ProgressText.Text = "完成"
         self.StatusText.Text = "完成"
 
     def _set_busy(self, busy: bool) -> None:
         self.StartBtn.IsEnabled = not busy
         self.TestBtn.IsEnabled = not busy
+        # 暂停按钮只在翻译任务运行中可用（连接测试不适用）
+        self.PauseBtn.IsEnabled = busy and not self._test_mode
+        if not busy:
+            self._pause_event = threading.Event()
         self.BrowseBtn.IsEnabled = not busy
         self.SaveBtn.IsEnabled = not busy
         self.Progress.IsIndeterminate = busy
