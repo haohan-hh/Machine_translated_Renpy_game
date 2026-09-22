@@ -83,6 +83,77 @@ def _placeholders_preserved(placeholders: list[str], restored: str) -> bool:
     return all(ph in restored for ph in placeholders)
 
 
+# 还原后仍残留的占位符痕迹：模型自行编造标记（原文没有）时会留下，写进
+# 游戏就是乱码。匹配放宽到 "@+[pn]数字"，实测模型会把系统提示词里的示例
+# "@@p0@@" 抄进译文，且抄错成 "@p0@@p" / "<｠@p0@@p｠>" 等变体。
+_PH_RESIDUE_RE = re.compile(r"@+[pn]\d+")
+# 代码块围栏
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.S)
+# 模型「以聊天方式回应」而非翻译时的典型措辞。
+# 只收「几乎不可能出现在正常对白里」的说法，避免误伤正常译文
+# （误判代价仅是这条回退原文并计入未翻译报告，不会污染游戏文本）。
+_META_REPLY_MARKERS = (
+    "请提供", "需要翻译", "请问有什么可以帮", "我已收到", "请随时告诉我",
+    "以下为您", "以下是您", "我已准备", "我明白您的",
+)
+
+
+def _placeholder_residue(text: str) -> bool:
+    """译文是否残留未还原的占位符标记（模型自行编造标记的迹象）。"""
+    return bool(_PH_RESIDUE_RE.search(text))
+
+
+def _unwrap_single_response(resp: str) -> str:
+    """剥掉模型套在译文外面的各种外壳，取出纯译文。
+
+    不同模型对「只输出译文」的理解不同，实测至少会出现：
+    裸文本、带引号、``["…"]``、``{"response": "…"}``、```json 代码块。
+    这些外壳若原样写进游戏，玩家就会看到 ``["译文"]``。
+    """
+    s = resp.strip()
+    m = _FENCE_RE.search(s)
+    if m:
+        s = m.group(1).strip()
+    if s[:1] in ("[", "{"):
+        try:
+            obj = json.loads(s)
+        except ValueError:
+            return s          # 不是合法 JSON，按原样返回
+        if isinstance(obj, list):
+            if len(obj) == 1 and isinstance(obj[0], str):
+                return obj[0]
+            if obj and all(isinstance(x, str) for x in obj):
+                return "\n".join(obj)   # 模型把多行拆成了数组
+        elif isinstance(obj, dict):
+            for key in ("translation", "translated", "text", "result",
+                        "response", "output", "译文"):
+                if isinstance(obj.get(key), str):
+                    return obj[key]
+            vals = [v for v in obj.values() if isinstance(v, str)]
+            if len(vals) == 1:
+                return vals[0]
+        return s
+    # 去单层引号（模型常给整句套上引号）
+    pairs = {'"': '"', "'": "'", "“": "”", "‘": "’", "「": "」", "『": "』"}
+    if len(s) >= 2 and pairs.get(s[0]) == s[-1]:
+        s = s[1:-1]
+    return s
+
+
+def _looks_like_meta_reply(source: str, result: str) -> bool:
+    """粗判译文是否是「聊天式回应/解释」而非真正的翻译。
+
+    只在置信度较高时返回 True（例如模型答复“请提供需要翻译的文本”），
+    误判的代价是这条回退原文并计入未翻译报告，不会污染游戏文本。
+    """
+    if not result.strip():
+        return True
+    if any(m in result for m in _META_REPLY_MARKERS):
+        return True
+    # 远长于原文（>4 倍且多出 80 字）→ 多半是解释性回复而非译文
+    return len(result) > len(source) * 4 + 80
+
+
 def protect_names(text: str, names: list[str]) -> tuple[str, list[str]]:
     """把名单中的人名/专有名词整体替换为占位符，防止被 AI 翻译。
 
@@ -222,6 +293,9 @@ _COMPACT_TARGETS = {
     "English": "English",
 }
 
+
+# 批量失败时的最大折半层数：40 条 → 20 → 10 → 5 → 2，再退化为逐条翻译
+_MAX_SPLIT_DEPTH = 4
 
 DEFAULT_TARGET = "简体中文"
 
@@ -469,11 +543,25 @@ class TranslationClient:
         name_ph_list = [nph for _, nph in named]
 
         out: list[str] = [""] * len(texts)
-        pending = list(range(len(texts)))     # 尚未翻译成功的原索引
+        self._translate_indices(
+            list(range(len(texts))), texts, payload, ph_list, name_ph_list,
+            target, error_cb, names, out, depth=0)
+        return out
 
-        for attempt in range(self.config.max_retries):
+    def _translate_indices(self, pending, texts, payload, ph_list, name_ph_list,
+                           target, error_cb, names, out, depth):
+        """对一组条目执行「批译 → 校验 → 失败折半 → 逐条兜底」。
+
+        折半的意义：批量越大，弱模型（上下文小 / 指令跟随能力差）越容易
+        返回条数不符、格式错乱或占位符丢失的响应。把失败批次不断对半切开，
+        成功率会快速回升，比反复重发同样大的批次更有效，也比直接逐条翻译
+        省请求。折半层数有上限，最末层仍失败才退化为逐条（回退原文）。
+        """
+        pending = list(pending)
+        tries = self.config.max_retries if depth == 0 else 1
+        for attempt in range(tries):
             if not pending:
-                break
+                return
             self._check_pause()
             sub_payload = [payload[i] for i in pending]
             try:
@@ -481,12 +569,12 @@ class TranslationClient:
                 raw = self._request_json_array(sub_payload, target, error_cb)
             except TranslationError as e:
                 self._record_error(str(e), error_cb)
-                if attempt < self.config.max_retries - 1:
+                if attempt < tries - 1:
                     time.sleep(1.5 * (attempt + 1))
                 continue
             except Exception as e:  # JSON 解析等
                 self._record_error(str(e), error_cb)
-                if attempt < self.config.max_retries - 1:
+                if attempt < tries - 1:
                     time.sleep(1.5 * (attempt + 1))
                 continue
 
@@ -495,25 +583,34 @@ class TranslationClient:
                 ph, nph = ph_list[orig_i], name_ph_list[orig_i]
                 restored = restore_text(raw[si], ph)
                 restored = restore_names(restored, nph)
-                if not _placeholders_preserved(ph, restored):
-                    still_failed.append(orig_i)
-                elif not _placeholders_preserved(nph, restored):
+                if (not _placeholders_preserved(ph, restored)
+                        or not _placeholders_preserved(nph, restored)
+                        or _placeholder_residue(restored)):
                     still_failed.append(orig_i)
                 else:
                     out[orig_i] = restored
             if still_failed and len(still_failed) < len(pending):
                 self._record_error(
-                    f"本批 {len(pending)} 条中有 {len(still_failed)} 条占位符校验失败"
-                    f"（已单独重试），示例: {texts[still_failed[0]][:50]!r}", error_cb)
+                    f"本批 {len(pending)} 条中有 {len(still_failed)} 条校验失败"
+                    f"（已缩小批次重试），示例: {texts[still_failed[0]][:50]!r}",
+                    error_cb)
             pending = still_failed
-            if pending and attempt < self.config.max_retries - 1:
+            if pending and attempt < tries - 1:
                 time.sleep(1.2 * (attempt + 1))
 
-        # 剩余失败条目：逐条翻译（单条请求，失败回退原文）
+        if not pending:
+            return
+        if len(pending) > 1 and depth < _MAX_SPLIT_DEPTH:
+            mid = len(pending) // 2
+            for group in (pending[:mid], pending[mid:]):
+                self._translate_indices(group, texts, payload, ph_list,
+                                        name_ph_list, target, error_cb, names,
+                                        out, depth + 1)
+            return
+        # 最末层：逐条翻译（失败回退原文）
         for i in pending:
             self._check_pause()
             out[i] = self._translate_single(texts[i], target, error_cb, names)
-        return out
 
     def _use_compact(self) -> bool:
         """当前是否使用精简提示词（True=精简，False=详细）。
@@ -626,17 +723,14 @@ class TranslationClient:
                     resp = self.chat([
                         {"role": "system", "content": system},
                         {"role": "user", "content": ptext},
-                    ], error_cb).strip()
-                    # 模型可能返回带引号的字符串
-                    if len(resp) >= 2 and resp[0] == '"' and resp[-1] == '"':
-                        try:
-                            resp = json.loads(resp)
-                        except Exception:
-                            pass
-                    restored = restore_text(resp, ph)
+                    ], error_cb)
+                    restored = restore_text(_unwrap_single_response(resp), ph)
                     restored = restore_names(restored, nph)
+                    # 三重把关：占位符齐全、没有残留标记、不是聊天式回应
                     if (_placeholders_preserved(ph, restored)
-                            and _placeholders_preserved(nph, restored)):
+                            and _placeholders_preserved(nph, restored)
+                            and not _placeholder_residue(restored)
+                            and not _looks_like_meta_reply(text, restored)):
                         if compact and self.config.compact_prompt is None:
                             self._compact_style = True
                         return restored
@@ -646,7 +740,7 @@ class TranslationClient:
                     self._record_error(str(e), error_cb)
                 if attempt < tries - 1:
                     time.sleep(1.5 * (attempt + 1))
-        return text  # 回退原文
+        return text  # 回退原文（宁可留英文，也不要聊天语/乱码进游戏）
 
 
 def build_client(config: TranslationConfig | None = None) -> TranslationClient:
