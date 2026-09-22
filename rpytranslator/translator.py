@@ -14,6 +14,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
 # 占位符保护
@@ -182,6 +183,57 @@ _SINGLE_SYSTEM_PROMPT = (
     "4. 语气自然，符合角色口吻。"
 )
 
+# 面向「纯机器翻译模型」（如 Hunyuan-MT / hy-mt2、Sakura）的精简系统提示词。
+# 这类模型未经指令微调：实测长中文系统提示会使批译完全失败（模型转而"聊天"），
+# 而极简英文指令 + 严格 JSON/占位符约束可稳定输出正确数组。
+_COMPACT_SYSTEM_PROMPT = (
+    "You are a professional game localization translator. Translate each item "
+    "of the input JSON array into {target}.\n"
+    "Rules:\n"
+    "1. Output ONLY a JSON array of the same length and order; no explanation, "
+    "no markdown fences.\n"
+    "2. Keep every \"{ph}\" placeholder exactly as-is: never translate, delete, "
+    "move or alter them.\n"
+    "3. Keep the original line-break structure.\n"
+    "4. Keep all character and proper names in original form.\n"
+    "5. Natural tone matching the character; keep lengths close to the source."
+)
+
+_COMPACT_SINGLE_PROMPT = (
+    "You are a professional game localization translator. Translate the "
+    "following Ren'Py game line into {target}.\n"
+    "Output only the translation itself, with no explanation and no quoting.\n"
+    "Keep every \"{ph}\" placeholder exactly as-is, and keep character and "
+    "proper names in original form."
+)
+
+# 精简提示词使用英文语言名（与 MT 模型的训练指令一致，效果更稳定）
+_COMPACT_TARGETS = {
+    "简体中文": "Simplified Chinese",
+    "繁体中文": "Traditional Chinese",
+    "繁體中文": "Traditional Chinese",
+    "日本語": "Japanese",
+    "English": "English",
+}
+
+
+def is_local_mt_model(config: TranslationConfig) -> bool:
+    """判断是否为「本地部署的纯机器翻译模型」。
+
+    仅当端点指向本机（localhost / 127.0.0.1 / ::1）且模型名带 mt / sakura
+    等机器翻译特征时才启用精简提示词；云端大模型与通用本地模型
+    （qwen、llama 等）保持原有详细提示词，行为不变。
+    """
+    try:
+        host = (urlparse(config.base_url).hostname or "").lower()
+    except Exception:  # noqa: BLE001
+        return False
+    if host not in ("localhost", "127.0.0.1", "::1", ""):
+        return False
+    name = (config.model or "").lower()
+    return any(k in name for k in ("mt", "sakura", "hunyuan"))
+
+
 DEFAULT_TARGET = "简体中文"
 
 
@@ -196,6 +248,7 @@ class TranslationConfig:
     chunk_chars: int = 1200          # 每个批量请求的字符上限
     chunk_items: int = 40            # 每个批量请求的条目上限
     max_workers: int = 1             # 并发批次数（>1 显著加速，注意服务端限流）
+    compact_prompt: bool = False     # 强制使用精简提示词（本地 MT 模型自动启用）
 
 
 class TranslationError(Exception):
@@ -464,10 +517,17 @@ class TranslationClient:
             out[i] = self._translate_single(texts[i], target, error_cb, names)
         return out
 
+    def _use_compact(self) -> bool:
+        return self.config.compact_prompt or is_local_mt_model(self.config)
+
     def _request_json_array(self, payload: list[str], target: str,
                             error_cb=None) -> list[str]:
-        system = _SYSTEM_PROMPT.format(
-            target=target, ph=_PH_PREFIX + "0" + _PH_PREFIX)
+        template = (_COMPACT_SYSTEM_PROMPT if self._use_compact()
+                    else _SYSTEM_PROMPT)
+        tgt = _COMPACT_TARGETS.get(target, target) if self._use_compact() \
+            else target
+        system = template.format(
+            target=tgt, ph=_PH_PREFIX + "0" + _PH_PREFIX)
         user = json.dumps(payload, ensure_ascii=False)
         messages = [
             {"role": "system", "content": system},
@@ -499,8 +559,13 @@ class TranslationClient:
         ptext, ph = protect_text(ntext)
         if not ptext.strip():
             return text
-        system = _SINGLE_SYSTEM_PROMPT.format(
-            target=target, ph=_PH_PREFIX + "0" + _PH_PREFIX)
+        if self._use_compact():
+            system = _COMPACT_SINGLE_PROMPT.format(
+                target=_COMPACT_TARGETS.get(target, target),
+                ph=_PH_PREFIX + "0" + _PH_PREFIX)
+        else:
+            system = _SINGLE_SYSTEM_PROMPT.format(
+                target=target, ph=_PH_PREFIX + "0" + _PH_PREFIX)
         for attempt in range(self.config.max_retries):
             try:
                 resp = self.chat([
