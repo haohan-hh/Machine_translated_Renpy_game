@@ -264,24 +264,28 @@ _SINGLE_SYSTEM_PROMPT = (
 # TranslationClient._request_json_array），不依赖模型名称、厂商或是否本地部署，
 # 因此对任意本地/云端模型通用。
 _COMPACT_SYSTEM_PROMPT = (
-    "You are a professional game localization translator. Translate each item "
-    "of the input JSON array into {target}.\n"
+    "This is an automated, non-interactive batch translation job. "
+    "Never greet, ask questions or explain; always answer with exactly "
+    "one JSON array.\n"
+    "Translate each item of the input JSON array into {target}.\n"
     "Rules:\n"
     "1. Output ONLY a JSON array of the same length and order; no explanation, "
     "no markdown fences.\n"
-    "2. Keep every \"{ph}\" placeholder exactly as-is: never translate, delete, "
-    "move or alter them.\n"
+    "2. Every \"{ph}\"-style token in the input is a placeholder: copy it "
+    "exactly as-is. Never translate, delete, move, alter, or newly create "
+    "such tokens.\n"
     "3. Keep the original line-break structure.\n"
     "4. Keep all character and proper names in original form.\n"
     "5. Natural tone matching the character; keep lengths close to the source."
 )
 
 _COMPACT_SINGLE_PROMPT = (
-    "You are a professional game localization translator. Translate the "
-    "following Ren'Py game line into {target}.\n"
-    "Output only the translation itself, with no explanation and no quoting.\n"
-    "Keep every \"{ph}\" placeholder exactly as-is, and keep character and "
-    "proper names in original form."
+    "This is an automated, non-interactive translation job. Never greet, "
+    "ask questions or explain; answer with the translation only.\n"
+    "Translate the following Ren'Py game line into {target}.\n"
+    "Every \"{ph}\"-style token is a placeholder: copy it exactly as-is. "
+    "Never translate, delete, move, alter, or newly create such tokens.\n"
+    "Keep character and proper names in original form."
 )
 
 # 精简提示词使用英文语言名（与多数机器翻译模型的训练指令一致，效果更稳定）
@@ -346,6 +350,16 @@ class TranslationClient:
         # 会话内自适应的提示词风格：False=详细（初始值），True=精简。
         # 一旦观测到模型无法按详细提示词返回结构化结果，即切换并记住。
         self._compact_style = False
+        # 本地推理服务（Ollama / LM Studio / vLLM 等）没有云端限流问题，
+        # 串行单请求时 GPU 大部分时间处于等待状态；并发多个批次可让
+        # GPU 同时处理多路请求，吞吐明显提升。云端服务保持串行以免限流。
+        if self.config.max_workers == 1:
+            try:
+                _host = (urlparse(self.config.base_url).hostname or "").lower()
+            except Exception:  # noqa: BLE001
+                _host = ""
+            if _host in ("localhost", "127.0.0.1", "::1"):
+                self.config.max_workers = 4
 
     def _check_pause(self) -> None:
         ev = self.pause_event
