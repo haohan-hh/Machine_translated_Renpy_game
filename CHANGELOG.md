@@ -1,5 +1,56 @@
 # 更新日志
 
+## v0.1.6 — 2026-09-23
+
+**系统性修复 4 类问题（针对 Ren'Py 发行版游戏常见缺陷）**
+
+针对游戏《Where The Demon Lurks》实测发现的 4 类问题逐一修复；多数是汉化工具
+与 Ren'Py 打包发行版共存时的系统性问题，对所有其他 Ren'Py 游戏同样受益。
+
+- **抽取器只读 .rpa 也能工作**（Issue 1 根因）：
+
+  Ren'Py 发行版常把所有脚本打包进 `archive.rpa`，游戏目录只剩缓存与资源。
+  上一版只检查「是否有散落 .rpy」来决定要不要拆包——但工具自己生成的
+  `zz_*.rpy` 补丁也算「散落 .rpy」，导致第二次运行以为游戏没归档，
+  `screens.rpy`（含偏好设置文本）等 UI 源脚本永远抽不到。
+  
+  修复：忽略 `zz_*` 前缀的散落脚本后，再判断是否有真正的游戏脚本。
+  没有时才走 archive.rpa 拆包。
+
+- **sub-label 跟踪进 ID 路径**（Issue 3 根因）：
+
+  抽器碰到 `label .arcade2:`（子标签）时直接跳过、不改当前 label，导致
+  抽取器把 `chapter_L3.arcade2` 块里的对白归到 `chapter_L3_` 下，runtime
+  拿 `chapter_L3_arcade2_xxxx` 去 tl/ 里查当然查不到——11460 条全「缺失」。
+  
+  修复：sub-label 改为追加到当前 label（Ren'Py 的实际语义），identifier 生成
+  时 `.` 替换为 `_`。实测：`chapter_L3.arcade2` → `chapter_L3_arcade2_<digest>`，
+  与运行时报告完全匹配。
+
+- **`font_replacement_map` 全局字体替换**（Issue 2 收尾）：
+
+  上一版已经覆盖 `gui.*_font` 与所有命名样式，但屏幕里**显式**写
+  `font="font/CarterOne-Regular.ttf"` 的（属性优先级最高）仍漏掉。
+  改为枚举 `game/font` 与 `game/fonts` 下的所有非 CJK 字体，写进
+  `config.font_replacement_map[(原字体, 粗, 斜)] = (cn_font, 粗, 斜)`，
+  替换在字体加载层完成，所有用到原字体的元素都会显示中文字体。
+  代价：英文会失去原游戏的字体风格，换成中文美观度优先。
+
+- **「提示词镜像」拒收判定**（Issue 4 收尾）：
+
+  实测某些原句（典型为 "I agree with the ..."）会让模型直接把系统提示词
+  的中译本当成译文返回（玩家会看到工具自己的指令出现在对白里）。
+  在 `_looks_like_meta_reply` 里加一组 prompt-echo 标记（「非交互式 /
+  JSON 数组 / 自动化 / 打招呼 / 批量翻译任务」等游戏对白里绝不可能出现的
+  短语），命中即拒收、退化为原文本并计未翻译报告。
+
+**已知局限（不在本版修复范围）**
+
+- `imagebutton auto "gui/navigation_buttons/start_%s.png"` 这类**主菜单按钮**
+  的英文是烤进 PNG 里的（screens.rpy 里能查到引用，但文本不在 .rpy 源里），
+  文本工具无能为力；解决途径只有改图或改屏加 textbutton 覆盖。
+  这次的抽取/字体修复不影响这一类。
+
 ## v0.1.5 — 2026-09-22
 
 **暂停与断点续译（重点）**

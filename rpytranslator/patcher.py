@@ -152,6 +152,45 @@ def font_supports_cjk(path: Path) -> bool:
     return False
 
 
+def _list_game_fonts(game_dir: Path) -> list[str]:
+    """枚举 game/font 与 game/fonts 下的字体路径（相对 game 前缀）。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for sub in ("font", "fonts"):
+        d = game_dir / sub
+        if not d.is_dir():
+            continue
+        for p in d.iterdir():
+            ext = p.suffix.lower()
+            if ext not in _FONT_EXTS:
+                continue
+            try:
+                rel = p.relative_to(game_dir).as_posix()
+            except ValueError:
+                continue
+            if rel not in seen:
+                seen.add(rel)
+                out.append(rel)
+    return out
+
+
+def _list_non_cjk_fonts(game_dir: Path, cjk_font: Path | None) -> list[str]:
+    """枚举不含 CJK 字形的字体（用于 config.font_replacement_map）。"""
+    cjk_str = str(cjk_font.resolve()).lower() if cjk_font else ""
+    out: list[str] = []
+    for rel in _list_game_fonts(game_dir):
+        try:
+            p = (game_dir / rel).resolve()
+            if cjk_str and str(p).lower() == cjk_str:
+                continue
+            if font_supports_cjk(p):
+                continue
+        except OSError:
+            pass
+        out.append(rel)
+    return out
+
+
 def find_game_cjk_font(game_dir: Path) -> Path | None:
     """在 game 目录（含子目录，排除 tl/renpy 等）中查找含中文字形的字体。"""
     for dirpath, dirnames, filenames in os.walk(game_dir):
@@ -244,7 +283,8 @@ def find_original_default_font(game_dir: Path) -> str:
     return "DejaVuSans.ttf"
 
 
-def _build_font_patch(cjk_font_rel: str, original_font: str) -> str:
+def _build_font_patch(cjk_font_rel: str, original_font: str,
+                      replacement_fonts: list[str] | None = None) -> str:
     """生成 zz_cn_font.rpy。
 
     实测总结（Wild Harmonies / Dawn Chorus 项目验证）：
@@ -258,10 +298,13 @@ def _build_font_patch(cjk_font_rel: str, original_font: str) -> str:
       中文仍全是方框（8.2 渲染端未采用 FontGroup）；而 init -1 覆盖 gui 变量
       后样式.font 已被确认改写成功。因此**直接给字体路径字符串**（引擎最
       成熟路径），前提是中文字体同时覆盖 ASCII + 中文 + 全角标点。
-    - 遍历样式注册表用 .items() 即可（8.2 中 renpy.style.styles 是类映射对象
+    - 遍历样式注册表用 .items() 即可（8.2 中 rencaizuo style.styles 是类映射对象
       而非 dict，len=207；renpy/lint.py 正是用其 .items() 遍历）。
     - 中文必须用静态字体：可变字体（*Variable*.ttf）在 Ren'Py/SDL_ttf 下
       字形支持不完整，会导致部分汉字仍是方框。
+    - 上面的覆盖仍漏掉屏幕里**显式**写 `font "xxx.ttf"` 的元素（属性优先级
+      最高）。这层用 config.font_replacement_map 把所有游戏字体重定向到中文
+      字体——Ren'Py 在加载字体时即替换，绕过 screen 的 font= 属性。
     """
     esc = cjk_font_rel.replace("\\", "/")
     warn_var = (
@@ -276,6 +319,42 @@ def _build_font_patch(cjk_font_rel: str, original_font: str) -> str:
         "startbutton_text_font",
     )
     gui_keys_lit = ", ".join(f'"{k}"' for k in gui_keys)
+
+    # 4) font_replacement_map：把游戏原始字体全部映射到中文字体。
+    # 屏幕里的 `font "CarterOne-Regular.ttf"` 等内联写法改不动样式对象，
+    # 必须从字体加载层换掉。代价：英文会跟着使用中文字体（失去原游戏的字体风格），
+    # 但保证中文能正常显示——对汉化来说是正确的取舍。
+    rep_fonts = list(replacement_fonts or [])
+    if original_font and original_font not in rep_fonts:
+        rep_fonts.append(original_font)
+    # 去重 + 排版
+    seen = set()
+    rep_unique = []
+    for f in rep_fonts:
+        if f and f not in seen and f != esc:
+            seen.add(f)
+            rep_unique.append(f)
+    if rep_unique:
+        rep_lines = "\n".join(
+            f'    config.font_replacement_map[({f!r}, False, False)] = '
+            f'({esc!r}, False, False)\n'
+            f'    config.font_replacement_map[({f!r}, True, False)] = '
+            f'({esc!r}, True, False)\n'
+            f'    config.font_replacement_map[({f!r}, False, True)] = '
+            f'({esc!r}, False, True)\n'
+            f'    config.font_replacement_map[({f!r}, True, True)] = '
+            f'({esc!r}, True, True)'
+            for f in rep_unique
+        )
+        replacement_block = (
+            "    # 4) 字体替换映射：把屏幕里显式 `font=` 写的字体也换成中文字体\n"
+            "    if not hasattr(config, 'font_replacement_map'):\n"
+            "        config.font_replacement_map = {}\n"
+            f"{rep_lines}\n"
+        )
+    else:
+        replacement_block = ""
+
     return (
         "# -*- coding: utf-8 -*-\n"
         "# 中文字体补丁（汉化工具自动生成）：解决中文显示为方框。\n"
@@ -283,6 +362,8 @@ def _build_font_patch(cjk_font_rel: str, original_font: str) -> str:
         "# 说明：界面样式在 init 阶段读取 gui.*_font 构建并写死字体，因此先于\n"
         "#       样式构建（init -1）把 gui.*_font 换成中文字体路径；init 999\n"
         "#       再兜底覆盖 gui 变量、style.default.font 并遍历命名样式。\n"
+        "#       屏幕里显式写 font=\"xxx.ttf\" 的元素还会被绕过——再通过\n"
+        "#       config.font_replacement_map 在字体加载层换掉。\n"
         f"{warn_var}"
         "init -1 python:\n"
         f"    _zh_cn_font = \"{esc}\"\n"
@@ -334,6 +415,8 @@ def _build_font_patch(cjk_font_rel: str, original_font: str) -> str:
         "                _zh_s.font = _zh_cn_font\n"
         "            except Exception:\n"
         "                pass\n"
+        "\n"
+        f"{replacement_block}"
     )
 
 
@@ -378,16 +461,22 @@ def apply_font_patch(game_dir: Path) -> PatchResult:
         res.message = f"已复制系统字体到 {rel}"
 
     original_font = find_original_default_font(game_dir)
+    # 枚举所有非 CJK 字体，用于 font_replacement_map（覆盖屏幕里
+    # 显式写 font=xxx 的元素）。中文是否仍保留游戏原美术字体无所谓——
+    # 关键是中文能渲染。
+    rep_fonts = _list_non_cjk_fonts(game_dir, cjk_font)
     try:
         patch.write_text(
-            _build_font_patch(rel, original_font), encoding="utf-8-sig")
+            _build_font_patch(rel, original_font, rep_fonts), encoding="utf-8-sig")
     except OSError as e:
         res.ok = False
         res.message = f"写字体补丁失败: {e}"
         return res
     res.files.append(patch)
     res.ok = True
-    res.detail = f"中文字体: {rel}（直接覆盖 gui.*_font 与全部样式 font）"
+    extra = f"；font_replacement_map: {len(rep_fonts)} 个" if rep_fonts else ""
+    res.detail = (
+        f"中文字体: {rel}（覆盖 gui.*_font + 全部命名样式{extra}）")
     res.message = f"已配置中文字体（{res.message}）"
     return res
 

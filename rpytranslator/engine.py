@@ -251,7 +251,12 @@ def scan_game(path: str | Path) -> GameInfo:
     info.has_chinese = any(_is_chinese_language(l) for l in info.languages)
     info.version_hint = _detect_version(game_dir, root)
 
-    if not info.rpy_files and not info.rpyc_files:
+    # 决定是否需要从 .rpa 归档里抽脚本。Ren'Py 发行版常把全部脚本打包进
+    # archive.rpa，game 目录只剩缓存与资源——但本工具的汉化补丁（zz_*.rpy）
+    # 也是「散落 .rpy」，需要忽略后再看是否还有真正属于游戏的散落脚本。
+    has_game_loose = any(not p.name.lower().startswith("zz_")
+                         for p in info.rpy_files + info.rpyc_files)
+    if not has_game_loose:
         # 脚本可能打包在 .rpa 归档中（Ren'Py 发行版常见做法）
         _detect_rpa_archives(info, game_dir)
     if not info.rpy_files and not info.rpyc_files and not info.archive_scripts:

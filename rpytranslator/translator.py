@@ -99,6 +99,13 @@ _META_REPLY_MARKERS = (
     "请提供", "需要翻译", "请问有什么可以帮", "我已收到", "请随时告诉我",
     "以下为您", "以下是您", "我已准备", "我明白您的",
 )
+# 模型「把系统提示词翻譯当译文」的牌子。出现在「I agree with ...」这类原
+# 句之后时，模型干脆把提示词整段译过来。玩家会在游戏里看到系统提示词
+# 的中译本——极端危险。任何一个命中即拒收（都是正常游戏不可能出现的短语）。
+_PROMPT_ECHO_MARKERS = (
+    "自动化", "非交互式", "批量翻译任务", "批量翻译作业", "批量作业",
+    "JSON数组", "JSON 数组", "打招呼，提问", "非交互的",
+)
 
 
 def _placeholder_residue(text: str) -> bool:
@@ -152,6 +159,11 @@ def _looks_like_meta_reply(source: str, result: str) -> bool:
     if not result.strip():
         return True
     if any(m in result for m in _META_REPLY_MARKERS):
+        return True
+    # 模型把系统提示词的中文译文当输出（最严重的污染源：玩家会在对白里
+    # 看到工具自己的指令）。只要命中其中任何一个就拒收——正常游戏不可能
+    # 出现「非交互式」「JSON数组」这类短语。
+    if any(m in result for m in _PROMPT_ECHO_MARKERS):
         return True
     # 远长于原文（>4 倍且多出 80 字）→ 多半是解释性回复而非译文
     return len(result) > len(source) * 4 + 80

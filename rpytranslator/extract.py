@@ -605,8 +605,19 @@ class RpyExtractor:
         if name.startswith("_"):
             self._alternate = name
             return
-        if "." in name or name.startswith("."):
-            return  # 局部标签（含点）不改变当前 label
+        if name.startswith("."):
+            # 子标签（`.subname:`）：叠加到当前 label 路径
+            # （Ren'Py 用 "." 分层，identifier 生成时 "." 替换为 "_"）。
+            # 没有父标签时退化为同级全局标签（罕见，但容错）。
+            sub = name[1:]
+            self._label = (self._label + "." + sub) if self._label else sub
+            self._alternate = None
+            return
+        if "." in name:
+            # 全限定带点（如 `chapter_L3.subname`）：按字面值保留
+            self._label = name
+            self._alternate = None
+            return
         self._label = name
         self._alternate = None
 

@@ -1,6 +1,6 @@
 # Ren'Py 自动汉化工具 (rpytranslator)
 
-> 当前版本：**v0.1.5**（详细变更见 [CHANGELOG.md](CHANGELOG.md)）
+> 当前版本：**v0.1.6**（详细变更见 [CHANGELOG.md](CHANGELOG.md)）
 
 将 Ren'Py 游戏自动汉化为简体/繁体中文：识别游戏文本 → AI 翻译 → 一键生成汉化补丁。
 
