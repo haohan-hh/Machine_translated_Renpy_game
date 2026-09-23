@@ -16,7 +16,11 @@ from pathlib import Path
 from win32more.winui3 import XamlApplication, XamlLoader
 from win32more.Microsoft.UI.Xaml import Window, Thickness, DispatcherTimer
 from win32more.Microsoft.UI.Xaml.Media import MicaBackdrop, SolidColorBrush
-from win32more.Microsoft.UI.Xaml.Controls import ComboBoxItem
+from win32more.Microsoft.UI.Xaml.Controls import (
+    ComboBoxItem,
+    MenuFlyout,
+    MenuFlyoutItem,
+)
 from win32more.Microsoft.UI.Xaml.Documents import Run
 from win32more.Windows.Foundation import TimeSpan
 from win32more.Windows.Graphics import SizeInt32
@@ -133,14 +137,16 @@ XAML = r'''
                         <TextBlock Text="API Key" FontSize="12" Opacity="0.6"/>
                         <PasswordBox x:Name="ApiKeyBox" PlaceholderText="sk-…"/>
                     </StackPanel>
-                    <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="12">
+                    <Grid ColumnDefinitions="*,Auto,Auto,Auto" ColumnSpacing="12">
                         <StackPanel Spacing="4">
                             <TextBlock Text="模型" FontSize="12" Opacity="0.6"/>
                             <TextBox x:Name="ModelBox" PlaceholderText="gpt-4o-mini"/>
                         </StackPanel>
-                        <Button Grid.Column="1" x:Name="TestBtn" Content="测试连接"
+                        <Button Grid.Column="1" x:Name="ModelMenuBtn" Content="&#x25BE;"
+                                VerticalAlignment="Bottom" Padding="10,4"/>
+                        <Button Grid.Column="2" x:Name="TestBtn" Content="测试连接"
                                 Click="OnTestConnection" VerticalAlignment="Bottom"/>
-                        <Button Grid.Column="2" x:Name="SaveBtn" Content="保存设置"
+                        <Button Grid.Column="3" x:Name="SaveBtn" Content="保存设置"
                                 Click="OnSaveSettings" VerticalAlignment="Bottom"/>
                     </Grid>
                     <StackPanel Spacing="4">
@@ -243,6 +249,10 @@ class GuiApp(XamlApplication):
         self._test_mode = False
         self._paused_mode = False
         self._pause_event = threading.Event()
+        # 已保存的模型配置（每条：{model, url, key}）；用于 ModelBox 右侧 ▼ 下拉
+        self._saved_models: list[dict] = []
+        # 模型下拉 Flyout 在 OnLaunched 中创建并挂到 ModelMenuBtn
+        self._model_flyout: MenuFlyout | None = None
 
     # -- 生命周期 ----------------------------------------------------------
 
@@ -265,6 +275,11 @@ class GuiApp(XamlApplication):
             self.AppTitleText.Text = _APP_TITLE
         except Exception:
             pass
+
+        # 模型下拉：把 MenuFlyout 挂到 ModelMenuBtn；之后 _load_settings 会
+        # 根据 saved_models 填充条目。Button.Flyout 一旦设置，点击 ▼ 即自动展开。
+        self._model_flyout = MenuFlyout()
+        self.ModelMenuBtn.Flyout = self._model_flyout
 
         try:
             win.AppWindow.Resize(SizeInt32(920, 880))
@@ -329,9 +344,18 @@ class GuiApp(XamlApplication):
         self.FontSwitch.IsOn = bool(data.get("font", True))
         self.LangUiSwitch.IsOn = bool(data.get("lang_ui", True))
         self.KeepTermsBox.Text = data.get("keep_terms", "")
+        # 已保存的模型列表：旧配置无此字段时退化为「当前一项」（向后兼容）
+        self._saved_models = list(data.get("saved_models") or [])
+        if not self._saved_models and data.get("model"):
+            self._saved_models = [{
+                "model": data["model"],
+                "url": data.get("url", ""),
+                "key": data.get("key", ""),
+            }]
+        self._rebuild_model_menu()
         self._append_log("已加载配置%s" % ("" if data else "（无）"), "info")
 
-    def _save_settings(self) -> None:
+    def _save_settings(self) -> bool:
         data = {
             "service": SERVICES[self.ServiceBox.SelectedIndex],
             "lang": LANGUAGES[self.LangBox.SelectedIndex],
@@ -342,12 +366,60 @@ class GuiApp(XamlApplication):
             "lang_ui": self.LangUiSwitch.IsOn,
             "keep_terms": self.KeepTermsBox.Text,
         }
+        # 把当前配置作为一条保存进下拉列表（按 model 名去重）
+        cur_model = (data["model"] or "").strip()
+        cur_entry = {"model": cur_model, "url": data["url"], "key": data["key"]}
+        kept = [e for e in self._saved_models if (e.get("model") or "").strip() != cur_model]
+        kept.append(cur_entry)
+        # 上限 20 条：把最新的保留在末尾
+        self._saved_models = kept[-20:]
+        data["saved_models"] = self._saved_models
         try:
             _CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                                     encoding="utf-8")
-            return True
         except Exception:
             return False
+        self._rebuild_model_menu()
+        return True
+
+    # -- 模型下拉（ModelMenuBtn） -----------------------------------------
+
+    def _rebuild_model_menu(self) -> None:
+        """按 self._saved_models 重建 MenuFlyout 条目。空列表显示占位提示。"""
+        if self._model_flyout is None:
+            return
+        items = self._model_flyout.Items
+        while items.Count > 0:
+            items.RemoveAt(0)
+        if not self._saved_models:
+            hint = MenuFlyoutItem()
+            hint.Text = "（暂无已保存的模型，点击「保存设置」加入）"
+            hint.IsEnabled = False
+            items.Append(hint)
+            return
+        title = MenuFlyoutItem()
+        title.Text = "已保存的模型（按当前字段切换）"
+        title.IsEnabled = False
+        items.Append(title)
+        for entry in self._saved_models:
+            mi = MenuFlyoutItem()
+            model = (entry.get("model") or "").strip() or "（未命名）"
+            url = entry.get("url") or ""
+            mi.Text = f"{model}    {url}"
+            mi.Tag = entry
+            mi.add_Click(self.OnModelMenuItemClick)
+            items.Append(mi)
+
+    def OnModelMenuItemClick(self, sender, e) -> None:
+        """点击下拉条目：将该条目的 url/key/model 写回界面（不自动保存磁盘）。"""
+        entry = getattr(sender, "Tag", None)
+        if not entry:
+            return
+        self.ApiUrlBox.Text = entry.get("url") or ""
+        self.ApiKeyBox.Password = entry.get("key") or ""
+        self.ModelBox.Text = (entry.get("model") or "").strip()
+        self._append_log(
+            "已切换到已保存模型：%s" % (entry.get("model") or "（无模型名）"), "info")
 
     # -- 事件：浏览 / 拖放 --------------------------------------------------
 
