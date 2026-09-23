@@ -87,6 +87,9 @@ def _placeholders_preserved(placeholders: list[str], restored: str) -> bool:
 # 游戏就是乱码。匹配放宽到 "@+[pn]数字"，实测模型会把系统提示词里的示例
 # "@@p0@@" 抄进译文，且抄错成 "@p0@@p" / "<｠@p0@@p｠>" 等变体。
 _PH_RESIDUE_RE = re.compile(r"@+[pn]\d+")
+# 模型把自家对话模板的特殊 token 泄漏进译文（如 "<｜hy_User｜>" 及其
+# 各种残缺变体）。正常译文不可能包含这类标记。
+_TEMPLATE_LEAK_RE = re.compile(r"<｜|｜>|<\|hy|hy_[A-Za-z]+")
 # 代码块围栏
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.S)
 # 模型「以聊天方式回应」而非翻译时的典型措辞。
@@ -350,6 +353,11 @@ class TranslationClient:
         # 会话内自适应的提示词风格：False=详细（初始值），True=精简。
         # 一旦观测到模型无法按详细提示词返回结构化结果，即切换并记住。
         self._compact_style = False
+        # 自适应批大小（AIMD，类拥塞控制）：部分模型在较大批次上会生成几条
+        # 就提前停止或格式错乱。与其反复发起注定失败的大批再折半（每次失败
+        # 都浪费一整次生成），不如记住「近期稳定成功的批大小」，超过上限的
+        # 组在发请求前就预先折半。成功后缓慢放大探测更大批次，失败立即减半。
+        self._batch_cap = config.chunk_items or 40
         # 本地推理服务（Ollama / LM Studio / vLLM 等）没有云端限流问题，
         # 串行单请求时 GPU 大部分时间处于等待状态；并发多个批次可让
         # GPU 同时处理多路请求，吞吐明显提升。云端服务保持串行以免限流。
@@ -382,8 +390,14 @@ class TranslationClient:
         if error_cb:
             error_cb(msg)
 
-    def chat(self, messages: list[dict], error_cb=None) -> str:
-        """发起一次对话请求，返回 assistant 的文本内容。"""
+    def chat(self, messages: list[dict], error_cb=None,
+             max_tokens: int | None = None) -> str:
+        """发起一次对话请求，返回 assistant 的文本内容。
+
+        ``max_tokens`` 可为「注定被拒收的长回复」（如模型转成聊天模式后
+        输出的大段解释）设置输出上限：回复会被截断而更快结束，省下
+        等待整段无效生成的时间；正常译文远短于该上限，不受影响。
+        """
         self.request_count += 1
         body = {
             "model": self.config.model,
@@ -391,6 +405,8 @@ class TranslationClient:
             "temperature": self.config.temperature,
             "stream": False,
         }
+        if max_tokens:
+            body["max_tokens"] = max_tokens
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if self.config.api_key:
@@ -572,6 +588,15 @@ class TranslationClient:
         省请求。折半层数有上限，最末层仍失败才退化为逐条（回退原文）。
         """
         pending = list(pending)
+        # 预切：组大小超过自适应批上限时直接折半，不发起注定失败的大批请求
+        # （失败的大批要白等一整次生成，是吞吐的最大浪费源）。
+        if len(pending) > 1 and len(pending) > self._batch_cap:
+            mid = len(pending) // 2
+            for group in (pending[:mid], pending[mid:]):
+                self._translate_indices(group, texts, payload, ph_list,
+                                        name_ph_list, target, error_cb, names,
+                                        out, depth)
+            return
         tries = self.config.max_retries if depth == 0 else 1
         for attempt in range(tries):
             if not pending:
@@ -581,12 +606,19 @@ class TranslationClient:
             try:
                 # 条数校验与提示词风格自动切换都在 _request_json_array 内完成
                 raw = self._request_json_array(sub_payload, target, error_cb)
+            except ResponseFormatError as e:
+                # 格式错误不是瞬时的：同一批重发必然再失败（内部已试过两种
+                # 提示词），直接跳出重试、进入折半。AIMD 上限同步减半。
+                self._batch_cap = max(1, len(sub_payload) // 2)
+                self._record_error(str(e), error_cb)
+                break
             except TranslationError as e:
+                # 网络/HTTP 类瞬时错误：等待后原样重试
                 self._record_error(str(e), error_cb)
                 if attempt < tries - 1:
                     time.sleep(1.5 * (attempt + 1))
                 continue
-            except Exception as e:  # JSON 解析等
+            except Exception as e:  # noqa: BLE001 - 兜底，绝不炸掉整个任务
                 self._record_error(str(e), error_cb)
                 if attempt < tries - 1:
                     time.sleep(1.5 * (attempt + 1))
@@ -599,7 +631,9 @@ class TranslationClient:
                 restored = restore_names(restored, nph)
                 if (not _placeholders_preserved(ph, restored)
                         or not _placeholders_preserved(nph, restored)
-                        or _placeholder_residue(restored)):
+                        or _placeholder_residue(restored)
+                        or _TEMPLATE_LEAK_RE.search(restored)
+                        or _looks_like_meta_reply(texts[orig_i], restored)):
                     still_failed.append(orig_i)
                 else:
                     out[orig_i] = restored
@@ -608,6 +642,13 @@ class TranslationClient:
                     f"本批 {len(pending)} 条中有 {len(still_failed)} 条校验失败"
                     f"（已缩小批次重试），示例: {texts[still_failed[0]][:50]!r}",
                     error_cb)
+            elif still_failed and len(still_failed) == len(pending):
+                # 整批都过不了校验 → 批大小仍偏大，同样减半上限
+                self._batch_cap = max(1, len(sub_payload) // 2)
+            elif len(pending) >= self._batch_cap:
+                # AIMD：整批成功且已达上限 → 缓慢放大，探测更大的可行批次
+                self._batch_cap = min(self.config.chunk_items or 40,
+                                      self._batch_cap + 2)
             pending = still_failed
             if pending and attempt < tries - 1:
                 time.sleep(1.2 * (attempt + 1))
@@ -737,13 +778,17 @@ class TranslationClient:
                     resp = self.chat([
                         {"role": "system", "content": system},
                         {"role": "user", "content": ptext},
-                    ], error_cb)
+                    ], error_cb,
+                        # 译文长度与原文同量级；超出数倍的几乎必是聊天式
+                        # 回复（反正会被拒收），提前截断省时间
+                        max_tokens=max(80, len(ptext) * 3 + 120))
                     restored = restore_text(_unwrap_single_response(resp), ph)
                     restored = restore_names(restored, nph)
-                    # 三重把关：占位符齐全、没有残留标记、不是聊天式回应
+                    # 四重把关：占位符齐全、无残留标记、无模板泄漏、非聊天语
                     if (_placeholders_preserved(ph, restored)
                             and _placeholders_preserved(nph, restored)
                             and not _placeholder_residue(restored)
+                            and not _TEMPLATE_LEAK_RE.search(restored)
                             and not _looks_like_meta_reply(text, restored)):
                         if compact and self.config.compact_prompt is None:
                             self._compact_style = True
