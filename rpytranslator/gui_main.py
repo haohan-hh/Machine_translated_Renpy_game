@@ -23,6 +23,8 @@ from win32more.Windows.Graphics import SizeInt32
 from win32more.Windows.UI import Color
 from win32more import asyncui
 
+from . import APP_NAME
+from . import __version__ as PKG_VERSION
 from . import engine
 from .pipeline import run_pipeline
 from .translator import TranslationClient, TranslationConfig, tcp_error_hint
@@ -30,6 +32,10 @@ from .translator import TranslationClient, TranslationConfig, tcp_error_hint
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
+
+# 应用标题：单一数据源指向 __init__.py 的 __version__，界面标题与窗口
+# 标题栏都从这里取值，避免多处硬编码导致版本号显示不一致。
+_APP_TITLE = f"{APP_NAME} v{PKG_VERSION}"
 
 # 预设服务: 名称 -> (API 地址, 模型)
 PRESETS: dict[str, tuple[str, str]] = {
@@ -76,7 +82,8 @@ XAML = r'''
             <FontIcon Glyph="&#xE8F1;" FontSize="20" Foreground="#60CDFF"/>
         </Border>
         <StackPanel VerticalAlignment="Center" Spacing="1">
-            <TextBlock Text="Ren'Py 自动汉化工具 v0.1.5" FontSize="24" FontWeight="SemiBold"/>
+            <TextBlock x:Name="AppTitleText" Text="Ren'Py 自动汉化工具"
+                       FontSize="24" FontWeight="SemiBold"/>
             <TextBlock Text="识别游戏文本 → AI 翻译 → 一键生成汉化补丁"
                        FontSize="12" Opacity="0.55"/>
         </StackPanel>
@@ -242,7 +249,7 @@ class GuiApp(XamlApplication):
     def OnLaunched(self, args) -> None:
         win = Window()
         self._win = win
-        win.Title = "Ren'Py 自动汉化工具 v0.1.7"
+        win.Title = _APP_TITLE
 
         # Mica 背景（类 Win11 深色磨砂）
         try:
@@ -252,6 +259,12 @@ class GuiApp(XamlApplication):
 
         root = XamlLoader.Load(self, XAML)
         win.Content = root
+
+        # 界面内的标题文本同样从单一数据源取，与窗口标题栏保持同步
+        try:
+            self.AppTitleText.Text = _APP_TITLE
+        except Exception:
+            pass
 
         try:
             win.AppWindow.Resize(SizeInt32(920, 880))
