@@ -892,6 +892,10 @@ def run_pipeline(
         result.skipped_count = 0
 
     report = out_dir.parent / f"{language}.未翻译报告.txt"
+    # 配套的临时/报告文件：上次运行暂停时遗留的标记、游戏运行时生成的
+    # 缺失报告（已被 build_missing_fix 在本轮消费过，本轮翻译完成即作废）。
+    pause_marker = out_dir.parent / f".{language}.暂停标记.txt"
+    runtime_report = out_dir.parent / f"{language}.运行时缺失报告.txt"
     if unchanged:
         try:
             with open(report, "w", encoding="utf-8-sig") as f:
@@ -914,13 +918,20 @@ def run_pipeline(
         for s in unchanged_s[:10]:
             log(f"  未翻译字符串: {s.filename}:{s.line} {s.text[:50]}")
     else:
-        # 全部翻译完成：删除可能残留的旧报告，以“报告是否存在”判断是否已完成
-        try:
-            if report.exists():
-                report.unlink()
-                log(f"全部文本翻译完成，已删除旧的未翻译报告: {report}")
-        except OSError:
-            pass
+        # 全部翻译完成：删除可能残留的旧报告与暂停标记，让
+        # “报告/标记是否存在”准确反映“是否还有未完成内容”，避免
+        # 上次运行的噪音被下一轮误判为未完成（runtime_report 已在
+        # build_missing_fix 中消费完）。
+        cleaned = []
+        for stale in (report, pause_marker, runtime_report):
+            try:
+                if stale.exists():
+                    stale.unlink()
+                    cleaned.append(stale.name)
+            except OSError:
+                pass
+        if cleaned:
+            log("全部翻译完成，已清理上次运行的遗留文件: " + ", ".join(cleaned))
 
     result.ok = True
     lines = [

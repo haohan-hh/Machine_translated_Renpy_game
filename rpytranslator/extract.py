@@ -538,7 +538,9 @@ class RpyExtractor:
 
         # 语句关键字
         keyword = self._keyword_of(stripped)
-        if keyword == "label":
+        if keyword in ("label", "menu"):
+            # `menu name:` 在 Ren'Py 中等价于一个隐式 label，对话/选项的
+            # 翻译 identifier 以此为前缀。漏掉会让大批量说错 label。
             self._handle_label(stripped)
             return
         if keyword in ("python", "init") and self._is_python_stmt(stripped):
@@ -594,11 +596,11 @@ class RpyExtractor:
         return bool(re.match(r"^init(?:\s+offset\s+\d+)?(?:\s+-\w+)*\s+python\b", stripped))
 
     def _handle_label(self, stripped: str):
-        # label name:  或  label name(参数):
+        # label name:  /  menu name:  /  label name(参数):
         # 必须带冒号（屏幕里的 `label 变量` / `label 变量:` 控件不在此列）
         if not stripped.endswith(":"):
             return
-        m = re.match(r"^label\s+([^\s:()]+)", stripped)
+        m = re.match(r"^(?:label|menu)\s+([^\s:()]+)", stripped)
         if not m:
             return
         name = m.group(1)
@@ -614,7 +616,9 @@ class RpyExtractor:
             self._alternate = None
             return
         if "." in name:
-            # 全限定带点（如 `chapter_L3.subname`）：按字面值保留
+            # 全限定带点（如 `chapter_L3.subname` / `menu chapter_L3.distraction:`）：
+            # 按字面值保留。Ren'Py 允许 label 名带点（命名的 menu 也等价于
+            # 一个 label），identifier 生成时 "." 替换为 "_"。
             self._label = name
             self._alternate = None
             return

@@ -1,5 +1,31 @@
 # 更新日志
 
+## v0.1.7 — 2026-09-23
+
+**完成时清理 + named menu 进 ID**
+
+- **完成时清理遗留文件**（pipeline.py）：当本次翻译任务完全成功（无回退原文、
+  无错误）时，自动删除 3 个上次运行留下的文件——`[未知语言].未翻译报告.txt`、
+  `.[未知语言].暂停标记.txt`、`[未知语言].运行时缺失报告.txt`。让"报告/标记是否
+  存在"准确反映"是否还有未完成内容"，避免上次运行的噪音被下一轮误判为未完成
+  （运行时缺失报告已被 `build_missing_fix()` 在本轮消费过）。`result.paused=True`
+  或有未翻译条目时一律不动。
+
+- **`menu name:` 也进 ID 路径**（extract.py）：之前 dispatcher 只让 `label name:`
+  触发 label 切换，遗漏了 Ren'Py 里「命名的 menu」——`menu chapter_L3.distraction:`
+  等价于一个隐式 label，对话 / 选项的 identifier 以此为前缀。上一版 v0.1.6 的
+  sub-label 修复对 menu 无效，故仍有 ~1170 条 ID 错位（`chapter_L3_distraction_*`
+  / `chapter_M3_ritual_*` 等）。修复：dispatcher 同时识别 `label` / `menu`
+  关键字，调同一个 `_handle_label` 处理。实测游戏《Where The Demon Lurks》本轮
+  命中率 89.8% → **95.2%**，其余 4.8% 来自 `extend` / 动态 label 等边缘场景，
+  留作后续。
+
+- 本轮 "tl/schinese 下新文件"分析：`.schinese` 下 `zz_language_display.rpy` 是
+  `ensure_language_name()` 主动生成的（翻译"Language/English/简体中文"等显示名），
+  由 patcher.py 维护，无需修复；游戏运行时生成的 `schinese.运行时缺失报告.txt`
+  已被 `verify.py.build_missing_fix()` 自动消费补译，覆盖率比 v0.1.6 提升 5.4
+  个百分点，无需额外处理。
+
 ## v0.1.6 — 2026-09-23
 
 **系统性修复 4 类问题（针对 Ren'Py 发行版游戏常见缺陷）**
