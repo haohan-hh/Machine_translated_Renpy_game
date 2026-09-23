@@ -32,3 +32,7 @@ after_class_hanhua.log
 
 # 本地汉化备份（不入库）
 schinese_old_backup/
+
+# 本地推理模型配置（仅本机生效，不入库）
+*.Modelfile
+Modelfile
