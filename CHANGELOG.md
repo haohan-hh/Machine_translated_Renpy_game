@@ -39,6 +39,23 @@
   模型，点击「保存设置」加入）」。配置 schema 扩展：`saved_models` 字段；
   旧配置无此字段时退化为「当前一项」，向后兼容。
 
+- **修复：下拉列表导致软件无法启动**（gui_main.py，紧急）：上一版误把
+  `MenuFlyout.Items` 当成 .NET 风格集合，用了 `items.Count` —— 它是 WinRT 的
+  `IVector<T>`，取长度用 `Size`、清空用 `Clear()`、追加用 `Append()`，
+  **没有 `Count`**。该 `AttributeError` 在 `OnLaunched → _load_settings →
+  _rebuild_model_menu` 链路上抛出，逃出 WinUI 回调后**直接终止进程**，表现为
+  「双击 .bat 后命令窗闪过、主界面起不来」。修复要点：
+  - 改用 `Append`（经 `_vector_append` 做 Append/append/Add 命名兼容）；
+  - 每次**新建**一个 MenuFlyout 重新挂到按钮，彻底不再需要
+    `Count`/`Size`/`Clear`/`RemoveAt`；
+  - 条目回调改用**闭包**捕获配置，不再走 `Tag`（其类型是 `IInspectable`，
+    赋 Python dict 在 win32more 下不可靠）；闭包存入 `_menu_handlers` 防 GC；
+  - 整个重建过程 try/except 兜底——下拉只是便利功能，任何异常都不得再拖垮
+    启动。
+  实测（带探针启动真实 GUI）：`_rebuild_model_menu` 正常执行、`Append` 两次
+  调用均返回成功、进程稳定运行、无异常输出；并用「10 秒自动退出」脚本验证了
+  旧配置（无 `saved_models` 字段）能被正确迁移为 1 条。
+
 ## v0.1.6 — 2026-09-23
 
 **系统性修复 4 类问题（针对 Ren'Py 发行版游戏常见缺陷）**

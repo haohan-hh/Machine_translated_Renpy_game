@@ -253,6 +253,8 @@ class GuiApp(XamlApplication):
         self._saved_models: list[dict] = []
         # 模型下拉 Flyout 在 OnLaunched 中创建并挂到 ModelMenuBtn
         self._model_flyout: MenuFlyout | None = None
+        # 下拉条目点击回调的强引用（防 GC 回收 delegate）
+        self._menu_handlers: list = []
 
     # -- 生命周期 ----------------------------------------------------------
 
@@ -278,8 +280,16 @@ class GuiApp(XamlApplication):
 
         # 模型下拉：把 MenuFlyout 挂到 ModelMenuBtn；之后 _load_settings 会
         # 根据 saved_models 填充条目。Button.Flyout 一旦设置，点击 ▼ 即自动展开。
-        self._model_flyout = MenuFlyout()
-        self.ModelMenuBtn.Flyout = self._model_flyout
+        # 包 try：下拉列表属于锦上添花，绝不能因它让整个软件启动失败。
+        try:
+            self._model_flyout = MenuFlyout()
+            self.ModelMenuBtn.Flyout = self._model_flyout
+        except Exception as exc:
+            self._model_flyout = None
+            try:
+                self._append_log("模型下拉初始化失败（不影响使用）: %s" % exc, "err")
+            except Exception:
+                pass
 
         try:
             win.AppWindow.Resize(SizeInt32(920, 880))
@@ -384,42 +394,88 @@ class GuiApp(XamlApplication):
 
     # -- 模型下拉（ModelMenuBtn） -----------------------------------------
 
-    def _rebuild_model_menu(self) -> None:
-        """按 self._saved_models 重建 MenuFlyout 条目。空列表显示占位提示。"""
-        if self._model_flyout is None:
-            return
-        items = self._model_flyout.Items
-        while items.Count > 0:
-            items.RemoveAt(0)
-        if not self._saved_models:
-            hint = MenuFlyoutItem()
-            hint.Text = "（暂无已保存的模型，点击「保存设置」加入）"
-            hint.IsEnabled = False
-            items.Append(hint)
-            return
-        title = MenuFlyoutItem()
-        title.Text = "已保存的模型（按当前字段切换）"
-        title.IsEnabled = False
-        items.Append(title)
-        for entry in self._saved_models:
-            mi = MenuFlyoutItem()
-            model = (entry.get("model") or "").strip() or "（未命名）"
-            url = entry.get("url") or ""
-            mi.Text = f"{model}    {url}"
-            mi.Tag = entry
-            mi.add_Click(self.OnModelMenuItemClick)
-            items.Append(mi)
+    @staticmethod
+    def _vector_append(items, item) -> None:
+        """向 WinRT `IVector<T>` 追加元素。
 
-    def OnModelMenuItemClick(self, sender, e) -> None:
-        """点击下拉条目：将该条目的 url/key/model 写回界面（不自动保存磁盘）。"""
-        entry = getattr(sender, "Tag", None)
-        if not entry:
-            return
-        self.ApiUrlBox.Text = entry.get("url") or ""
-        self.ApiKeyBox.Password = entry.get("key") or ""
-        self.ModelBox.Text = (entry.get("model") or "").strip()
-        self._append_log(
-            "已切换到已保存模型：%s" % (entry.get("model") or "（无模型名）"), "info")
+        `MenuFlyout.Items` 是 ABI 层的 `IVector<MenuFlyoutItemBase>`，不是
+        .NET 风格集合：追加方法叫 **`Append`**（不是 `Add`），取长度用
+        `Size`（**没有 `Count`**）——此前误用 `Count` 会在启动阶段抛
+        `AttributeError` 直接导致软件起不来。这里仍做一次命名兼容，防止
+        不同 win32more 版本的投影差异再次让下拉不可用。
+        """
+        for name in ("Append", "append", "Add"):
+            fn = getattr(items, name, None)
+            if callable(fn):
+                fn(item)
+                return
+        raise AttributeError("IVector 未找到可用的追加方法（Append/append/Add）")
+
+    def _rebuild_model_menu(self) -> None:
+        """按 self._saved_models 重建模型下拉。
+
+        实现要点（都是为了不再让启动崩掉）：
+        - 每次**新建**一个 MenuFlyout 重新挂到按钮上，因此完全不需要
+          `Clear()` / `RemoveAt()` / `Size`，只用到最确定的 `Append`。
+        - 条目回调用**闭包**直接捕获该条配置，不用 `Tag`——`Tag` 的类型是
+          `IInspectable`，把 Python dict 赋给它在 win32more 下并不可靠。
+        - 闭包 delegate 存进 `self._menu_handlers` 保持引用，防止被 GC。
+        - 整体包 try/except：下拉只是便利功能，任何异常都不得拖垮启动。
+        """
+        try:
+            btn = getattr(self, "ModelMenuBtn", None)
+            if btn is None:
+                return
+            flyout = MenuFlyout()
+            items = flyout.Items
+            self._menu_handlers = []          # 保持委托引用，避免被 GC
+            if not self._saved_models:
+                hint = MenuFlyoutItem()
+                hint.Text = "（暂无已保存的模型，点击「保存设置」加入）"
+                hint.IsEnabled = False
+                self._vector_append(items, hint)
+            else:
+                title = MenuFlyoutItem()
+                title.Text = "已保存的模型（点击切换）"
+                title.IsEnabled = False
+                self._vector_append(items, title)
+                for entry in self._saved_models:
+                    mi = MenuFlyoutItem()
+                    model = (entry.get("model") or "").strip() or "（未命名）"
+                    url = entry.get("url") or ""
+                    mi.Text = f"{model}    {url}"
+                    handler = self._make_model_handler(dict(entry))
+                    self._menu_handlers.append(handler)
+                    mi.add_Click(handler)
+                    self._vector_append(items, mi)
+            self._model_flyout = flyout
+            btn.Flyout = flyout
+        except Exception as exc:
+            try:
+                self._append_log("构建模型下拉列表失败（不影响使用）: %s" % exc, "err")
+            except Exception:
+                pass
+
+    def _make_model_handler(self, entry: dict):
+        """为一条已保存配置生成点击回调（闭包捕获 entry，避免用 Tag）。"""
+        def _handler(sender, e):
+            self._apply_saved_model(entry)
+        return _handler
+
+    def _apply_saved_model(self, entry: dict) -> None:
+        """把一条已保存配置的 url/key/model 写回界面（不自动落盘）。"""
+        try:
+            self.ApiUrlBox.Text = entry.get("url") or ""
+            self.ApiKeyBox.Password = entry.get("key") or ""
+            self.ModelBox.Text = (entry.get("model") or "").strip()
+            self._append_log(
+                "已切换到已保存模型：%s" % (entry.get("model") or "（无模型名）"),
+                "info")
+        except Exception as exc:
+            try:
+                self._append_log("切换模型失败: %s" % exc, "err")
+            except Exception:
+                pass
 
     # -- 事件：浏览 / 拖放 --------------------------------------------------
 
