@@ -542,20 +542,126 @@ _LANG_UI_SNIPPET = (
 #      任何对 _zz_font_select 的引用。
 _FONT_UI_MARKER = "# ===== 字体选项（汉化工具自动生成） ====="
 
-_FONT_UI_SNIPPET = (
-    "        " + _FONT_UI_MARKER + "\n"
-    "        vbox:\n"
-    '            style_prefix "radio"\n'
-    '            label _("Font")\n'
-    "            if _zz_font_choices:\n"
-    "                textbutton \"汉化默认字体\" selected "
-    "(persistent._zz_font_choice != 'yahei') action "
-    "Function(_zz_font_select, 'cjk') style \"radio_button\"\n"
-    "                if 'yahei' in _zz_font_choices:\n"
-    "                    textbutton \"微软雅黑\" selected "
-    "(persistent._zz_font_choice == 'yahei') action "
-    "Function(_zz_font_select, 'yahei') style \"radio_button\"\n"
-)
+# （屏幕片段由 _apply_font_ui 生成：有原生字体列表时插入该列表，否则追加自有段。）
+
+# --- 原生字体选择列表 -------------------------------------------------------
+#
+# 不少游戏自带字体选择（如本作 ``Font: Default / OpenDyslexic``）。此时再
+# 另起一个「字体」段会让设置界面出现两个 Font（截图反馈的问题），正确做法是
+# 把汉化字体**追加到游戏原生列表里**。原生列表的典型形态：
+#
+#     label _("Font")
+#     textbutton _("{font=font/Itim-Regular.ttf}Default") action Language(None)
+#     textbutton _("{font=font/OpenDyslexicReg.otf}OpenDyslexic") action Language("opendyslexic")
+#
+# 检测不到原生列表时，才注入自有的「字体」段，且**仅在当前语言为汉化目标
+# 语言时显示**（否则切到中文前多出一段无意义的字体选项）。
+_FONT_LABEL_RE = re.compile(
+    r'^(\s*)label\s+_?\(\s*["\'](?:Font|字体)["\']\s*\)\s*$')
+_TEXTBUTTON_RE = re.compile(r"^(\s*)textbutton\b")
+_RADIO_STYLE_RE = re.compile(r'\bstyle\s+["\']radio_button["\']')
+
+
+def _find_native_font_list(block: str) -> tuple[int, str, str] | None:
+    """在 preferences 屏幕块里定位游戏原生的「字体」选择列表。
+
+    返回 ``(插入行号(0 基，在其后插入), 缩进串, 条目样式后缀)``；
+    未找到返回 None。样式后缀是 ``style "radio_button"``（原生条目带则跟着带，
+    保证视觉一致），否则空串。
+
+    关键：屏幕语言里 ``label`` 与 ``textbutton`` 是**同级**（同一 vbox 的子
+    元素，缩进相同），所以「Font 组」= 该 label 及其后续同级/更深缩进的行，
+    直到缩进变浅（父块结束）或遇到下一个同级 ``label``。
+    """
+    lines = block.splitlines()
+    for i, ln in enumerate(lines):
+        m = _FONT_LABEL_RE.match(ln)
+        if not m:
+            continue
+        label_indent = len(m.group(1))
+        last_btn: int | None = None
+        end = i
+        j = i + 1
+        while j < len(lines):
+            s = lines[j]
+            if not s.strip():
+                j += 1
+                continue
+            cur = len(s) - len(s.lstrip())
+            if cur < label_indent:
+                break                      # 回到父块 → 本组结束
+            if cur == label_indent and _FONT_LABEL_RE.match(s):
+                break                      # 下一个同级标题 → 本组结束
+            if _TEXTBUTTON_RE.match(s):
+                last_btn = j
+            end = j
+            j += 1
+        if last_btn is None:
+            continue
+        # textbutton 语句可能带续行（缩进更深，如 `style "radio_button"`）
+        stmt_end = last_btn
+        k = last_btn + 1
+        while k <= end:
+            s = lines[k]
+            if s.strip() and (len(s) - len(s.lstrip())) > label_indent:
+                stmt_end = k
+                k += 1
+                continue
+            break
+        head = lines[last_btn]
+        indent = head[: len(head) - len(head.lstrip())]
+        style_suffix = ' style "radio_button"' if _RADIO_STYLE_RE.search(
+            "\n".join(lines[last_btn:stmt_end + 1])) else ""
+        return stmt_end, indent, style_suffix
+    return None
+
+
+def _font_list_entries(indent: str, style_suffix: str) -> list[str]:
+    """追加到原生字体列表的条目（与原生条目同缩进 / 同样式）。"""
+    return [
+        f"{indent}{_FONT_UI_MARKER}",
+        f"{indent}if _zz_font_choices:",
+        f"{indent}    textbutton \"汉化默认字体\" selected "
+        f"(persistent._zz_font_choice != 'yahei') action "
+        f"Function(_zz_font_select, 'cjk'){style_suffix}",
+        f"{indent}    if 'yahei' in _zz_font_choices:",
+        f"{indent}        textbutton \"微软雅黑\" selected "
+        f"(persistent._zz_font_choice == 'yahei') action "
+        f"Function(_zz_font_select, 'yahei'){style_suffix}",
+    ]
+
+
+def _apply_font_ui(block: str, language: str) -> str:
+    """把字体选项加进屏幕文本，返回**整段**屏幕定义（已含插入内容）。
+
+    两种模式：
+    - 定位到游戏原生字体列表 → 把条目插入该列表末尾（不新增 Font 标题，
+      避免设置界面出现两个 Font 段）；
+    - 没有原生列表 → 在屏幕末尾追加自有「字体」段，且仅在当前语言为汉化
+      目标语言时显示。
+    """
+    found = _find_native_font_list(block)
+    if found is not None:
+        end, indent, style_suffix = found
+        lines = block.rstrip("\n").splitlines()
+        lines[end + 1:end + 1] = _font_list_entries(indent, style_suffix)
+        return "\n".join(lines) + "\n"
+    # 无原生字体列表：自有「字体」段，仅在当前语言 == 汉化语言时显示
+    return block.rstrip("\n") + "\n" + (
+        "        " + _FONT_UI_MARKER + "\n"
+        f"        if _preferences.language == {language!r}:\n"
+        "            vbox:\n"
+        '                style_prefix "radio"\n'
+        '                label _("Font")\n'
+        "                if _zz_font_choices:\n"
+        "                    textbutton \"汉化默认字体\" selected "
+        "(persistent._zz_font_choice != 'yahei') action "
+        "Function(_zz_font_select, 'cjk') style \"radio_button\"\n"
+        "                    if 'yahei' in _zz_font_choices:\n"
+        "                        textbutton \"微软雅黑\" selected "
+        "(persistent._zz_font_choice == 'yahei') action "
+        "Function(_zz_font_select, 'yahei') style \"radio_button\"\n"
+    )
 
 
 def _font_ui_available(game_dir: Path) -> bool:
@@ -670,6 +776,35 @@ _LANG_UI_PATTERNS = (
 )
 
 
+def _strip_comments(text: str) -> str:
+    """去掉整行注释与行尾注释（保留字符串内的 ``#``，按引号状态判断）。
+
+    用途：判断「源码是否使用了某 API」时必须忽略注释——本工具自己生成的
+    补丁里就有 ``# 老版 Ren'Py 无 Preference('language')，…`` 这类说明注释。
+    """
+    out: list[str] = []
+    for line in text.splitlines():
+        quote: str | None = None
+        cut = len(line)
+        i = 0
+        while i < len(line):
+            c = line[i]
+            if quote:
+                if c == "\\":
+                    i += 2
+                    continue
+                if c == quote:
+                    quote = None
+            elif c in ("'", '"'):
+                quote = c
+            elif c == "#":
+                cut = i
+                break
+            i += 1
+        out.append(line[:cut])
+    return "\n".join(out)
+
+
 def _extract_screen_block(text: str, screen_name: str) -> str | None:
     """提取 text 中 `screen <name>...:` 的完整定义块（含 screen 行）。
 
@@ -714,6 +849,11 @@ def _has_language_ui(game_dir: Path, language: str = "schinese") -> bool:
     1. 动态语言列表（get_languages / Preference("language") / language_button）
        —— 新语言会自动出现在列表中
     2. 硬编码语言按钮中包含目标语言标签（如 Language("schinese")）
+
+    两个必须排除的干扰源（都曾导致语言界面被误判为「游戏已有」而不再注入）：
+    - 本工具自己注入的 ``zz_*.rpy`` / ``zz_*.rpyc`` 补丁：它们的注释里就写着
+      ``Preference('language')`` 这样的说明文字，扫进去必然命中；
+    - 注释行：游戏/工具源码里「提到」某 API 不等于「使用」该 API。
     """
     # 硬编码按钮含目标语言
     hardcoded = (
@@ -722,15 +862,18 @@ def _has_language_ui(game_dir: Path, language: str = "schinese") -> bool:
     )
 
     def _check(text: str) -> bool:
-        if any(re.search(p, text) for p in _LANG_UI_PATTERNS):
+        stripped = _strip_comments(text)
+        if any(re.search(p, stripped) for p in _LANG_UI_PATTERNS):
             return True
-        return any(re.search(p, text) for p in hardcoded)
+        return any(re.search(p, stripped) for p in hardcoded)
 
-    # 先扫 .rpy
+    # 先扫 .rpy（跳过本工具注入的 zz_* 补丁）
     for dirpath, dirnames, filenames in os.walk(game_dir):
         dirnames[:] = [d for d in dirnames if d.lower() not in _SKIP_DIRS]
         for fn in filenames:
             if os.path.splitext(fn)[1].lower() not in (".rpy", ".rpym"):
+                continue
+            if fn.lower().startswith("zz_"):
                 continue
             try:
                 text = Path(dirpath, fn).read_text(encoding="utf-8-sig", errors="ignore")
@@ -738,10 +881,10 @@ def _has_language_ui(game_dir: Path, language: str = "schinese") -> bool:
                 continue
             if _check(text):
                 return True
-    # screens.rpyc 反编译检查
+    # screens.rpyc 反编译检查（同样跳过 zz_*）
     for fn in ("screens.rpyc", "screens.rpymc"):
         p = game_dir / fn
-        if not p.is_file():
+        if not p.is_file() or fn.lower().startswith("zz_"):
             continue
         text = _decompile_rpyc_source(p, p.name)
         if text and _check(text):
@@ -821,6 +964,11 @@ def _find_preferences_source(game_dir: Path) -> tuple[str | None, Path | None]:
         for fn in sorted(filenames):
             if os.path.splitext(fn)[1].lower() not in (".rpyc", ".rpymc"):
                 continue
+            # 跳过本工具注入的 zz_* 补丁（.rpyc 同样要跳！否则会把上轮
+            # 自己生成的补丁当成「游戏源码」，在它之上反复注入，导致
+            # 块内容逐轮退化——语言段就是在这一步被丢掉的）。
+            if fn.lower().startswith("zz_"):
+                continue
             p = Path(dirpath) / fn
             text = _decompile_rpyc_source(p, p.name)
             if text and re.search(_PREF_SCREEN_RE, text):
@@ -845,20 +993,27 @@ def _find_preferences_source(game_dir: Path) -> tuple[str | None, Path | None]:
     return None, None
 
 
-def _build_language_ui(source_text: str, with_font: bool = False) -> str | None:
+def _count_screen_defs(text: str, name: str) -> int:
+    """统计文本里 ``screen <name>`` 定义的个数（含 ``init -N`` 前缀写法）。"""
+    pat = re.compile(r"^\s*(?:init\s+-?\d+\s+)?screen\s+" + re.escape(name) + r"\b")
+    return sum(1 for ln in text.splitlines() if pat.match(ln))
+
+
+def _build_language_ui(source_text: str, with_font: bool = False,
+                      language: str = "schinese") -> str | None:
     """在 preferences 屏幕块末尾注入语言选择器（及可选的字体选项）。
 
     返回新的整个屏幕定义；屏幕块已注入过或定位不到时返回 None。
+    字体选项优先追加进游戏的**原生字体列表**（避免出现两个 Font 段）。
     """
     block = _extract_screen_block(source_text, "preferences")
     if block is None:
         return None
     if _LANG_UI_MARKER in block:
         return None  # 已注入
-    block = block.rstrip() + "\n"
-    out = block + _LANG_UI_SNIPPET
+    out = block.rstrip() + "\n" + _LANG_UI_SNIPPET
     if with_font:
-        out += _FONT_UI_SNIPPET
+        out = _apply_font_ui(out, language)
     return out + _LANG_UI_HELPER
 
 
@@ -888,7 +1043,8 @@ def apply_language_ui(game_dir: Path, language: str = "schinese",
         # 但缺补丁时字体选项本身也没有意义）。
         want_font = with_font and _font_ui_available(game_dir)
         if want_font:
-            body += _FONT_UI_SNIPPET
+            # 有原生字体列表 → 追加进去；否则注入自有段（仅在中文下显示）
+            body = _apply_font_ui(body, language)
         try:
             header = (
                 "# -*- coding: utf-8 -*-\n"
@@ -929,16 +1085,26 @@ def apply_language_ui(game_dir: Path, language: str = "schinese",
         except OSError:
             text = ""
         if _LANG_UI_MARKER in text:
-            if (_FONT_UI_MARKER in text) == want_font:
+            # 结构自检：补丁里 preferences 屏幕定义必须恰好 1 个，且语言段
+            # 不能只有标记没有按钮——历史上出现过「_has_language_ui 误判
+            # 游戏已有语言界面 → 重注入时只写字体段」的坏文件：语言标记
+            # 还在（helper 里），但语言列表按钮整个没了。判定「已注入」必须
+            # 看实际按钮代码（_lang_ui_label 只出现在语言段的按钮行里）。
+            sane = (_count_screen_defs(text, "preferences") == 1
+                    and "_lang_ui_label" in text)
+            if sane and (_FONT_UI_MARKER in text) == want_font:
                 res.ok = True
                 res.skip = True
                 res.message = "设置界面选项已注入，跳过"
                 return res
-            # 需要补字体选项 / 需要移除失效字体选项 → 重建（语言 + 字体）
+            # 需要补字体选项 / 移除失效字体选项 / 修复损坏文件 → 重建
             _inject(with_lang=True)
             if res.ok:
-                res.message = ("已为现有设置界面补上字体选项" if want_font
-                               else "已移除失效的字体选项（字体补丁缺失）")
+                if not sane:
+                    res.message = "设置界面补丁结构异常（屏幕被重复写入），已重建"
+                else:
+                    res.message = ("已为现有设置界面补上字体选项" if want_font
+                                   else "已移除失效的字体选项（字体补丁缺失）")
             return res
 
     # 3. 全新注入（语言 + 可选字体）

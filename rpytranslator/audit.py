@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """补漏查缺：扫描已生成的 tl/<语言>/ 翻译文件，分类检测残留问题。
 
-三类问题（报告中的中文类别名）：
+四类问题（报告中的中文类别名）：
 
 1. ``untranslated`` 未翻译残留：译文与原文相同，且原文含成串英文单词。
 2. ``mixed`` 中英参半：译文含目标语言文字，同时残留成段英文（连续 ≥3 个
@@ -10,10 +10,14 @@
 3. ``wrong_lang`` 目标语言不正确：译文不含目标语言文字，却含其他语言
    文字（日文假名 / 韩文 / 西里尔 / 泰文 / 希腊文），或整句仍是英文
    且与原文不同（模型把原文「英文改写」了一遍而没有翻译）。
+4. ``traditional`` 繁体残留（简体中文目标）：译文含繁体字形。这类问题
+   **不需要重译**——繁→简是一一对应的确定性替换，直接在本地把 tl 文件的
+   译文行改写为简体（fix_traditional=True，默认开启），零 API 成本。
 
 检测结果写入 ``tl/<语言>.补漏查缺报告.txt`` 供人工逐条核查（含
-文件:行号 定位）；同时把问题项原文合并进「未翻译报告」，下次运行
-「开始汉化」时增量模式会自动重译这些文本——这就是「补充修正」的闭环。
+文件:行号 定位）；除 ``traditional``（已本地修复）外，问题项原文会合并进
+「未翻译报告」，下次运行「开始汉化」时增量模式会自动重译这些文本——
+这就是「补充修正」的闭环。
 
 解析格式与 generator.py 的输出逐字节对称（encode_say_string 的反转义）。
 """
@@ -23,6 +27,9 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+
+from .extract import encode_say_string
+from .zhconv import traditional_chars, to_simplified
 
 # ---------------------------------------------------------------------------
 # 语言 → 目标文字
@@ -67,6 +74,11 @@ def _norm_language(language: str) -> str:
     return language.split("（")[0].split("(")[0].strip().lower()
 
 
+# 「简体中文」目标的语言码（繁体目标只检测不转换：简→繁是多对一的
+# 有损映射，如「后」→「後/后」，自动转换会出错）
+_SIMPLIFIED_LANGS = {"schinese", "zh", "zh_cn", "zh_hans"}
+
+
 @dataclass
 class AuditItem:
     """一个翻译条目及其判定结果（category 为空表示无问题）。"""
@@ -76,8 +88,9 @@ class AuditItem:
     who: str = ""
     original: str = ""
     translation: str = ""
-    category: str = ""    # untranslated / mixed / wrong_lang；空 = 正常
+    category: str = ""    # untranslated / mixed / wrong_lang / traditional；空 = 正常
     note: str = ""        # 判定依据（报告里展示）
+    tl_line: int = 0      # 译文行在 tl 文件里的 1 基行号（traditional 本地修复用）
 
 
 @dataclass
@@ -86,6 +99,7 @@ class AuditSummary:
     counts: dict = field(default_factory=dict)   # category -> 条数
     report_path: str = ""
     queued: int = 0                                # 合并进未翻译报告的条数
+    fixed_traditional: int = 0                     # 已本地转换为简体的条数
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +190,7 @@ def parse_tl_file(path: Path) -> list[AuditItem]:
         if _TRANSLATE_RE.match(s) and not _STRINGS_RE.match(s):
             # 对话块：其后第一行 `# ...` 为原句，下一个非注释行为译文
             who, original, translation = "", "", ""
+            trans_line = 0
             j = i + 1
             while j < n:
                 t = lines[j].strip()
@@ -194,11 +209,13 @@ def parse_tl_file(path: Path) -> list[AuditItem]:
                 mm = _SAY_RE.match(t)
                 if mm:
                     translation = _quoted(mm.group(2))
+                    trans_line = j + 1
                 break
             if original or translation:
                 items.append(AuditItem(
                     tl_file=path.name, src_file=src_file, src_line=src_line,
-                    who=who, original=original, translation=translation))
+                    who=who, original=original, translation=translation,
+                    tl_line=trans_line))
             # 跳到块外（下一个 0 缩进的行）
             i = max(j, i + 1)
             while i < n and (not lines[i].strip() or lines[i][:1].isspace()):
@@ -230,7 +247,8 @@ def parse_tl_file(path: Path) -> list[AuditItem]:
                 if mn and pending_old is not None:
                     items.append(AuditItem(
                         tl_file=path.name, src_file=p_file, src_line=p_line,
-                        original=pending_old, translation=_quoted(mn.group(1))))
+                        original=pending_old, translation=_quoted(mn.group(1)),
+                        tl_line=j + 1))
                     pending_old = None
                     j += 1
                     continue
@@ -299,6 +317,16 @@ def classify(item: AuditItem, language: str) -> str | None:
     if _WORD_RUN3_RE.search(trans_plain):
         item.note = "残留成段英文"
         return "mixed"
+
+    # 4) 繁体残留（仅简体中文目标）：以上都正常、只是字形不对。放在最后
+    #    是有意的——「mixed + 繁体」的条目先按 mixed 进重译队列（重译才能
+    #    解决英文残留），纯繁体才走本地转换（免 API 修复）。
+    if lang in _SIMPLIFIED_LANGS:
+        tch = traditional_chars(trans_plain)
+        if tch:
+            item.note = "含繁体字: " + "".join(tch[:12]) + (
+                "…" if len(tch) > 12 else "")
+            return "traditional"
     return None
 
 
@@ -310,7 +338,77 @@ _CATEGORY_TITLES = {
     "untranslated": "未翻译残留（译文与原文相同）",
     "mixed": "中英参半（译文残留成段英文）",
     "wrong_lang": "目标语言不正确（含其他语言 / 整句英文）",
+    "traditional": "繁体残留（已自动转换为简体）",
 }
+
+
+def _simplify_say_line(line: str) -> tuple[str, str] | None:
+    """把一个译文行（``who "…"`` / ``new "…"``）引号内的繁体转为简体。
+
+    返回 ``(新行, 转换后的译文原文)``；行内没有引号或没有繁体时返回 None。
+    只动引号内的内容——说话人前缀、``new`` 关键字、缩进、行尾注释都不碰。
+    """
+    first, last = line.find('"'), line.rfind('"')
+    if first == -1 or last <= first:
+        return None
+    prefix, body, suffix = line[:first], line[first + 1:last], line[last + 1:]
+    decoded = _decode_say_string(body)
+    simplified = to_simplified(decoded)
+    if simplified == decoded:
+        return None
+    return prefix + encode_say_string(simplified) + suffix, simplified
+
+
+def _fix_traditional_lines(items: list[AuditItem],
+                           item_paths: dict[int, Path], log) -> int:
+    """把繁体译文行就地改写为简体（繁→简一一对应，无需重译）。
+
+    只改 ``new "…"`` / 译文行的引号内容；``old`` 原文行绝不碰——原文是
+    游戏文本的匹配键，动了会导致 Ren'Py 对不上号而整块失效。
+    返回成功改写的条数。
+    """
+    by_file: dict[Path, list[AuditItem]] = {}
+    for it in items:
+        p = item_paths.get(id(it))
+        if p is not None and it.tl_line > 0:
+            by_file.setdefault(p, []).append(it)
+
+    fixed = 0
+    for path, group in by_file.items():
+        try:
+            raw = path.read_text(encoding="utf-8-sig", errors="strict")
+        except (OSError, UnicodeError) as exc:
+            if log:
+                log(f"补漏查缺：读取 {path.name} 失败，跳过本地转换: {exc}")
+            continue
+        ends_nl = raw.endswith("\n")
+        lines = raw.split("\n")
+        touched: list[AuditItem] = []
+        for it in group:
+            idx = it.tl_line - 1
+            if not 0 <= idx < len(lines):
+                continue
+            rv = _simplify_say_line(lines[idx])
+            if rv is None:
+                continue
+            lines[idx], simplified = rv
+            touched.append(it)
+        if not touched:
+            continue
+        try:
+            out = "\n".join(lines)
+            if ends_nl and not out.endswith("\n"):
+                out += "\n"
+            path.write_text(out, encoding="utf-8-sig")
+        except OSError as exc:
+            if log:
+                log(f"补漏查缺：写回 {path.name} 失败: {exc}")
+            continue
+        fixed += len(touched)
+        for it in touched:
+            it.translation = to_simplified(it.translation)   # 报告展示转换后译文
+            it.note = "已自动转换为简体"
+    return fixed
 
 
 def _resolve_game_dir(game_path: str | Path) -> Path:
@@ -320,9 +418,30 @@ def _resolve_game_dir(game_path: str | Path) -> Path:
     return p
 
 
+def _escape_report_text(text: str) -> str:
+    """「未翻译报告」条目的多行转义：换行 → ``\\n``、反斜杠 → ``\\\\``。
+
+    报告是「一行一条」的格式（pipeline._parse_untran_report 靠行解析），
+    多行原文必须压成一行，否则一条会污染成多条。
+    """
+    return text.replace("\\", "\\\\").replace("\n", "\\n")
+
+
+def _unescape_report_text(text: str) -> str:
+    """_escape_report_text 的逆操作（写入/解析两侧配对使用）。"""
+    return re.sub(r"\\(.)", lambda m: "\n" if m.group(1) == "n" else m.group(1),
+                  text)
+
+
 def run_audit(game_path: str | Path, language: str, log=None,
-              queue_for_retranslate: bool = True) -> AuditSummary:
-    """扫描 tl/<语言>/ 全部翻译文件，写报告并把问题项排入重译队列。"""
+              queue_for_retranslate: bool = True,
+              fix_traditional: bool = True) -> AuditSummary:
+    """扫描 tl/<语言>/ 全部翻译文件，写报告并把问题项排入重译队列。
+
+    ``fix_traditional``（默认开）：简体中文目标下检出繁体残留时，直接在
+    本地把 tl 文件译文行改写为简体——确定性替换，零 API 成本，改完不进
+    重译队列（其他三类问题才需要重译）。
+    """
     summary = AuditSummary()
     game_dir = _resolve_game_dir(game_path)
     lang = _norm_language(language)
@@ -334,10 +453,13 @@ def run_audit(game_path: str | Path, language: str, log=None,
 
     # 不扫注入的界面补丁（无 translate 块，扫了也无害，但明确排除省时间）
     all_items: list[AuditItem] = []
+    item_paths: dict[int, Path] = {}     # id(item) -> tl 文件路径（修复要用）
     for f in sorted(tl_dir.rglob("*.rpy")):
         if f.name in ("zz_cn_font.rpy", "zz_language_ui.rpy"):
             continue
-        all_items.extend(parse_tl_file(f))
+        for it in parse_tl_file(f):
+            item_paths[id(it)] = f
+            all_items.append(it)
 
     problems: list[AuditItem] = []
     for it in all_items:
@@ -345,6 +467,17 @@ def run_audit(game_path: str | Path, language: str, log=None,
         if cat:
             it.category = cat
             problems.append(it)
+
+    # 繁体残留 → 本地修复（把译文行改写为简体）。来自模型输出质量，
+    # 但修复与模型无关：繁→简一一对应，直接替换 tl 文件即可。
+    if fix_traditional and lang in _SIMPLIFIED_LANGS:
+        trad_items = [it for it in problems if it.category == "traditional"]
+        if trad_items:
+            fixed = _fix_traditional_lines(trad_items, item_paths, log)
+            summary.fixed_traditional = fixed
+            if log:
+                log(f"补漏查缺：已把 {fixed} 条繁体译文本地转换为简体"
+                    f"（无需重译）")
 
     summary.total = len(all_items)
     for it in problems:
@@ -359,8 +492,11 @@ def run_audit(game_path: str | Path, language: str, log=None,
                 f.write("补漏查缺报告（翻译完成后自动扫描）\n")
                 f.write(f"扫描时间: {datetime.now():%Y-%m-%d %H:%M:%S}\n")
                 f.write(f"扫描范围: tl/{lang}/*.rpy，共 {len(all_items)} 条翻译\n")
-                f.write(f"发现问题: {len(problems)} 条"
-                        f"（已自动排入重译队列，点击「开始汉化」即可补充修正）\n")
+                if summary.fixed_traditional:
+                    f.write(f"繁体残留: {summary.fixed_traditional} 条已本地转换为简体（不占重译名额）\n")
+                queued_note = ("已自动排入重译队列，点击「开始汉化」即可补充修正"
+                               if queue_for_retranslate else "未排入重译队列")
+                f.write(f"发现问题: {len(problems)} 条（{queued_note}）\n")
                 for cat, title in _CATEGORY_TITLES.items():
                     group = [it for it in problems if it.category == cat]
                     if not group:
@@ -403,18 +539,21 @@ def run_audit(game_path: str | Path, language: str, log=None,
                         encoding="utf-8-sig", errors="ignore").splitlines():
                     m = re.match(r"^.+:\d+\s{2,}(.+)$", ln.strip())
                     if m:
-                        existing.add(m.group(1).strip())
+                        existing.add(_unescape_report_text(m.group(1).strip()))
             except OSError:
                 pass
         added = 0
         seen_new: set[str] = set()
         chunk: list[str] = []
         for it in problems:
+            if it.category == "traditional":
+                continue   # 已本地修复，无需重译
             text = it.original.strip()
-            if not text or "\n" in text or text in existing or text in seen_new:
+            if not text or text in existing or text in seen_new:
                 continue
             seen_new.add(text)
-            chunk.append(f"{it.src_file}:{it.src_line}  {text}")
+            chunk.append(f"{it.src_file}:{it.src_line}  "
+                         f"{_escape_report_text(text)}")
             added += 1
         if chunk:
             try:

@@ -16,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
+from .zhconv import to_simplified
+
 # ---------------------------------------------------------------------------
 # 占位符保护
 # ---------------------------------------------------------------------------
@@ -257,7 +259,9 @@ _SYSTEM_PROMPT = (
     "4. 所有人物名称、角色名、人名一律保留原文，绝不翻译成中文（例如 Eileen 保持 Eileen，Mako 保持 Mako）。\n"
     "5. 地名、组织名等专有名词尽量保留原文，若确需翻译应使用通用译名。\n"
     "6. 语气自然，符合角色口吻，译文长度尽量贴近原文。\n"
-    "7. 只输出 JSON 数组，不要输出任何解释或标记。"
+    "7. 译文必须是地道的{target}——禁止把英文句子、英文段落留在译文里（人名、专有名词、占位符除外）。\n"
+    "8. 目标是中文时必须使用与目标完全一致的字形：简体中文目标只准使用简体字，严禁繁体字，严禁简繁混用。\n"
+    "9. 只输出 JSON 数组，不要输出任何解释或标记。"
 )
 
 _SINGLE_SYSTEM_PROMPT = (
@@ -266,7 +270,8 @@ _SINGLE_SYSTEM_PROMPT = (
     "1. 只输出翻译结果，不要输出解释。\n"
     "2. 原样保留所有形如 \"{ph}\" 的占位符序列（游戏内标签/变量/换行/人名）。\n"
     "3. 所有人物名称、角色名、人名一律保留原文，绝不翻译成中文。\n"
-    "4. 语气自然，符合角色口吻。"
+    "4. 译文必须是地道的{target}，禁止保留英文句子；中文目标必须使用与目标一致的字形（简体目标只用简体字）。\n"
+    "5. 语气自然，符合角色口吻。"
 )
 
 # 精简系统提示词：用于「无法按常规指令返回结构化结果」的模型。
@@ -291,7 +296,11 @@ _COMPACT_SYSTEM_PROMPT = (
     "such tokens.\n"
     "3. Keep the original line-break structure.\n"
     "4. Keep all character and proper names in original form.\n"
-    "5. Natural tone matching the character; keep lengths close to the source."
+    "5. Output fully in {target}: never leave English sentences or paragraphs "
+    "untranslated (proper names and placeholders excepted).\n"
+    "6. For Chinese targets use exactly the target script: Simplified Chinese "
+    "means simplified characters only, never traditional or mixed.\n"
+    "7. Natural tone matching the character; keep lengths close to the source."
 )
 
 _COMPACT_SINGLE_PROMPT = (
@@ -300,7 +309,9 @@ _COMPACT_SINGLE_PROMPT = (
     "Translate the following Ren'Py game line into {target}.\n"
     "Every \"{ph}\"-style token is a placeholder: copy it exactly as-is. "
     "Never translate, delete, move, alter, or newly create such tokens.\n"
-    "Keep character and proper names in original form."
+    "Keep character and proper names in original form. Output fully in "
+    "{target}: no untranslated English sentences; for Simplified Chinese "
+    "use simplified characters only."
 )
 
 # 精简提示词使用英文语言名（与多数机器翻译模型的训练指令一致，效果更稳定）
@@ -317,6 +328,22 @@ _COMPACT_TARGETS = {
 _MAX_SPLIT_DEPTH = 4
 
 DEFAULT_TARGET = "简体中文"
+
+
+def _normalize_script(text: str, target: str) -> str:
+    """译文语言一致性兜底：简体中文目标下把繁体字形统一替换为简体。
+
+    提示词已要求「只用简体字」，但弱模型仍会整段输出繁体（尤其
+    zh-Hant 语料倾向的模型）。繁→简是确定性的逐字替换，这里做最后一道
+    保险，保证写进 tl 文件的一定是目标字形。占位符/标签是 ASCII，不受
+    逐字替换影响；其他目标语言原样返回。
+    """
+    if not text:
+        return text
+    t = target.strip().lower()
+    if "简体" in target or "simplified" in t:
+        return to_simplified(text)
+    return text
 
 
 @dataclass
@@ -648,7 +675,7 @@ class TranslationClient:
                         or _looks_like_meta_reply(texts[orig_i], restored)):
                     still_failed.append(orig_i)
                 else:
-                    out[orig_i] = restored
+                    out[orig_i] = _normalize_script(restored, target)
             if still_failed and len(still_failed) < len(pending):
                 self._record_error(
                     f"本批 {len(pending)} 条中有 {len(still_failed)} 条校验失败"
@@ -804,7 +831,7 @@ class TranslationClient:
                             and not _looks_like_meta_reply(text, restored)):
                         if compact and self.config.compact_prompt is None:
                             self._compact_style = True
-                        return restored
+                        return _normalize_script(restored, target)
                 except TranslationError as e:
                     self._record_error(str(e), error_cb)
                 except Exception as e:

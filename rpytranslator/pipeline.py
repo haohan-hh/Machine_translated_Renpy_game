@@ -13,6 +13,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import engine, rpa_loader
+from .audit import (
+    _WORD_RUN2_RE, _escape_report_text, _strip_markup, _unescape_report_text,
+)
 from .extract import (
     DialogueUnit, ExtractionResult, decode_say_string, extract_rpy_file,
     extract_rpy_files,
@@ -109,7 +112,8 @@ def _parse_untran_report(path: Path) -> list[str]:
     """解析「未翻译报告」：返回其中列出的未翻译文本清单。
 
     报告条目格式为 `文件名:行号  原文`（文件名与行号后为两个空格），
-    标题行、错误详情行等不会被解析进来。
+    标题行、错误详情行等不会被解析进来。多行原文在写入时被转义为
+    ``\\n``（见 audit._escape_report_text），这里还原。
     """
     texts: list[str] = []
     try:
@@ -122,7 +126,7 @@ def _parse_untran_report(path: Path) -> list[str]:
             continue
         m = re.match(r"^.+:\d+\s{2,}(.+)$", s)
         if m:
-            texts.append(m.group(1).strip())
+            texts.append(_unescape_report_text(m.group(1).strip()))
     return texts
 
 
@@ -874,23 +878,29 @@ def run_pipeline(
 
     # 10. 统计与未翻译报告
     elapsed = time.time() - t0
+    # 「译文 == 原文」的条目分两类：
+    # - 原文含成串英文单词（≥2 连续单词，与 audit 的未翻译判定一致）→ 真正
+    #   的未翻译回退，必须写进报告、进重译队列。以前“无翻译错误时一律视为
+    #   模型有意保持原文”的规则会让这类条目被永久吞掉（audit 排队 → 重译
+    #   又回退 → 又被吞，用户多次查缺仍残留就是它）。
+    # - 原文无可翻译内容（纯符号、单个词、数字、键名等）→ 有意保持，跳过。
     unchanged_d = [
-        d for d in dialogues if dialogue_translations.get(d.identifier) == d.what]
+        d for d in dialogues if dialogue_translations.get(d.identifier) == d.what
+        and _WORD_RUN2_RE.search(_strip_markup(d.what))]
     unchanged_s = [
-        s for s in strings if string_translations.get(s.text) == s.text]
+        s for s in strings if string_translations.get(s.text) == s.text
+        and _WORD_RUN2_RE.search(_strip_markup(s.text))]
+    kept_d = [
+        d for d in dialogues if dialogue_translations.get(d.identifier) == d.what
+        and not _WORD_RUN2_RE.search(_strip_markup(d.what))]
+    kept_s = [
+        s for s in strings if string_translations.get(s.text) == s.text
+        and not _WORD_RUN2_RE.search(_strip_markup(s.text))]
     unchanged = len(unchanged_d) + len(unchanged_s)
-    result.skipped_count = unchanged
-
-    # 若整个汉化过程没有任何翻译错误（无 HTTP/连接/格式/占位符校验失败），
-    # 剩余“译文 == 原文”的文本是模型有意保持原文（专有名词、技术标识符、
-    # 键盘键名、`_()` 标记但无需翻译的内容等），视为已处理，不再生成报告。
-    if unchanged and not client.error_count and not client.error_messages:
-        log(f"无任何翻译错误，{unchanged} 条文本为模型保持原文"
-            f"（专有名词/技术标识符等），视为已处理")
-        unchanged_d = []
-        unchanged_s = []
-        unchanged = 0
-        result.skipped_count = 0
+    result.skipped_count = unchanged + len(kept_d) + len(kept_s)
+    if kept_d or kept_s:
+        log(f"{len(kept_d) + len(kept_s)} 条文本原文无可翻译内容"
+            f"（纯符号/键名/单个词），模型保持原文，视为已处理")
 
     report = out_dir.parent / f"{language}.未翻译报告.txt"
     # 配套的临时/报告文件：上次运行暂停时遗留的标记、游戏运行时生成的
@@ -903,10 +913,12 @@ def run_pipeline(
                 f.write("以下文本未能翻译（回退为原文），请检查翻译服务或手动补充：\n\n")
                 f.write("== 对话 ==" if unchanged_d else "")
                 for d in unchanged_d:
-                    f.write(f"\n{d.filename}:{d.line}  {d.what}")
+                    f.write(f"\n{d.filename}:{d.line}  "
+                            f"{_escape_report_text(d.what)}")
                 f.write("\n\n== 字符串 ==" if unchanged_s else "")
                 for s in unchanged_s:
-                    f.write(f"\n{s.filename}:{s.line}  {s.text}")
+                    f.write(f"\n{s.filename}:{s.line}  "
+                            f"{_escape_report_text(s.text)}")
                 if client.error_messages:
                     f.write("\n\n== 翻译错误详情（去重） ==\n")
                     for em in client.error_messages[:20]:
@@ -976,11 +988,15 @@ def run_pipeline(
                 "untranslated": "未翻译残留",
                 "mixed": "中英参半",
                 "wrong_lang": "目标语言错误",
+                "traditional": "繁体残留",
             }
             parts = "、".join(
                 f"{titles.get(k, k)} {v} 条" for k, v in counts.items())
             total_bad = sum(counts.values())
             lines.append(f"· 补漏查缺：发现 {total_bad} 条问题（{parts}）")
+            fixed = getattr(auditsum, "fixed_traditional", 0)
+            if fixed:
+                lines.append(f"  其中 {fixed} 条繁体残留已自动转换为简体（无需重译）")
             if getattr(auditsum, "report_path", ""):
                 lines.append(f"  详情报告: {auditsum.report_path}")
             queued = getattr(auditsum, "queued", 0)

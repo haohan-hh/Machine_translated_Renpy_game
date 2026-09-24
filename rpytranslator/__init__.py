@@ -3,5 +3,5 @@
 rpytranslator - Ren'Py 游戏自动汉化工具核心包
 """
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 APP_NAME = "Ren'Py 自动汉化工具"
