@@ -294,17 +294,19 @@ def _build_font_patch(cjk_font_rel: str, original_font: str,
     - 因此必须在**样式构建之前**（init -1）就把 gui.*_font 换成中文字体；
       init 999 再兜底：重新覆盖 gui 变量、style.default.font。
     - gui 不是 Python 模块，不能 import gui，直接在 init python 块中访问即可。
-    - Dawn Chorus(Ren'Py 8.2.0) 实测：样式字体挂 FontGroup 对象后，标题界面
-      中文仍全是方框（8.2 渲染端未采用 FontGroup）；而 init -1 覆盖 gui 变量
-      后样式.font 已被确认改写成功。因此**直接给字体路径字符串**（引擎最
-      成熟路径），前提是中文字体同时覆盖 ASCII + 中文 + 全角标点。
-    - 遍历样式注册表用 .items() 即可（8.2 中 rencaizuo style.styles 是类映射对象
+    - 遍历样式注册表用 .items() 即可（8.2 中 renpy.style.styles 是类映射对象
       而非 dict，len=207；renpy/lint.py 正是用其 .items() 遍历）。
     - 中文必须用静态字体：可变字体（*Variable*.ttf）在 Ren'Py/SDL_ttf 下
       字形支持不完整，会导致部分汉字仍是方框。
     - 上面的覆盖仍漏掉屏幕里**显式**写 `font "xxx.ttf"` 的元素（属性优先级
       最高）。这层用 config.font_replacement_map 把所有游戏字体重定向到中文
       字体——Ren'Py 在加载字体时即替换，绕过 screen 的 font= 属性。
+    - **设置界面字体选项**：init -1 探测系统微软雅黑（msyh.ttc，只加入
+      config.searchpath，不复制文件）；init 999 定义 `_zz_set_font(f)`
+      （gui 变量 + 默认样式 + 全部命名样式 + font_replacement_map 一站式
+      应用）与 `_zz_font_select(choice)`（设置界面调用：记住选择并即时
+      重建样式）。启动时按 persistent._zz_font_choice 应用上次选择。
+      「字体」单选出现在 zz_language_ui.rpy 注入的设置界面里。
     """
     esc = cjk_font_rel.replace("\\", "/")
     warn_var = (
@@ -320,40 +322,17 @@ def _build_font_patch(cjk_font_rel: str, original_font: str,
     )
     gui_keys_lit = ", ".join(f'"{k}"' for k in gui_keys)
 
-    # 4) font_replacement_map：把游戏原始字体全部映射到中文字体。
-    # 屏幕里的 `font "CarterOne-Regular.ttf"` 等内联写法改不动样式对象，
-    # 必须从字体加载层换掉。代价：英文会跟着使用中文字体（失去原游戏的字体风格），
-    # 但保证中文能正常显示——对汉化来说是正确的取舍。
+    # font_replacement_map 要重定向的游戏原字体（去重）
     rep_fonts = list(replacement_fonts or [])
     if original_font and original_font not in rep_fonts:
         rep_fonts.append(original_font)
-    # 去重 + 排版
     seen = set()
     rep_unique = []
     for f in rep_fonts:
         if f and f not in seen and f != esc:
             seen.add(f)
             rep_unique.append(f)
-    if rep_unique:
-        rep_lines = "\n".join(
-            f'    config.font_replacement_map[({f!r}, False, False)] = '
-            f'({esc!r}, False, False)\n'
-            f'    config.font_replacement_map[({f!r}, True, False)] = '
-            f'({esc!r}, True, False)\n'
-            f'    config.font_replacement_map[({f!r}, False, True)] = '
-            f'({esc!r}, False, True)\n'
-            f'    config.font_replacement_map[({f!r}, True, True)] = '
-            f'({esc!r}, True, True)'
-            for f in rep_unique
-        )
-        replacement_block = (
-            "    # 4) 字体替换映射：把屏幕里显式 `font=` 写的字体也换成中文字体\n"
-            "    if not hasattr(config, 'font_replacement_map'):\n"
-            "        config.font_replacement_map = {}\n"
-            f"{rep_lines}\n"
-        )
-    else:
-        replacement_block = ""
+    rep_list_lit = ", ".join(repr(f) for f in rep_unique)
 
     return (
         "# -*- coding: utf-8 -*-\n"
@@ -361,12 +340,29 @@ def _build_font_patch(cjk_font_rel: str, original_font: str,
         f"# 中文字体: {cjk_font_rel}\n"
         "# 说明：界面样式在 init 阶段读取 gui.*_font 构建并写死字体，因此先于\n"
         "#       样式构建（init -1）把 gui.*_font 换成中文字体路径；init 999\n"
-        "#       再兜底覆盖 gui 变量、style.default.font 并遍历命名样式。\n"
-        "#       屏幕里显式写 font=\"xxx.ttf\" 的元素还会被绕过——再通过\n"
-        "#       config.font_replacement_map 在字体加载层换掉。\n"
+        "#       再统一应用（gui 变量、默认样式、全部命名样式、字体替换映射），\n"
+        "#       并提供设置界面可切换的字体选项（汉化默认字体 / 微软雅黑）。\n"
         f"{warn_var}"
         "init -1 python:\n"
         f"    _zh_cn_font = \"{esc}\"\n"
+        "\n"
+        "    # 探测系统微软雅黑（不复制进游戏目录，加入搜索路径即可引用）\n"
+        "    _zz_yahei = None\n"
+        "    import os as _zz_os\n"
+        "    _zz_fonts_dir = _zz_os.path.join(\n"
+        "        _zz_os.environ.get('WINDIR',\n"
+        "            _zz_os.environ.get('SystemRoot', 'C:\\\\Windows')),\n"
+        "        'Fonts')\n"
+        "    for _zz_c in ('msyh.ttc', 'msyh.ttf'):\n"
+        "        try:\n"
+        "            if _zz_os.path.isfile(\n"
+        "                    _zz_os.path.join(_zz_fonts_dir, _zz_c)):\n"
+        "                _zz_yahei = _zz_c\n"
+        "                if _zz_fonts_dir not in config.searchpath:\n"
+        "                    config.searchpath.append(_zz_fonts_dir)\n"
+        "                break\n"
+        "        except Exception:\n"
+        "            pass\n"
         "\n"
         "    # 抢在 screens 样式构建前替换 gui 字体变量（定义于 init -2）\n"
         "    try:\n"
@@ -379,44 +375,78 @@ def _build_font_patch(cjk_font_rel: str, original_font: str,
         "                setattr(_zh_gui, _k, _zh_cn_font)\n"
         "\n"
         "init 999 python:\n"
-        "    # 1) 重新覆盖 gui 变量（应对游戏在 init 阶段重设字体）\n"
-        "    try:\n"
-        "        _zh_gui2 = gui\n"
-        "    except Exception:\n"
-        "        _zh_gui2 = None\n"
-        "    if _zh_gui2 is not None:\n"
-        f"        for _k in ({gui_keys_lit}):\n"
-        "            if hasattr(_zh_gui2, _k):\n"
-        "                setattr(_zh_gui2, _k, _zh_cn_font)\n"
+        "    # 字体选项表：cjk=汉化默认字体；yahei=系统微软雅黑（探测到才有）\n"
+        "    _zz_font_choices = {'cjk': _zh_cn_font}\n"
+        "    if _zz_yahei is not None:\n"
+        "        _zz_font_choices['yahei'] = _zz_yahei\n"
+        f"    _zz_rep_font_list = [{rep_list_lit}]\n"
         "\n"
-        "    # 2) 默认样式兜底\n"
-        "    style.default.font = _zh_cn_font\n"
-        "\n"
-        "    # 3) 其余命名样式兜底（覆盖绕过 gui 变量直接指定字体的样式）\n"
-        "    #    Ren'Py 8.2 的 renpy.style.styles 是类映射对象（非 dict），\n"
-        "    #    lint.py 即用其 .items() 遍历；低版本回退 game.style.styles。\n"
-        "    _zh_items = None\n"
-        "    try:\n"
-        "        import renpy.style as _zh_style_mod\n"
-        "        if hasattr(_zh_style_mod, 'styles') and hasattr(\n"
-        "                _zh_style_mod.styles, 'items'):\n"
-        "            _zh_items = _zh_style_mod.styles.items()\n"
-        "    except Exception:\n"
-        "        pass\n"
-        "    if _zh_items is None:\n"
+        "    def _zz_all_style_items():\n"
+        "        # Ren'Py 8.2 的 renpy.style.styles 是类映射对象（非 dict），\n"
+        "        # lint.py 即用其 .items() 遍历；低版本回退 game.style.styles。\n"
+        "        _zh_items = None\n"
         "        try:\n"
-        "            if hasattr(renpy.game.style.styles, 'items'):\n"
-        "                _zh_items = renpy.game.style.styles.items()\n"
+        "            import renpy.style as _zh_style_mod\n"
+        "            if hasattr(_zh_style_mod, 'styles') and hasattr(\n"
+        "                    _zh_style_mod.styles, 'items'):\n"
+        "                _zh_items = _zh_style_mod.styles.items()\n"
         "        except Exception:\n"
         "            pass\n"
-        "    if _zh_items:\n"
-        "        for _zh_n, _zh_s in _zh_items:\n"
+        "        if _zh_items is None:\n"
         "            try:\n"
-        "                _zh_s.font = _zh_cn_font\n"
+        "                if hasattr(renpy.game.style.styles, 'items'):\n"
+        "                    _zh_items = renpy.game.style.styles.items()\n"
         "            except Exception:\n"
         "                pass\n"
+        "        return _zh_items or []\n"
         "\n"
-        f"{replacement_block}"
+        "    def _zz_set_font(f):\n"
+        "        # 一站式应用字体：gui 变量 + 默认样式 + 全部命名样式 + 替换映射\n"
+        "        try:\n"
+        f"            for _k in ({gui_keys_lit}):\n"
+        "                if hasattr(gui, _k):\n"
+        "                    setattr(gui, _k, f)\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "        try:\n"
+        "            style.default.font = f\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "        for _zh_n, _zh_s in _zz_all_style_items():\n"
+        "            try:\n"
+        "                _zh_s.font = f\n"
+        "            except Exception:\n"
+        "                pass\n"
+        "        # 字体替换映射：把屏幕里显式 `font=\"xxx.ttf\"` 的元素也换掉\n"
+        "        try:\n"
+        "            if not hasattr(config, 'font_replacement_map'):\n"
+        "                config.font_replacement_map = {}\n"
+        "            for _f in _zz_rep_font_list:\n"
+        "                for _b in (False, True):\n"
+        "                    for _i in (False, True):\n"
+        "                        config.font_replacement_map[(_f, _b, _i)] = (f, _b, _i)\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "\n"
+        "    def _zz_font_select(choice):\n"
+        "        # 设置界面「字体」选项调用：记住选择并即时应用到全部文本\n"
+        "        try:\n"
+        "            persistent._zz_font_choice = choice\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "        _zz_set_font(_zz_font_choices.get(choice, _zh_cn_font))\n"
+        "        try:\n"
+        "            renpy.style.rebuild()\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "        try:\n"
+        "            renpy.restart_interaction()\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "\n"
+        "    # 启动时应用用户上次的选择（默认汉化字体）\n"
+        "    _zz_set_font(_zz_font_choices.get(\n"
+        "        persistent._zz_font_choice, _zh_cn_font))\n"
     )
 
 
@@ -434,11 +464,13 @@ def apply_font_patch(game_dir: Path) -> PatchResult:
     res = PatchResult()
     patch = game_dir / "zz_cn_font.rpy"
 
-    # 已有补丁且字体文件仍存在 → 跳过
+    # 已有补丁、字体文件仍在、且已是「带字体选项」的新版补丁 → 跳过。
+    # 旧版补丁（无 _zz_font_select，设置界面不可切换字体）在此升级重写。
     if patch.is_file():
         text = patch.read_text(encoding="utf-8-sig", errors="ignore")
         m = re.search(r"^# 中文字体: (.+)$", text, re.M)
-        if m and (game_dir / m.group(1).strip()).is_file():
+        if (m and (game_dir / m.group(1).strip()).is_file()
+                and "_zz_font_select" in text):
             res.ok = True
             res.skip = True
             res.message = "中文字体补丁已存在，跳过"
@@ -500,6 +532,46 @@ _LANG_UI_SNIPPET = (
     "Function(_lang_ui_switch, _lang_ui_i) style \"radio_button\"\n"
 )
 
+# 字体选项（设置界面）：单选「汉化默认字体 / 微软雅黑」。
+# _zz_font_select / _zz_font_choices 定义在 zz_cn_font.rpy。为避免「字体补丁
+# 缺失时屏幕引用未定义变量」（NameError），这里做两层保护：
+#   1. apply_language_ui 只在 zz_cn_font.rpy 确实含这些定义时才注入本段
+#      （见 _font_ui_available）；
+#   2. 本段把两个按钮都套在 `if _zz_font_choices:` 内，且 _LANG_UI_HELPER 会
+#      在缺少定义时兜底 `_zz_font_choices = {}` —— 此时只渲染标题，不产生
+#      任何对 _zz_font_select 的引用。
+_FONT_UI_MARKER = "# ===== 字体选项（汉化工具自动生成） ====="
+
+_FONT_UI_SNIPPET = (
+    "        " + _FONT_UI_MARKER + "\n"
+    "        vbox:\n"
+    '            style_prefix "radio"\n'
+    '            label _("Font")\n'
+    "            if _zz_font_choices:\n"
+    "                textbutton \"汉化默认字体\" selected "
+    "(persistent._zz_font_choice != 'yahei') action "
+    "Function(_zz_font_select, 'cjk') style \"radio_button\"\n"
+    "                if 'yahei' in _zz_font_choices:\n"
+    "                    textbutton \"微软雅黑\" selected "
+    "(persistent._zz_font_choice == 'yahei') action "
+    "Function(_zz_font_select, 'yahei') style \"radio_button\"\n"
+)
+
+
+def _font_ui_available(game_dir: Path) -> bool:
+    """字体补丁是否已就位（可用于设置界面的字体选项）。
+
+    只有 zz_cn_font.rpy 存在且含 `_zz_font_choices` / `_zz_font_select` 定义时
+    才认为可用——否则注入字体 UI 会让屏幕引用未定义的变量。
+    """
+    p = game_dir / "zz_cn_font.rpy"
+    if not p.is_file():
+        return False
+    try:
+        text = p.read_text(encoding="utf-8-sig", errors="ignore")
+    except OSError:
+        return False
+    return "_zz_font_choices" in text and "_zz_font_select" in text
 # 语言辅助函数：
 # - 语言列表：Ren'Py 8.2+ 提供 renpy.translation.known_languages()；
 #   get_languages() 为更新版本 API，老版本需回退扫描 game/tl 目录。
@@ -507,6 +579,15 @@ _LANG_UI_SNIPPET = (
 #   renpy.change_language()（None 表示恢复默认英文）。
 _LANG_UI_HELPER = (
     "\n\n"
+    "# 兜底默认值：字体补丁（zz_cn_font.rpy，init 999）未生效时，设置界面里的\n"
+    "# 「字体」段会读到空表并只渲染标题（不引用 _zz_font_select），避免\n"
+    "# NameError。补丁存在时其 init 999 会用真实字体表覆盖本默认值。\n"
+    "init -1 python:\n"
+    "    try:\n"
+    "        _zz_font_choices\n"
+    "    except NameError:\n"
+    "        _zz_font_choices = {}\n"
+    "\n"
     "init python:\n"
     "    def _lang_ui_languages():\n"
     "        # 可用语言列表（含默认英文 None）。跨 Ren'Py 版本兼容。\n"
@@ -547,6 +628,7 @@ _LANGUAGE_DISPLAY: dict[str, dict[str, str]] = {
         "Chinese (Simplified)": "简体中文",
         "Chinese": "中文",
         "English": "英语",
+        "Font": "字体",
     },
     "tchinese": {
         "tchinese": "繁體中文",
@@ -554,6 +636,7 @@ _LANGUAGE_DISPLAY: dict[str, dict[str, str]] = {
         "Chinese (Traditional)": "繁体中文",
         "Chinese": "中文",
         "English": "英语",
+        "Font": "字体",
     },
     "zh_cn": {
         "zh_cn": "简体中文",
@@ -561,6 +644,7 @@ _LANGUAGE_DISPLAY: dict[str, dict[str, str]] = {
         "Chinese (Simplified)": "简体中文",
         "Chinese": "中文",
         "English": "英语",
+        "Font": "字体",
     },
     "zh_hans": {
         "zh_hans": "简体中文",
@@ -568,12 +652,14 @@ _LANGUAGE_DISPLAY: dict[str, dict[str, str]] = {
         "Chinese (Simplified)": "简体中文",
         "Chinese": "中文",
         "English": "英语",
+        "Font": "字体",
     },
     "zh": {
         "zh": "中文",
         "Chinese": "中文",
         "Simplified Chinese": "简体中文",
         "English": "英语",
+        "Font": "字体",
     },
 }
 
@@ -712,11 +798,15 @@ def _find_preferences_source(game_dir: Path) -> tuple[str | None, Path | None]:
             text = _decompile_to_text(p)
             if text and re.search(_PREF_SCREEN_RE, text):
                 return text, p
-    # 3. 全目录搜索（源码）
+    # 3. 全目录搜索（源码）。跳过本工具注入的 zz_*.rpy 补丁——
+    #    它们 redefine 了 preferences 屏幕，若被当成“游戏源码”，
+    #    会因块内已有注入标记而无法再次注入（无限升级失败）。
     for dirpath, dirnames, filenames in os.walk(game_dir):
         dirnames[:] = [d for d in dirnames if d.lower() not in _SKIP_DIRS]
         for fn in sorted(filenames):
             if os.path.splitext(fn)[1].lower() not in (".rpy", ".rpym"):
+                continue
+            if fn.lower().startswith("zz_"):
                 continue
             p = Path(dirpath) / fn
             try:
@@ -755,66 +845,104 @@ def _find_preferences_source(game_dir: Path) -> tuple[str | None, Path | None]:
     return None, None
 
 
-def _build_language_ui(source_text: str) -> str | None:
-    """在 preferences 屏幕块末尾注入语言选择器，返回新的整个屏幕定义。"""
+def _build_language_ui(source_text: str, with_font: bool = False) -> str | None:
+    """在 preferences 屏幕块末尾注入语言选择器（及可选的字体选项）。
+
+    返回新的整个屏幕定义；屏幕块已注入过或定位不到时返回 None。
+    """
     block = _extract_screen_block(source_text, "preferences")
     if block is None:
         return None
     if _LANG_UI_MARKER in block:
         return None  # 已注入
     block = block.rstrip() + "\n"
-    return block + _LANG_UI_SNIPPET + _LANG_UI_HELPER
+    out = block + _LANG_UI_SNIPPET
+    if with_font:
+        out += _FONT_UI_SNIPPET
+    return out + _LANG_UI_HELPER
 
 
-def apply_language_ui(game_dir: Path, language: str = "schinese") -> PatchResult:
-    """确保游戏设置界面有语言切换选项，返回结果。"""
+def apply_language_ui(game_dir: Path, language: str = "schinese",
+                      with_font: bool = False) -> PatchResult:
+    """确保游戏设置界面有语言切换（及可选字体）选项，返回结果。"""
     res = PatchResult()
     patch = game_dir / "zz_language_ui.rpy"
 
-    # 1. 游戏已有语言切换 → 跳过
-    if _has_language_ui(game_dir, language):
+    def _inject(with_lang: bool) -> None:
+        """从游戏原始 preferences 屏幕重建注入文件（with_lang 控制是否含语言）。"""
+        source, src_path = _find_preferences_source(game_dir)
+        if source is None:
+            res.ok = False
+            res.message = "未找到 preferences 屏幕定义，无法注入设置界面选项"
+            return
+        block = _extract_screen_block(source, "preferences")
+        if block is None or _LANG_UI_MARKER in block:
+            res.ok = False
+            res.message = "无法定位 preferences 屏幕块，跳过设置界面注入"
+            return
+        body = block.rstrip() + "\n"
+        if with_lang:
+            body += _LANG_UI_SNIPPET
+        # 字体选项仅在字体补丁确实就位时注入——否则屏幕会引用未定义的
+        # _zz_font_choices / _zz_font_select（虽然 helper 有兜底空表，
+        # 但缺补丁时字体选项本身也没有意义）。
+        want_font = with_font and _font_ui_available(game_dir)
+        if want_font:
+            body += _FONT_UI_SNIPPET
+        try:
+            header = (
+                "# -*- coding: utf-8 -*-\n"
+                "# 设置界面选项（汉化工具自动生成）：语言切换 / 字体选择。\n"
+                f"# 来源: {src_path.name if src_path else '归档内 screens 脚本'}\n\n"
+            )
+            patch.write_text(header + body + _LANG_UI_HELPER,
+                             encoding="utf-8-sig")
+        except OSError as e:
+            res.ok = False
+            res.message = f"写设置界面补丁失败: {e}"
+            return
+        res.files.append(patch)
         res.ok = True
-        res.skip = True
-        res.message = "游戏已自带语言切换界面，跳过注入"
+        bits = ([] + ["语言切换"] if with_lang else []) + \
+               (["字体选项"] if want_font else [])
+        res.detail = "重启游戏后，在 设置 界面即可使用「%s」" % "、".join(bits)
+        res.message = "已注入设置界面选项（%s）" % "、".join(bits)
+
+    # 只有字体补丁确实就位时，字体选项才有意义（见 _font_ui_available）
+    want_font = with_font and _font_ui_available(game_dir)
+
+    # 1. 游戏已有语言切换 → 仅当需要字体选项时注入字体（不重复加语言）
+    if _has_language_ui(game_dir, language):
+        if not want_font:
+            res.ok = True
+            res.skip = True
+            res.message = "游戏已自带语言切换界面，跳过注入"
+            return res
+        _inject(with_lang=False)
+        if res.ok:
+            res.message = "游戏已自带语言切换界面，已补充字体选项"
         return res
-    # 2. 已有补丁 → 跳过
+    # 2. 已有补丁 → 仅在「字体选项该有/不该有」与现状不一致时重建
     if patch.is_file():
         try:
             text = patch.read_text(encoding="utf-8-sig", errors="ignore")
         except OSError:
             text = ""
         if _LANG_UI_MARKER in text:
-            res.ok = True
-            res.skip = True
-            res.message = "语言切换界面已注入，跳过"
+            if (_FONT_UI_MARKER in text) == want_font:
+                res.ok = True
+                res.skip = True
+                res.message = "设置界面选项已注入，跳过"
+                return res
+            # 需要补字体选项 / 需要移除失效字体选项 → 重建（语言 + 字体）
+            _inject(with_lang=True)
+            if res.ok:
+                res.message = ("已为现有设置界面补上字体选项" if want_font
+                               else "已移除失效的字体选项（字体补丁缺失）")
             return res
 
-    # 3. 定位 preferences 屏幕并注入
-    source, src_path = _find_preferences_source(game_dir)
-    if source is None:
-        res.ok = False
-        res.message = "未找到 preferences 屏幕定义，无法注入语言切换界面"
-        return res
-    new_block = _build_language_ui(source)
-    if new_block is None:
-        res.ok = False
-        res.message = "无法定位 preferences 屏幕，跳过语言 UI 注入"
-        return res
-    try:
-        header = (
-            "# -*- coding: utf-8 -*-\n"
-            "# 语言切换界面（汉化工具自动生成）：为无语言按钮的游戏补上语言选择。\n"
-            f"# 来源: {src_path.name if src_path else '归档内 screens 脚本'}\n\n"
-        )
-        patch.write_text(header + new_block, encoding="utf-8-sig")
-    except OSError as e:
-        res.ok = False
-        res.message = f"写语言界面补丁失败: {e}"
-        return res
-    res.files.append(patch)
-    res.ok = True
-    res.detail = "重启游戏后，在 设置 → 语言 中选择中文即可切换"
-    res.message = "已注入语言切换界面（设置 → 语言）"
+    # 3. 全新注入（语言 + 可选字体）
+    _inject(with_lang=True)
     return res
 
 
@@ -901,7 +1029,9 @@ def apply_all(game_dir: Path, language: str = "schinese",
     if with_font:
         results.append(apply_font_patch(game_dir))
     if with_language_ui:
-        results.append(apply_language_ui(game_dir, language))
+        # 字体补丁启用时，设置界面同时提供「字体」选项（汉化默认 / 微软雅黑）
+        results.append(apply_language_ui(game_dir, language,
+                                         with_font=with_font))
         name_res = ensure_language_name(game_dir, language)
         if name_res is not None:
             results.append(name_res)

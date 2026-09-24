@@ -174,13 +174,15 @@ XAML = r'''
             <Border Background="#1FFFFFFF" BorderBrush="#14FFFFFF" BorderThickness="1"
                     CornerRadius="8" Padding="20,16">
                 <StackPanel Spacing="14">
-                    <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="10">
+                    <Grid ColumnDefinitions="*,Auto,Auto,Auto" ColumnSpacing="10">
                         <ProgressBar x:Name="Progress" Minimum="0" Maximum="100"
                                      Height="6" VerticalAlignment="Center"/>
                         <TextBlock Grid.Column="1" x:Name="ProgressText" Text="就绪"
                                    FontSize="12" Opacity="0.7" VerticalAlignment="Center"/>
                         <Button Grid.Column="2" x:Name="OpenOutBtn" Content="打开输出目录"
                                 Click="OnOpenOutput" IsEnabled="False"/>
+                        <Button Grid.Column="3" x:Name="AuditBtn" Content="补漏查缺"
+                                Click="OnAudit" ToolTipService.ToolTip="扫描已生成的翻译，检出未翻译残留 / 中英参半 / 目标语言错误，并排入重译队列"/>
                     </Grid>
                     <Grid>
                         <Grid.ColumnDefinitions>
@@ -248,6 +250,8 @@ class GuiApp(XamlApplication):
         self._last_result: str | None = None
         self._test_mode = False
         self._paused_mode = False
+        # 补漏查缺模式（仅扫描出报告，不翻译）
+        self._audit_mode = False
         self._pause_event = threading.Event()
         # 已保存的模型配置（每条：{model, url, key}）；用于 ModelBox 右侧 ▼ 下拉
         self._saved_models: list[dict] = []
@@ -770,6 +774,47 @@ class GuiApp(XamlApplication):
         finally:
             self.msg_q.put("__done__")
 
+    def OnAudit(self, sender, e) -> None:
+        """补漏查缺：对已翻译的游戏单独执行扫描（不翻译，只出报告+排队）。"""
+        if self._busy():
+            self._append_log("上一个任务仍在运行，请等待其完成后再试", "err")
+            self.StatusText.Text = "忙：等待上一任务完成"
+            return
+        game_dir = (getattr(self, "game_dir", None)
+                    or self.GamePathBox.Text).strip()
+        if not game_dir or not Path(game_dir).exists():
+            self._append_log("请先选择已翻译的游戏目录，再执行补漏查缺", "err")
+            return
+        lang = LANGUAGES[self.LangBox.SelectedIndex].split("（")[0].strip()
+        self._audit_mode = True
+        self.worker = threading.Thread(
+            target=self._run_audit,
+            args=(game_dir, lang),
+            daemon=True,
+        )
+        self.worker.start()
+        self._ensure_timer()
+        self._set_busy(True)
+        self.ProgressText.Text = "扫描中…"
+        self.StatusText.Text = "补漏查缺扫描中…"
+        self._append_log("补漏查缺：正在扫描 tl/%s 下的翻译文件…" % lang, "info")
+
+    def _run_audit(self, game_dir: str, lang: str) -> None:
+        """后台线程：跑 audit.run_audit，日志经 msg_q 回 UI 线程。"""
+        try:
+            from rpytranslator.audit import run_audit
+            run_audit(game_dir, lang, log=lambda t: self.msg_q.put(t))
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+            self.msg_q.put("ERR|补漏查缺失败: %s" % exc)
+            try:
+                with open("_gui_worker_err.txt", "a", encoding="utf-8") as f:
+                    traceback.print_exc(file=f)
+            except Exception:
+                pass
+        finally:
+            self.msg_q.put("__done__")
+
     def _run_translation(
         self,
         config: TranslationConfig,
@@ -923,6 +968,11 @@ class GuiApp(XamlApplication):
             self.ProgressText.Text = "就绪"
             self.Progress.Value = 0
             return
+        if self._audit_mode:
+            self._audit_mode = False
+            self.ProgressText.Text = "就绪"
+            self.Progress.Value = 0
+            return
         if getattr(self, "_last_result", None):
             self._append_log(self._last_result, "ok")
             self._last_result = None
@@ -940,12 +990,13 @@ class GuiApp(XamlApplication):
     def _set_busy(self, busy: bool) -> None:
         self.StartBtn.IsEnabled = not busy
         self.TestBtn.IsEnabled = not busy
-        # 暂停按钮只在翻译任务运行中可用（连接测试不适用）
-        self.PauseBtn.IsEnabled = busy and not self._test_mode
+        # 暂停按钮只在翻译任务运行中可用（连接测试/补漏查缺不适用）
+        self.PauseBtn.IsEnabled = busy and not self._test_mode and not self._audit_mode
         if not busy:
             self._pause_event = threading.Event()
         self.BrowseBtn.IsEnabled = not busy
         self.SaveBtn.IsEnabled = not busy
+        self.AuditBtn.IsEnabled = not busy
         self.Progress.IsIndeterminate = busy
         if not busy:
             self.Progress.Value = 100

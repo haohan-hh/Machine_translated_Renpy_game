@@ -59,6 +59,7 @@ class PipelineResult:
     removed_rpyc: int = 0
     removed_dup_blocks: int = 0
     paused: bool = False
+    audit: object | None = None   # AuditSummary（补漏查缺结果）
     message: str = ""
     errors: list[str] = field(default_factory=list)
 
@@ -933,6 +934,18 @@ def run_pipeline(
         if cleaned:
             log("全部翻译完成，已清理上次运行的遗留文件: " + ", ".join(cleaned))
 
+    # 11) 补漏查缺：自动扫描已生成的翻译，检测残留问题
+    #     （未翻译 / 中英参半 / 目标语言不正确），写报告并把问题项
+    #     排入「未翻译报告」——再次「开始汉化」即可只重译这些条目。
+    #     仅正常结束时执行；暂停走断点续译流程，不需要扫描。
+    if not getattr(result, "paused", False):
+        try:
+            from .audit import run_audit
+            audit_summary = run_audit(game_path, language, log=log)
+            result.audit = audit_summary
+        except Exception as exc:  # noqa: BLE001 - 绝不影响主流程
+            log(f"补漏查缺扫描失败（不影响已完成的翻译）: {exc}")
+
     result.ok = True
     lines = [
         f"汉化完成！共翻译 {len(dialogue_translations)} 条对话、"
@@ -954,5 +967,29 @@ def run_pipeline(
         details = "；".join(pr.detail for pr in result.post_patches if pr.detail)
         if details:
             lines.append("提示: " + details)
+    # 补漏查缺结果并入汇总（报告路径 + 各类问题条数 + 重译队列状态）
+    auditsum = getattr(result, "audit", None)
+    if auditsum is not None and getattr(auditsum, "total", 0):
+        counts = getattr(auditsum, "counts", {}) or {}
+        if counts:
+            titles = {
+                "untranslated": "未翻译残留",
+                "mixed": "中英参半",
+                "wrong_lang": "目标语言错误",
+            }
+            parts = "、".join(
+                f"{titles.get(k, k)} {v} 条" for k, v in counts.items())
+            total_bad = sum(counts.values())
+            lines.append(f"· 补漏查缺：发现 {total_bad} 条问题（{parts}）")
+            if getattr(auditsum, "report_path", ""):
+                lines.append(f"  详情报告: {auditsum.report_path}")
+            queued = getattr(auditsum, "queued", 0)
+            if queued:
+                lines.append(
+                    f"  已排入重译队列 {queued} 条：再次点击「开始汉化」"
+                    "即可只重译这些条目（增量模式）")
+        else:
+            lines.append(
+                f"· 补漏查缺：{auditsum.total} 条翻译全部正常，未发现残留问题")
     result.message = "\n".join(lines)
     return result
