@@ -206,7 +206,10 @@ class ExtractionResult:
 # 字符串字面量解析
 # ---------------------------------------------------------------------------
 
-_STRING_START = re.compile(r'(["\']{1,3})')
+_STRING_START = re.compile(r'("""|\'\'\'|"|\')')
+# 注意：不能用 (["']{1,3})——贪婪量词会把 "'abc" 开头的 "' 一起吞成
+# “引号对”，吃掉紧贴开引号的撇号（如 `T "'Sunny Fruits, ..."`），
+# 导致 what 丢首字符、digest 与引擎不一致。三引号必须排在前面的分支。
 
 
 def _unescape(body: str, quote: str = '"') -> str:
@@ -384,6 +387,10 @@ class RpyExtractor:
         self.skipped: list[str] = []
         self._label: str | None = None
         self._alternate: str | None = None
+        # Ren'Py 的 label 名解析基准（lexer.set_global_label）：最近一个
+        # 非点开头 label 名的第一段（`a.b` → "a"）。`.sub` 子标签永远挂在
+        # 这个基准下（`<global>.sub`），而不是链式叠加——见 _resolve_label_name。
+        self._global_label: str | None = None
         self._stack: list[_Ctx] = []
         self._open_define_parens = 0   # 跨行 define 未闭合的括号数
 
@@ -543,6 +550,19 @@ class RpyExtractor:
             # 翻译 identifier 以此为前缀。漏掉会让大批量说错 label。
             self._handle_label(stripped)
             return
+        if keyword == "call":
+            # `call label from name`：from 子句会在返回点创建一个**真实、
+            # 非隐藏**的 Label（parser.py:765 `ast.Label(loc, name, [], None)`，
+            # Restructurer 据此把 call 之后整段对话的 identifier 前缀切到该
+            # 名）。本作 292+132 条运行时缺失的根因就是漏了这一步——"Hey!"
+            # 们被挂到 chapter_T2 前缀下，而引擎在 toast_call_... 下找它们。
+            m = re.search(r"\bfrom\s+([^\s:()]+)\s*$", stripped)
+            if m:
+                full = self._resolve_label_name(m.group(1))
+                if full and not full.startswith("_"):
+                    self._label = full
+                    self._alternate = None
+            return
         if keyword in ("python", "init") and self._is_python_stmt(stripped):
             self._stack.append(_Ctx(_PYTHON, indent))
             return
@@ -595,34 +615,50 @@ class RpyExtractor:
             return True
         return bool(re.match(r"^init(?:\s+offset\s+\d+)?(?:\s+-\w+)*\s+python\b", stripped))
 
+    def _resolve_label_name(self, name: str) -> str:
+        """按 Ren'Py 语义解析 label 名，返回完整名。
+
+        对应 lexer.py 的 label_name()/set_global_label()（游戏自带引擎
+        源码实证）：
+
+        - ``a``     → "a"，解析基准变为 "a"
+        - ``a.b``   → "a.b"，解析基准变为 "a"（split(".")[0]）
+        - ``.sub``  → "<基准>.sub"，**基准不变**——子标签永远挂在最近一个
+          非点开头 label 下，绝不嵌套叠加。旧实现把 `.sub1 .sub2` 叠成
+          parent.sub1.sub2，导致 identifier 前缀过长而整块失配。
+        """
+        if name.startswith("."):
+            base = self._global_label or ""
+            return (base + name) if base else name[1:]
+        self._global_label = name.split(".")[0]
+        return name
+
     def _handle_label(self, stripped: str):
-        # label name:  /  menu name:  /  label name(参数):
-        # 必须带冒号（屏幕里的 `label 变量` / `label 变量:` 控件不在此列）
+        # label name: / label name(参数): / label name(参数) hide: / menu name:
+        # （命名 menu 在 Ren'Py 中等价于一个隐式 label）。
+        # 必须带冒号结尾（屏幕里的 `label 变量` / `label 变量:` 控件不走
+        # 这里——_SCREEN 上下文已提前返回）。
         if not stripped.endswith(":"):
             return
-        m = re.match(r"^(?:label|menu)\s+([^\s:()]+)", stripped)
+        body = stripped.rstrip(":").strip()
+        hide = False
+        if body.endswith(" hide"):
+            hide = True
+            body = body[:-5].rstrip()
+        # 名字 = 第一个裸 token；`label name(a, b):` 带参数时只取 name
+        m = re.match(r"^(?:label|menu)\s+([^\s(:]+)", body)
         if not m:
             return
         name = m.group(1)
-        if name.startswith("_"):
-            self._alternate = name
+        if not name or name.startswith(('"', "'", "(", "$", "%", "[", "{")):
+            return   # 表达式/字符串形式的屏幕 label 控件等，不是脚本 label
+        full = self._resolve_label_name(name)
+        if hide:
+            return   # 隐藏 label 不更新前缀（Restructurer: not i.hide 才更新）
+        if full.startswith("_"):
+            self._alternate = full
             return
-        if name.startswith("."):
-            # 子标签（`.subname:`）：叠加到当前 label 路径
-            # （Ren'Py 用 "." 分层，identifier 生成时 "." 替换为 "_"）。
-            # 没有父标签时退化为同级全局标签（罕见，但容错）。
-            sub = name[1:]
-            self._label = (self._label + "." + sub) if self._label else sub
-            self._alternate = None
-            return
-        if "." in name:
-            # 全限定带点（如 `chapter_L3.subname` / `menu chapter_L3.distraction:`）：
-            # 按字面值保留。Ren'Py 允许 label 名带点（命名的 menu 也等价于
-            # 一个 label），identifier 生成时 "." 替换为 "_"。
-            self._label = name
-            self._alternate = None
-            return
-        self._label = name
+        self._label = full
         self._alternate = None
 
     @staticmethod
@@ -630,12 +666,9 @@ class RpyExtractor:
         return bool(_STRING_START.match(stripped))
 
     def _handle_menu(self, stripped: str):
-        # Ren'Py 会把命名 menu 当作隐式 label：menu 块内以及 menu 之后、
-        # 直到下一个显式 label 之前的所有 say，identifier 前缀都是 menu 名。
-        m = re.match(r"^menu\s+([A-Za-z_]\w*)\s*:", stripped)
-        if m:
-            self._label = m.group(1)
-            self._alternate = None
+        # 兼容保留：命名 menu 等价于隐式 label（实际入口在关键字分发的
+        # label/menu 分支，统一走 _handle_label 的新解析语义）。
+        self._handle_label(stripped)
 
     def _handle_menu_string(self, stripped: str, line_no: int):
         value, _ = _parse_string_literal(stripped, 0)
@@ -694,6 +727,21 @@ class RpyExtractor:
                 r = self._parse_say_rest(stripped, m.end())
                 if r is not None:
                     return r
+        # 字符串 who（内联角色名）：`"Cultist" "What's that noise?"`。
+        # Ren'Py 允许 who 是任意表达式；这里是字符串字面量，序列化进
+        # translate identifier 的 code 时必须带引号原样保留（ast.py:917
+        # `rv.append(self.who)` 直接追加原始表达式文本）。
+        if stripped[:1] in ('"', "'"):
+            lit, end = _parse_string_literal(stripped, 0)
+            if lit is not None:
+                j = end
+                while j < len(stripped) and stripped[j] in " \t":
+                    j += 1
+                if j < len(stripped) and stripped[j] in ('"', "'"):
+                    # 后面还有第二个字符串 → 第一个是 who
+                    r = self._parse_say_rest(stripped, end)
+                    if r is not None:
+                        return r
         # 旁白：`"what" ...`
         return self._parse_say_rest(stripped, 0)
 

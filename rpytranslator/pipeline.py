@@ -46,6 +46,12 @@ def _guess_language_name(code: str) -> str:
     return LANGUAGE_LABELS.get(code.lower(), code)
 
 
+# 界面字符串的「可翻译」判定：含 2 个以上连续字母即可（SAVE/LOAD/ABOUT
+# 这类单词必须翻译）。对话里的单个英文词多为键名/舞台指令，用对话侧的
+# _WORD_RUN2_RE（≥2 连续单词）判定，见第 10 步统计处的说明。
+_UI_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+
+
 @dataclass
 class PipelineResult:
     ok: bool = False
@@ -152,25 +158,34 @@ def _progress_fingerprint(uniq_d, uniq_s) -> str:
     return h.hexdigest()
 
 
-def _load_progress_cache(path: Path, fingerprint: str) -> tuple[dict[str, str], dict[str, str]]:
-    """读取断点续译缓存；指纹不一致（源文本已变）时视为无效并删除。"""
+def _load_progress_cache(path: Path, fingerprint: str,
+                         valid_texts: set[str] | None = None
+                         ) -> tuple[dict[str, str], dict[str, str], bool]:
+    """读取断点续译缓存。
+
+    指纹一致 → 完整复用；指纹不一致（源更新 / 提取器升级）→ **按文本键
+    做交集迁移**：旧缓存里仍出现在当前文本集合中的条目直接复用（相同文本
+    的译文天然有效），只有新增 / 变更的文本才需要重新翻译——否则提取器
+    修复（如 identifier 修正新增的提取条目）会把上万条缓存一笔作废，
+    重新全量烧 API。返回 (对话表, 字符串表, 是否完整复用)。
+    """
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-        if raw.get(_CACHE_FP_KEY) != fingerprint:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-            return {}, {}
-        d, s = raw.get("dialogues", {}), raw.get("strings", {})
-        if isinstance(d, dict) and isinstance(s, dict):
-            return (
-                {str(k): str(v) for k, v in d.items()},
-                {str(k): str(v) for k, v in s.items()},
-            )
     except (OSError, ValueError):
-        pass
-    return {}, {}
+        return {}, {}, False
+    d, s = raw.get("dialogues", {}), raw.get("strings", {})
+    if not (isinstance(d, dict) and isinstance(s, dict)):
+        return {}, {}, False
+    d = {str(k): str(v) for k, v in d.items()}
+    s = {str(k): str(v) for k, v in s.items()}
+    if raw.get(_CACHE_FP_KEY) == fingerprint:
+        return d, s, True
+    if valid_texts is None:
+        return {}, {}, False
+    # 指纹变化：交集迁移（保留依然存在的文本的译文）
+    d2 = {k: v for k, v in d.items() if k in valid_texts}
+    s2 = {k: v for k, v in s.items() if k in valid_texts}
+    return d2, s2, False
 
 
 def _save_progress_cache(path: Path, fingerprint: str,
@@ -363,6 +378,19 @@ def run_pipeline(
                        if p.suffix.lower() in (".rpyc", ".rpymc")]
             rpy_ok = [p for p in extracted
                       if p.suffix.lower() in (".rpy", ".rpym")]
+            # 排除归档里自带的翻译目录（tl/<语言>/…）——那是翻译文件
+            # 不是源码。归档里就带着 tl/opendyslexic/，其中 gui/options/
+            # screens/script 等与顶层源码同名；若不排除，后续 need_rpyc
+            # 按 basename 构造键时会同名冲突，翻译版反而覆盖真源码——
+            # 表现为顶层界面文本（SAVE/ABOUT/游戏名）与 script 对话
+            # 「从未被提取过」，tl 里永远没有这些条目。
+            def _not_tl(p: Path) -> bool:
+                try:
+                    return p.relative_to(materialized_dir).parts[0] != "tl"
+                except ValueError:
+                    return True
+            rpyc_ok = [p for p in rpyc_ok if _not_tl(p)]
+            rpy_ok = [p for p in rpy_ok if _not_tl(p)]
             # 与松散文件规则一致：有 .rpyc 时以 .rpyc 反编译为准，
             # 避免同一文件双份提取导致 tl 中 translate identifier 重复。
             if rpyc_ok:
@@ -532,9 +560,12 @@ def run_pipeline(
     #     游戏升级（更新脚本、新增剧情）后会自动命中这里 → 旧译文 100%
     #     保留，只补译更新带来的新文本，不会误判“无需汉化”或全量重译。
     # 5.2 与 7 步组装共用一份解析结果，避免对同一目录解析两次。
+    # 注意：retry（补漏重译）场景也解析并检测未覆盖文本——否则「报告里
+    # 没有但 tl 里缺译」的条目（如提取器修复后新发现的文本）会在重译
+    # 循环里永远看不见（audit 只扫已写出的块，未写出的对它是盲区）。
     existing_d: dict[str, str] = {}
     existing_s: dict[str, str] = {}
-    if info.has_chinese and not retry_texts and (todo_d or todo_s):
+    if info.has_chinese and (todo_d or todo_s):
         parsed_d, parsed_s = _parse_existing_tl(
             info.game_dir / "tl" / language, language)
         existing_d.update(parsed_d)
@@ -577,62 +608,106 @@ def run_pipeline(
         new_d_whats = {d.what for d in dialogues if not _tl_covered(d)}
         new_s_texts = {s.text for s in strings if s.text not in existing_s}
         if new_d_whats or new_s_texts:
-            todo_d = [u for u in uniq_d if u.what in new_d_whats]
-            todo_s = [u for u in uniq_s if u.text in new_s_texts]
-            log(f"检测到游戏更新/新增文本：本次需补译 {len(todo_d)} 条对话、"
-                f"{len(todo_s)} 条字符串；其余 {len(uniq_d) - len(todo_d)} 条对话、"
-                f"{len(uniq_s) - len(todo_s)} 条字符串已有译文，将全部保留")
+            # 未覆盖文本并入待翻译列表（retry 重译队列同时保留——
+            # 「报告里的重译条目」与「tl 中缺译的新发现条目」都翻）
+            seen = {u.what for u in todo_d}
+            todo_d += [u for u in uniq_d if u.what in new_d_whats
+                       and u.what not in seen]
+            seen = {u.text for u in todo_s}
+            todo_s += [u for u in uniq_s if u.text in new_s_texts
+                       and u.text not in seen]
+            log(f"检测到未覆盖文本（游戏更新 / 提取器修复后新发现）："
+                f"补译 {len(new_d_whats)} 类对话、{len(new_s_texts)} 类字符串；"
+                f"合计待翻译 {len(todo_d)} 条对话、{len(todo_s)} 条字符串，"
+                f"其余已有译文全部保留")
         else:
-            # 5.2.1 现有汉化已覆盖当前版本全部文本 → 无需再翻译
-            log("现有汉化已覆盖当前版本全部文本，无需新增翻译")
-            _drop_progress_cache(progress_cache)
-            removed_rpyc = remove_stale_rpyc(info.game_dir)
-            extra = (f"；已删除 {removed_rpyc} 个过期 .rpyc 缓存，"
-                     f"下次启动游戏将自动重新编译" if removed_rpyc else "")
-            zh = next(
-                (l for l in info.languages
-                 if engine.is_chinese_language(l)),
-                language,
-            )
-            result.removed_rpyc = removed_rpyc
-            # 仍可能“运行时缺翻译”（提取覆盖不到的对话，表现为部分英文），
-            # 因此继续做运行时验证 / 按运行时 identifier 自动补译。
-            if apply_verification:
-                result.post_patches.append(
-                    write_verification_patch(info.game_dir, language, log_cb=log))
-            if runtime_report_path(info.game_dir, language).is_file():
-                log("检测到运行时缺失报告（游戏内仍有对话缺少翻译），"
-                    "正在按运行时 identifier 自动补译…")
-                if client is None:
-                    client = TranslationClient(config or TranslationConfig())
-                result.post_patches.append(build_missing_fix(
-                    info.game_dir, language, client=client, log_cb=log))
-                removed = remove_stale_rpyc(info.game_dir)
-                result.removed_rpyc += removed
-                if removed:
-                    log(f"已删除 {removed} 个过期 .rpyc 缓存，"
-                        f"下次启动游戏将自动重新编译")
+            # 5.2.1 文本全部已覆盖。但还要检查 identifier 一致性：提取器
+            # 修复（如 call…from / .sublabel / 字符串 who 的追踪修正）会让
+            # 同一批文本的 identifier 前缀变化——译文按 digest 兜底可全部
+            # 保留（无需重译），但 tl 文件必须按新 identifier 重写，否则
+            # 运行时按旧 id 找不到翻译块（表现为“已翻译却显示英文”）。
+            extracted_ids = {d.identifier for d in dialogues}
+            stale_ids = extracted_ids - set(existing_d)
+            # retry（补漏重译）场景不能提前返回——todo 里还有重译队列要翻
+            if not stale_ids and not retry_texts:
+                # 现有汉化已覆盖当前版本全部文本 → 无需再翻译
+                log("现有汉化已覆盖当前版本全部文本，无需新增翻译")
+                _drop_progress_cache(progress_cache)
+                removed_rpyc = remove_stale_rpyc(info.game_dir)
+                extra = (f"；已删除 {removed_rpyc} 个过期 .rpyc 缓存，"
+                         f"下次启动游戏将自动重新编译" if removed_rpyc else "")
+                zh = next(
+                    (l for l in info.languages
+                     if engine.is_chinese_language(l)),
+                    language,
+                )
+                result.removed_rpyc = removed_rpyc
+                # 仍可能“运行时缺翻译”（提取覆盖不到的对话，表现为部分英文），
+                # 因此继续做运行时验证 / 按运行时 identifier 自动补译。
+                if apply_verification:
+                    result.post_patches.append(
+                        write_verification_patch(info.game_dir, language, log_cb=log))
+                if runtime_report_path(info.game_dir, language).is_file():
+                    log("检测到运行时缺失报告（游戏内仍有对话缺少翻译），"
+                        "正在按运行时 identifier 自动补译…")
+                    if client is None:
+                        client = TranslationClient(config or TranslationConfig())
+                    result.post_patches.append(build_missing_fix(
+                        info.game_dir, language, client=client, log_cb=log))
+                    removed = remove_stale_rpyc(info.game_dir)
+                    result.removed_rpyc += removed
+                    if removed:
+                        log(f"已删除 {removed} 个过期 .rpyc 缓存，"
+                            f"下次启动游戏将自动重新编译")
+                    result.ok = True
+                    lines = [p.message for p in result.post_patches
+                             if p.ok and p.message]
+                    lines.append("提示：重新启动一次游戏，运行时校验会自动更新缺失报告；"
+                                 "报告只剩空对话/符号（无实际文本）即视为汉化完整")
+                    result.message = "\n".join(lines)
+                    return result
+                result.message = f"汉化已是最新：tl/{zh} 已覆盖当前版本全部文本{extra}"
                 result.ok = True
-                lines = [p.message for p in result.post_patches
-                         if p.ok and p.message]
-                lines.append("提示：重新启动一次游戏，运行时校验会自动更新缺失报告；"
-                             "报告只剩空对话/符号（无实际文本）即视为汉化完整")
-                result.message = "\n".join(lines)
                 return result
-            result.message = f"汉化已是最新：tl/{zh} 已覆盖当前版本全部文本{extra}"
-            result.ok = True
-            return result
+            # stale_ids 非空：提取出的 identifier 与现有 tl 不一致（提取器
+            # 修复了 label 追踪）。译文按 digest 兜底全部可复用（主流程第
+            # 7 步），不调 API；但文件必须按新 identifier 重写，且过时的
+            # 「运行时缺失报告」要删除——它是旧 identifier 状态下生成的，
+            # 若继续消费会在主 tl 已覆盖同一 id 后再生成重复翻译块
+            #（zz_missing_fix.rpy 与主文件同 id，Ren'Py 会报重复块）。
+            log(f"检测到 {len(stale_ids)} 个翻译块的 identifier 与当前提取"
+                f"不一致（提取器已修复 label 追踪），将按新 identifier 重写"
+                f"翻译文件（译文按内容全部保留，不重复调用 API）")
+            stale_report = runtime_report_path(info.game_dir, language)
+            if stale_report.is_file():
+                try:
+                    stale_report.unlink()
+                    log("已删除过时的运行时缺失报告（基于修复前的 identifier，"
+                        "重写后由游戏运行时重新校验）")
+                except OSError:
+                    pass
+            # 5.1 若走了全量路径（无重译报告），todo 清空——所有译文由第 7
+            # 步的 existing + digest 兜底提供，本轮 0 次 API 调用
+            if not retry_texts:
+                todo_d, todo_s = [], []
 
     # 6. 断点续译：加载上次汉化中断前实时保存的缓存（原文→译文）。
     #    文本全集指纹一致时，命中缓存的文本本次直接跳过，不再重复调用 API。
-    #    （指纹变化 = 源脚本已更新，旧缓存作废，自动走全新汉化。）
+    #    （指纹变化 = 源更新 / 提取器升级 → 按文本键交集迁移，只补翻差异。）
     fingerprint = _progress_fingerprint(uniq_d, uniq_s)
-    cached_d, cached_s = _load_progress_cache(progress_cache, fingerprint)
+    valid_texts = {u.what for u in uniq_d} | {u.text for u in uniq_s}
+    cached_d, cached_s, cache_full = _load_progress_cache(
+        progress_cache, fingerprint, valid_texts)
     d_by_text: dict[str, str] = dict(cached_d)
     s_by_text: dict[str, str] = dict(cached_s)
     if cached_d or cached_s:
-        log(f"检测到上次汉化进度缓存（对话 {len(cached_d)} 条、"
-            f"字符串 {len(cached_s)} 条），本次将从中断处继续…")
+        if cache_full:
+            log(f"检测到上次汉化进度缓存（对话 {len(cached_d)} 条、"
+                f"字符串 {len(cached_s)} 条），本次将从中断处继续…")
+        else:
+            log(f"文本集合与上次不同（源更新/提取器升级）：已按文本复用"
+                f"旧译文 {len(cached_d)} 条对话、{len(cached_s)} 条字符串，"
+                f"其余差异部分将重新翻译…")
         pause_marker = info.game_dir / "tl" / f".{language}.暂停标记.txt"
         if pause_marker.exists():
             log("识别到上一次的暂停标记：将按标记顺序续译未完成的段落")
@@ -883,19 +958,23 @@ def run_pipeline(
     #   的未翻译回退，必须写进报告、进重译队列。以前“无翻译错误时一律视为
     #   模型有意保持原文”的规则会让这类条目被永久吞掉（audit 排队 → 重译
     #   又回退 → 又被吞，用户多次查缺仍残留就是它）。
-    # - 原文无可翻译内容（纯符号、单个词、数字、键名等）→ 有意保持，跳过。
+    # - 原文无可翻译内容（纯符号、数字、键名等）→ 有意保持，跳过。
+    # 对话与字符串的「可翻译」判定不同：对话里单个英文词多为键名/舞台
+    # 指令；但**字符串是界面文本**——"SAVE"/"LOAD"/"ABOUT" 这样的单词恰恰
+    # 必须翻译，所以字符串只要含 2 个以上连续字母就算可翻译（纯数字/
+    # 符号除外），否则界面按钮永远保持英文。
     unchanged_d = [
         d for d in dialogues if dialogue_translations.get(d.identifier) == d.what
         and _WORD_RUN2_RE.search(_strip_markup(d.what))]
     unchanged_s = [
         s for s in strings if string_translations.get(s.text) == s.text
-        and _WORD_RUN2_RE.search(_strip_markup(s.text))]
+        and _UI_WORD_RE.search(_strip_markup(s.text))]
     kept_d = [
         d for d in dialogues if dialogue_translations.get(d.identifier) == d.what
         and not _WORD_RUN2_RE.search(_strip_markup(d.what))]
     kept_s = [
         s for s in strings if string_translations.get(s.text) == s.text
-        and not _WORD_RUN2_RE.search(_strip_markup(s.text))]
+        and not _UI_WORD_RE.search(_strip_markup(s.text))]
     unchanged = len(unchanged_d) + len(unchanged_s)
     result.skipped_count = unchanged + len(kept_d) + len(kept_s)
     if kept_d or kept_s:

@@ -65,6 +65,8 @@ _OTHER_SCRIPTS: list[tuple[str, re.Pattern]] = [
 
 # 2 个及以上连续英文单词（"Good morning"）→ 疑似未翻译
 _WORD_RUN2_RE = re.compile(r"[A-Za-z]{2,}(?:[\s'\u2019\-]+[A-Za-z]{2,}){1,}")
+# 界面字符串的单词级可翻译判定（"SAVE"/"LOAD" 单词也必须翻译）
+_UI_WORD_RE = re.compile(r"[A-Za-z]{2,}")
 # 3 个及以上连续英文单词（"the door is locked"）→ 疑似整句漏译
 _WORD_RUN3_RE = re.compile(r"[A-Za-z]{2,}(?:[\s'\u2019\-]+[A-Za-z]{2,}){2,}")
 
@@ -91,6 +93,7 @@ class AuditItem:
     category: str = ""    # untranslated / mixed / wrong_lang / traditional；空 = 正常
     note: str = ""        # 判定依据（报告里展示）
     tl_line: int = 0      # 译文行在 tl 文件里的 1 基行号（traditional 本地修复用）
+    is_string: bool = False   # True = translate strings 块（界面文本）
 
 
 @dataclass
@@ -248,7 +251,7 @@ def parse_tl_file(path: Path) -> list[AuditItem]:
                     items.append(AuditItem(
                         tl_file=path.name, src_file=p_file, src_line=p_line,
                         original=pending_old, translation=_quoted(mn.group(1)),
-                        tl_line=j + 1))
+                        tl_line=j + 1, is_string=True))
                     pending_old = None
                     j += 1
                     continue
@@ -289,7 +292,12 @@ def classify(item: AuditItem, language: str) -> str | None:
 
     # 1) 未翻译残留：译文 == 原文，且原文有成串英文单词
     if trans_plain.strip() == orig_plain.strip():
-        if _WORD_RUN2_RE.search(orig_plain):
+        # 界面字符串（"SAVE"/"LOAD"）单词也必须翻译；对话里的单个英文词
+        # 多为键名/舞台指令，维持 ≥2 连续单词的判定
+        if item.is_string:
+            if _UI_WORD_RE.search(orig_plain):
+                return "untranslated"
+        elif _WORD_RUN2_RE.search(orig_plain):
             return "untranslated"
         return None
 
