@@ -13,6 +13,7 @@ dist/
 
 # 运行时生成
 rpytranslator_config.json
+rpytranslator_config.json.tmp
 汉化补丁/
 build_log.txt
 

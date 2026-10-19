@@ -27,23 +27,16 @@ from .generator import write_translation_files
 from .housekeeping import dedupe_translate_blocks, remove_stale_rpyc
 from .patcher import PatchResult, apply_all
 from .rpyc_loader import cleanup, decompile_rpyc_files
-from .translator import PauseRequested, TranslationClient, TranslationConfig
+from .translator import (
+    PauseRequested, TranslationClient, TranslationConfig, target_language_name,
+)
 
 DEFAULT_LANGUAGE = "schinese"
 # 未翻译文本的自动补译轮数上限：每轮只重译上一轮仍然失败的文本，
 # 全部完成后不再生成“未翻译报告”；达到上限仍有残留则保留报告供手动处理。
 MAX_RETRY_ROUNDS = 5
-LANGUAGE_LABELS = {
-    "schinese": "简体中文",
-    "tchinese": "繁体中文",
-    "zh_cn": "简体中文",
-    "zh_hans": "简体中文",
-    "zh": "简体中文",
-}
-
-
 def _guess_language_name(code: str) -> str:
-    return LANGUAGE_LABELS.get(code.lower(), code)
+    return target_language_name(code)
 
 
 # 界面字符串的「可翻译」判定：含 2 个以上连续字母即可（SAVE/LOAD/ABOUT
@@ -137,6 +130,108 @@ def _parse_untran_report(path: Path) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# 人工兜底：外部报告导入（GUI 拖拽区调用）
+# ---------------------------------------------------------------------------
+
+# 补漏查缺报告的条目行：`  原文: <文本>`
+_AUDIT_ORIG_RE = re.compile(r"^\s*原文[:：]\s?(.*)$")
+
+
+def parse_external_report(path: str | Path) -> tuple[list[str], str]:
+    """解析用户上传的外部报告文件，返回 (待补翻译的文本列表, 类型描述)。
+
+    支持两种格式（自动识别，也支持人工编辑过的同格式文件）：
+    1. 「补漏查缺报告」（``tl/<语言>.补漏查缺报告.txt``）——按 ``原文:`` 行
+       提取问题项的原文；
+    2. 「未翻译报告」（``tl/<语言>.未翻译报告.txt``）——按
+       ``文件名:行号  原文`` 行提取。
+
+    无法识别（既无 ``原文:`` 行也无定位行）时返回空列表 + 「不支持」。
+    """
+    p = Path(path)
+    try:
+        lines = p.read_text(encoding="utf-8-sig", errors="ignore").splitlines()
+    except OSError:
+        return [], "读取失败"
+
+    texts: list[str] = []
+    audit_entries: list[str] = []
+    for i, ln in enumerate(lines):
+        m = _AUDIT_ORIG_RE.match(ln)
+        if m and m.group(1).strip():
+            parts = [m.group(1)]
+            for continuation in lines[i + 1:]:
+                if re.match(r"^\s*译文[:：]", continuation):
+                    break
+                parts.append(continuation)
+            audit_entries.append("\n".join(parts).strip())
+    if audit_entries:
+        return audit_entries, f"补漏查缺报告（{len(audit_entries)} 条）"
+
+    # 未翻译报告格式：复用与 _parse_untran_report 相同的行规则
+    for ln in lines:
+        s = ln.strip()
+        if not s or s.startswith("==") or s.startswith("以下文本"):
+            continue
+        m = re.match(r"^.+:\d+\s{2,}(.+)$", s)
+        if m:
+            texts.append(_unescape_report_text(m.group(1).strip()))
+    if texts:
+        return texts, f"未翻译报告（{len(texts)} 条）"
+    return [], "格式不支持（未识别到报告条目）"
+
+
+def import_report_texts(texts: list[str], game_path: str | Path, language: str,
+                        log=None) -> tuple[int, int, str]:
+    """把外部报告解析出的文本合并进游戏的「未翻译报告」（人工兜底入口）。
+
+    与 audit 的自动排队走同一文件、同一格式（按文本去重），下次点击
+    「开始汉化」时增量模式会自动翻译这些文本——不新增任何翻译路径。
+    返回 (新增条数, 已存在条数, 报告路径描述)。
+    """
+    game_dir = Path(game_path)
+    if (game_dir / "game").is_dir():
+        game_dir = game_dir / "game"
+    lang = language.split("（")[0].split("(")[0].strip().lower()
+    untran = game_dir / "tl" / f"{lang}.未翻译报告.txt"
+    untran.parent.mkdir(parents=True, exist_ok=True)
+
+    existing: list[str] = _parse_untran_report(untran) if untran.is_file() else []
+    seen: set[str] = set()
+    for t in existing:
+        seen.add(t.strip())
+    new_texts: list[str] = []
+    for t in texts:
+        t = (t or "").strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        new_texts.append(t)
+    if not new_texts:
+        if log:
+            log(f"人工兜底：{len(texts)} 条文本全部已在队列中，无需重复导入")
+        return 0, len(existing), str(untran)
+    # 追加（不重建）：保留原报告的条目与定位，外部导入的标在文件末尾。
+    # 注意编码：文件已存在时必须用普通 utf-8 追加——utf-8-sig 的编码器
+    # 在流开头会输出 BOM，追加模式下会把它写进文件中间。
+    try:
+        with open(untran, "a", encoding="utf-8" if untran.is_file()
+                  else "utf-8-sig") as f:
+            if existing:
+                f.write("\n\n== 人工兜底导入 ==\n")
+            for t in new_texts:
+                f.write(f"\n外部导入:0  {_escape_report_text(t)}")
+    except OSError as exc:
+        if log:
+            log(f"人工兜底：写未翻译报告失败: {exc}")
+        return 0, len(existing), str(untran)
+    if log:
+        log(f"人工兜底：已导入 {len(new_texts)} 条文本到重译队列"
+            f"（报告原有 {len(existing)} 条保留）")
+    return len(new_texts), len(existing), str(untran)
+
+
+# ---------------------------------------------------------------------------
 # 断点续译缓存
 # ---------------------------------------------------------------------------
 
@@ -191,13 +286,15 @@ def _load_progress_cache(path: Path, fingerprint: str,
 def _save_progress_cache(path: Path, fingerprint: str,
                          d_by_text: dict[str, str],
                          s_by_text: dict[str, str]) -> None:
-    """把翻译进度实时写入缓存（供断点续译）。失败静默（不影响主流程）。"""
+    """原子更新断点缓存；中途退出时仍保留上一次完整检查点。"""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         data = {_CACHE_FP_KEY: fingerprint,
                 "dialogues": d_by_text, "strings": s_by_text}
-        path.write_text(json.dumps(data, ensure_ascii=False),
-                        encoding="utf-8")
+        pending = path.with_name(path.name + ".tmp")
+        pending.write_text(json.dumps(data, ensure_ascii=False),
+                           encoding="utf-8")
+        pending.replace(path)
     except OSError:
         pass
 

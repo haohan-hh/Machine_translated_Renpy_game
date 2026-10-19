@@ -14,7 +14,9 @@ import time
 from pathlib import Path
 
 from win32more.winui3 import XamlApplication, XamlLoader
-from win32more.Microsoft.UI.Xaml import Window, Thickness, DispatcherTimer
+from win32more.Microsoft.UI.Xaml import (
+    Window, Thickness, DispatcherTimer, Visibility, WindowActivationState,
+)
 from win32more.Microsoft.UI.Xaml.Media import MicaBackdrop, SolidColorBrush
 from win32more.Microsoft.UI.Xaml.Controls import (
     ComboBoxItem,
@@ -30,6 +32,10 @@ from win32more import asyncui
 from . import APP_NAME
 from . import __version__ as PKG_VERSION
 from . import engine
+from .gui_state import (
+    group_log_entries, has_recoverable_translation, pending_matches,
+    should_follow_log,
+)
 from .pipeline import run_pipeline
 from .translator import TranslationClient, TranslationConfig, tcp_error_hint
 
@@ -63,11 +69,19 @@ LANGUAGES = [
 
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "rpytranslator_config.json"
 
+
+def _write_config(data: dict) -> None:
+    """同目录原子替换，避免意外退出时把已有配置截断。"""
+    pending = _CONFIG_PATH.with_name(_CONFIG_PATH.name + ".tmp")
+    pending.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+    pending.replace(_CONFIG_PATH)
+
 # 日志配色（Windows.UI.Color: A, R, G, B）
-_COLOR_DEFAULT = Color(255, 229, 229, 229)
-_COLOR_ERR     = Color(255, 244, 135, 113)
-_COLOR_OK      = Color(255, 139, 195, 74)
-_COLOR_INFO    = Color(255, 79, 195, 255)
+_COLOR_DEFAULT = Color(255, 232, 240, 247)
+_COLOR_ERR     = Color(255, 255, 182, 165)
+_COLOR_OK      = Color(255, 167, 227, 184)
+_COLOR_INFO    = Color(255, 155, 217, 255)
 
 # ---------------------------------------------------------------------------
 # XAML 界面定义
@@ -94,7 +108,9 @@ XAML = r'''
     </StackPanel>
 
     <!-- 内容滚动区 -->
-    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+    <ScrollViewer x:Name="PageScroll" Grid.Row="1"
+                  BringIntoViewOnFocusChange="False"
+                  VerticalScrollBarVisibility="Auto">
         <StackPanel Margin="28,4,28,20" Spacing="14">
 
             <!-- 卡片：游戏目录 -->
@@ -114,6 +130,23 @@ XAML = r'''
                 </StackPanel>
             </Border>
 
+            <!-- 上次任务：只提示，不在启动时自动续译 -->
+            <Border x:Name="RecoveryPanel" Visibility="Collapsed"
+                    Background="#17374D" BorderBrush="#397195"
+                    BorderThickness="1" CornerRadius="8" Padding="20,14">
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+                    <StackPanel Spacing="4" VerticalAlignment="Center">
+                        <TextBlock Text="发现未完成的汉化任务" FontSize="15"
+                                   Foreground="#E8F0F7" FontWeight="SemiBold"/>
+                        <TextBlock x:Name="RecoveryText" TextWrapping="Wrap"
+                                   FontSize="12" Foreground="#D4E8F4"/>
+                    </StackPanel>
+                    <Button Grid.Column="1" x:Name="ResumeBtn"
+                            Content="手动继续" Click="OnResume"
+                            VerticalAlignment="Center"/>
+                </Grid>
+            </Border>
+
             <!-- 卡片：翻译设置 -->
             <Border Background="#1FFFFFFF" BorderBrush="#14FFFFFF" BorderThickness="1"
                     CornerRadius="8" Padding="20,16">
@@ -126,7 +159,7 @@ XAML = r'''
                         </StackPanel>
                         <StackPanel Grid.Column="1" Spacing="4">
                             <TextBlock Text="目标语言" FontSize="12" Opacity="0.6"/>
-                            <ComboBox x:Name="LangBox"/>
+                            <ComboBox x:Name="LangBox" SelectionChanged="OnLangChanged"/>
                         </StackPanel>
                     </Grid>
                     <StackPanel Spacing="4">
@@ -209,10 +242,12 @@ XAML = r'''
                                 Click="OnClearLog" FontSize="12" Padding="12,5"
                                 VerticalAlignment="Center"/>
                     </Grid>
-                    <Border Background="#66000000" CornerRadius="6" Padding="12,10">
+                    <Border Background="#14202D" BorderBrush="#365064"
+                            BorderThickness="1" CornerRadius="6" Padding="12,10">
                         <ScrollViewer x:Name="LogScroll" VerticalScrollBarVisibility="Auto"
-                                      MaxHeight="240">
+                                      BringIntoViewOnFocusChange="False" MaxHeight="240">
                             <TextBlock x:Name="LogText" TextWrapping="Wrap"
+                                       Foreground="#E8F0F7"
                                        FontFamily="Consolas" FontSize="12"/>
                         </ScrollViewer>
                     </Border>
@@ -246,7 +281,15 @@ class GuiApp(XamlApplication):
         self.game_dir: str | None = None
         self.game_info: object | None = None
         self._timer: DispatcherTimer | None = None
-        self._log_lines = 0
+        self._scroll_restore_timer: DispatcherTimer | None = None
+        self._page_offset_before_deactivate: float | None = None
+        self._log_offset_before_deactivate: float | None = None
+        self._log_follow_before_deactivate = True
+        self._log_brushes: dict[str, SolidColorBrush] = {}
+        self._task_active = False
+        self._pending_task: dict | None = None
+        self._translation_result_ok = False
+        self._progress_before_aux: tuple[float, str] | None = None
         self._last_result: str | None = None
         self._test_mode = False
         self._paused_mode = False
@@ -303,6 +346,16 @@ class GuiApp(XamlApplication):
         self._init_controls()
         self._load_settings()
 
+        # WinUI 重新激活时可能把焦点控件滚入视野；布局完成后恢复此前位置。
+        try:
+            win.add_Activated(self._on_window_activated)
+            scroll_timer = DispatcherTimer()
+            scroll_timer.Interval = TimeSpan(500000)  # 50 ms
+            scroll_timer.add_Tick(self._restore_scroll_position)
+            self._scroll_restore_timer = scroll_timer
+        except Exception as exc:
+            self._append_log("滚动位置恢复初始化失败: %s" % exc, "err")
+
         win.Activate()
 
         # UI 轮询定时器：从工作线程队列取消息更新界面
@@ -311,10 +364,7 @@ class GuiApp(XamlApplication):
             timer.Interval = TimeSpan(1000000)  # 100 ms
             self._timer = timer
 
-            def on_tick(sender, e):
-                self._poll_queue()
-
-            timer.add_Tick(on_tick)
+            timer.add_Tick(self._on_timer_tick)
             timer.Start()
         except Exception as exc:
             self._append_log("定时器启动失败: %s" % exc, "err")
@@ -333,6 +383,40 @@ class GuiApp(XamlApplication):
         self.ServiceBox.SelectedIndex = 0
         self.LangBox.SelectedIndex = 0
 
+    def _on_timer_tick(self, sender, e) -> None:
+        self._poll_queue()
+
+    def _on_window_activated(self, sender, args) -> None:
+        try:
+            if args.WindowActivationState == WindowActivationState.Deactivated:
+                self._page_offset_before_deactivate = float(self.PageScroll.VerticalOffset)
+                self._log_offset_before_deactivate = float(self.LogScroll.VerticalOffset)
+                self._log_follow_before_deactivate = should_follow_log(
+                    self._log_offset_before_deactivate,
+                    float(self.LogScroll.ScrollableHeight),
+                )
+            elif self._page_offset_before_deactivate is not None:
+                if self._scroll_restore_timer is not None:
+                    self._scroll_restore_timer.Start()
+                else:
+                    self._restore_scroll_position(None, None)
+        except Exception:
+            pass
+
+    def _restore_scroll_position(self, sender, e) -> None:
+        if self._scroll_restore_timer is not None:
+            self._scroll_restore_timer.Stop()
+        try:
+            if self._page_offset_before_deactivate is not None:
+                self.PageScroll.ChangeViewWithOptionalAnimation(
+                    None, self._page_offset_before_deactivate, None, True)
+            if (not self._log_follow_before_deactivate
+                    and self._log_offset_before_deactivate is not None):
+                self.LogScroll.ChangeViewWithOptionalAnimation(
+                    None, self._log_offset_before_deactivate, None, True)
+        except Exception:
+            pass
+
     # -- 配置持久化 --------------------------------------------------------
 
     def _load_settings(self) -> None:
@@ -341,6 +425,8 @@ class GuiApp(XamlApplication):
             if _CONFIG_PATH.exists():
                 data = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
         except Exception:
+            data = {}
+        if not isinstance(data, dict):
             data = {}
         self.ApiUrlBox.Text = data.get("url", PRESETS[SERVICES[0]][0])
         self.ApiKeyBox.Password = data.get("key", "")
@@ -367,6 +453,15 @@ class GuiApp(XamlApplication):
                 "key": data.get("key", ""),
             }]
         self._rebuild_model_menu()
+        pending_task = data.get("pending_task")
+        self._pending_task = pending_task if isinstance(pending_task, dict) else None
+        last_game = data.get("game_path")
+        if isinstance(last_game, str) and Path(last_game).is_dir():
+            self.game_dir = last_game
+            self.GamePathBox.Text = last_game
+            self.GameInfoText.Text = "已恢复上次选择的游戏目录"
+            self.OpenOutBtn.IsEnabled = True
+        self._refresh_recovery_prompt()
         self._append_log("已加载配置%s" % ("" if data else "（无）"), "info")
 
     def _save_settings(self) -> bool:
@@ -379,7 +474,10 @@ class GuiApp(XamlApplication):
             "font": self.FontSwitch.IsOn,
             "lang_ui": self.LangUiSwitch.IsOn,
             "keep_terms": self.KeepTermsBox.Text,
+            "game_path": self.game_dir or "",
         }
+        if self._pending_task is not None:
+            data["pending_task"] = self._pending_task
         # 把当前配置作为一条保存进下拉列表（按 model 名去重）
         cur_model = (data["model"] or "").strip()
         cur_entry = {"model": cur_model, "url": data["url"], "key": data["key"]}
@@ -389,12 +487,59 @@ class GuiApp(XamlApplication):
         self._saved_models = kept[-20:]
         data["saved_models"] = self._saved_models
         try:
-            _CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2),
-                                    encoding="utf-8")
+            _write_config(data)
         except Exception:
             return False
         self._rebuild_model_menu()
         return True
+
+    def _set_pending_task(self, task: dict | None) -> None:
+        """保存任务身份；即使进度缓存尚未产生，重启后也能提示手动继续。"""
+        self._pending_task = task
+        try:
+            data = (json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+                    if _CONFIG_PATH.exists() else {})
+            if not isinstance(data, dict):
+                data = {}
+            if task is None:
+                data.pop("pending_task", None)
+            else:
+                data["pending_task"] = task
+            _write_config(data)
+        except (OSError, ValueError) as exc:
+            self._append_log("任务状态保存失败，重启后可能需要重新选择: %s" % exc, "err")
+
+    def _remember_game_path(self, path: str) -> None:
+        """仅更新最近的游戏目录，不把尚未保存的 API 表单一起落盘。"""
+        try:
+            data = (json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+                    if _CONFIG_PATH.exists() else {})
+            if not isinstance(data, dict):
+                data = {}
+            data["game_path"] = path
+            _write_config(data)
+        except (OSError, ValueError) as exc:
+            self._append_log("无法记住游戏目录，重启后需重新选择: %s" % exc, "err")
+
+    def _refresh_recovery_prompt(self) -> None:
+        """仅显示已存在的断点；继续翻译必须由用户点击。"""
+        path = self.game_dir
+        idx = self.LangBox.SelectedIndex
+        lang = LANGUAGES[idx].split("（")[0] if 0 <= idx < len(LANGUAGES) else ""
+        script_dir = getattr(self.game_info, "game_dir", None)
+        checkpoint = bool(path and lang and has_recoverable_translation(
+            path, lang, script_dir=script_dir))
+        pending = bool(path and lang and pending_matches(
+            self._pending_task, path, lang))
+        recoverable = not self._busy() and (checkpoint or pending)
+        self.RecoveryPanel.Visibility = (
+            Visibility.Visible if recoverable else Visibility.Collapsed)
+        if recoverable:
+            detail = ("检测到上次保留的进度" if checkpoint else
+                      "上次任务未完成；若尚无断点缓存，续译可能从头开始")
+            self.RecoveryText.Text = (
+                f"{path} · {lang}：{detail}。"
+                "不会自动运行；确认设置后点击右侧按钮续译。")
 
     # -- 模型下拉（ModelMenuBtn） -----------------------------------------
 
@@ -534,6 +679,9 @@ class GuiApp(XamlApplication):
             return None
 
     def _set_game(self, path: str) -> None:
+        if self._busy():
+            self._append_log("任务运行中不能切换游戏目录", "err")
+            return
         path = path.strip().strip('"')
         if not path or not os.path.isdir(path):
             self._append_log("目录不存在: %s" % path, "err")
@@ -541,12 +689,14 @@ class GuiApp(XamlApplication):
         self.GamePathBox.Text = path
         self.game_dir = path
         self._append_log("已选择游戏目录: %s" % path, "info")
+        self._remember_game_path(path)
         try:
             self.game_info = engine.scan_game(path)
         except Exception as exc:
             self._append_log("解析游戏目录失败: %s" % exc, "err")
             self.game_info = None
         self._update_game_info()
+        self._refresh_recovery_prompt()
 
     def _update_game_info(self) -> None:
         info = self.game_info
@@ -580,6 +730,9 @@ class GuiApp(XamlApplication):
         if model:
             self.ModelBox.Text = model
 
+    def OnLangChanged(self, sender, e) -> None:
+        self._refresh_recovery_prompt()
+
     # -- 事件：保存 / 清空日志 / 打开输出目录 -------------------------------
 
     def OnSaveSettings(self, sender, e) -> None:
@@ -592,8 +745,11 @@ class GuiApp(XamlApplication):
 
     def OnClearLog(self, sender, e) -> None:
         self.LogText.Inlines.Clear()
-        self._log_lines = 0
         self.StatusText.Text = "日志已清空"
+
+    def OnResume(self, sender, e) -> None:
+        """使用现有流程和进度缓存续译，不自动启动任务。"""
+        self.OnStart(sender, e)
 
     def OnOpenOutput(self, sender, e) -> None:
         if self.game_dir:
@@ -635,9 +791,11 @@ class GuiApp(XamlApplication):
             api_key=key,
             model=model,
         )
-        self._save_settings()
+        if not self._save_settings():
+            self._append_log("设置保存失败；重启后可能需要重新选择游戏目录", "err")
 
         self._test_mode = False
+        self._translation_result_ok = False
         self._pause_event = threading.Event()
         self.worker = threading.Thread(
             target=self._run_translation,
@@ -646,8 +804,11 @@ class GuiApp(XamlApplication):
             daemon=True,
         )
         self.worker.start()
+        self._task_active = True
+        self._set_pending_task({"game_path": game_dir, "language": lang})
         self._ensure_timer()
         self._set_busy(True)
+        self.RecoveryPanel.Visibility = Visibility.Collapsed
         # ETA 倒计时起点：任务启动时刻（含解包/反编译阶段），并清空旧任务状态
         self._eta_start = time.monotonic()
         self._eta_smooth = None
@@ -672,12 +833,14 @@ class GuiApp(XamlApplication):
             self._append_log("请填写完整的 API 地址 / Key / 模型", "err")
             return
         self._test_mode = True
+        self._progress_before_aux = (float(self.Progress.Value), self.ProgressText.Text)
         self.worker = threading.Thread(
             target=self._run_test_connection,
             args=(TranslationConfig(base_url=url, api_key=key, model=model),),
             daemon=True,
         )
         self.worker.start()
+        self._task_active = True
         self._ensure_timer()
         self._set_busy(True)
         self.ProgressText.Text = "测试中…"
@@ -787,12 +950,14 @@ class GuiApp(XamlApplication):
             return
         lang = LANGUAGES[self.LangBox.SelectedIndex].split("（")[0].strip()
         self._audit_mode = True
+        self._progress_before_aux = (float(self.Progress.Value), self.ProgressText.Text)
         self.worker = threading.Thread(
             target=self._run_audit,
             args=(game_dir, lang),
             daemon=True,
         )
         self.worker.start()
+        self._task_active = True
         self._ensure_timer()
         self._set_busy(True)
         self.ProgressText.Text = "扫描中…"
@@ -836,7 +1001,8 @@ class GuiApp(XamlApplication):
                 extra_terms=keep_terms,
                 pause_event=pause_event,
             )
-            prefix = "PAUSED|" if result.paused else "RESULT|"
+            prefix = ("PAUSED|" if result.paused else
+                      "RESULT_OK|" if result.ok else "RESULT_ERR|")
             self.msg_q.put(prefix + result.message)
         except Exception as exc:
             import traceback
@@ -852,12 +1018,12 @@ class GuiApp(XamlApplication):
     # -- 队列轮询（UI 线程） -------------------------------------------------
 
     def _busy(self) -> bool:
-        return bool(self.worker and self.worker.is_alive())
+        return self._task_active or bool(self.worker and self.worker.is_alive())
 
     def _ensure_timer(self) -> None:
         """确保 UI 轮询定时器正在运行（每次启动后台任务时调用）。
 
-        DispatcherTimer 空闲时会被 on_tick 停掉以节省资源；
+        DispatcherTimer 空闲时会被 _poll_queue 停掉以节省资源；
         若不在此重新 Start，队列中的消息将永远不会被 UI 消费，
         界面会卡在“准备中 / 测试中”不刷新。
         """
@@ -868,39 +1034,50 @@ class GuiApp(XamlApplication):
             self._append_log("定时器重启失败: %s" % exc, "err")
 
     def _poll_queue(self) -> None:
-        try:
-            while True:
+        logs: list[tuple[str, str]] = []
+        latest_progress: int | None = None
+        # 每帧限定消息数，避免日志突发时长时间占用 UI 线程。
+        for _ in range(250):
+            try:
                 msg = self.msg_q.get_nowait()
-                if msg == "__done__":
-                    self._on_done()
-                    continue
-                if msg.startswith("TEST_OK|"):
-                    self._append_log(msg[8:], "ok")
-                    self.StatusText.Text = "连接成功"
-                    continue
-                if msg.startswith("TEST_ERR|"):
-                    self._append_log(msg[9:], "err")
-                    self.StatusText.Text = "连接失败"
-                    continue
-                if msg.startswith("RESULT|"):
-                    self._last_result = msg[7:]
-                    continue
-                if msg.startswith("PAUSED|"):
-                    self._last_result = msg[7:]
-                    self._paused_mode = True
-                    continue
-                if msg.startswith("ERR|"):
-                    self._append_log(msg[4:], "err")
-                    continue
-                if msg.startswith("PROGRESS|"):
-                    try:
-                        self._update_progress(int(msg.split("|")[1]))
-                    except (ValueError, IndexError):
-                        pass
-                    continue
-                self._append_log(msg)
-        except queue.Empty:
-            pass
+            except queue.Empty:
+                break
+            if msg == "__done__":
+                self._append_logs(logs)
+                logs.clear()
+                if latest_progress is not None:
+                    self._update_progress(latest_progress)
+                    latest_progress = None
+                self._on_done()
+            elif msg.startswith("TEST_OK|"):
+                logs.append((msg[8:], "ok"))
+                self.StatusText.Text = "连接成功"
+            elif msg.startswith("TEST_ERR|"):
+                logs.append((msg[9:], "err"))
+                self.StatusText.Text = "连接失败"
+            elif msg.startswith("RESULT_OK|"):
+                self._last_result = msg[10:]
+                self._translation_result_ok = True
+            elif msg.startswith("RESULT_ERR|"):
+                self._last_result = msg[11:]
+                self._translation_result_ok = False
+            elif msg.startswith("PAUSED|"):
+                self._last_result = msg[7:]
+                self._paused_mode = True
+            elif msg.startswith("ERR|"):
+                logs.append((msg[4:], "err"))
+            elif msg.startswith("PROGRESS|"):
+                try:
+                    latest_progress = int(msg.split("|", 2)[1])
+                except (ValueError, IndexError):
+                    pass
+            else:
+                logs.append((msg, "info"))
+        self._append_logs(logs)
+        if latest_progress is not None:
+            self._update_progress(latest_progress)
+        if not self._busy() and self.msg_q.empty() and self._timer is not None:
+            self._timer.Stop()
 
     def _update_progress(self, pct: int) -> None:
         """对接成功后：把“就绪”替换为实时百分比进度 + 预计剩余时间。"""
@@ -958,6 +1135,7 @@ class GuiApp(XamlApplication):
 
     def _on_done(self) -> None:
         self.worker = None
+        self._task_active = False
         self._set_busy(False)
         # 清空 ETA 状态，避免下次任务继承上次的起点/平滑值
         self._eta_start = None
@@ -965,27 +1143,45 @@ class GuiApp(XamlApplication):
         self._eta_max_pct = 0
         if self._test_mode:
             self._test_mode = False
-            self.ProgressText.Text = "就绪"
-            self.Progress.Value = 0
+            self._restore_aux_progress()
+            self._refresh_recovery_prompt()
             return
         if self._audit_mode:
             self._audit_mode = False
-            self.ProgressText.Text = "就绪"
-            self.Progress.Value = 0
+            self._restore_aux_progress()
+            self.StatusText.Text = "补漏查缺扫描结束"
+            self._refresh_recovery_prompt()
             return
         if getattr(self, "_last_result", None):
-            self._append_log(self._last_result, "ok")
+            level = "info" if self._paused_mode else (
+                "ok" if self._translation_result_ok else "err")
+            self._append_log(self._last_result, level)
             self._last_result = None
         if getattr(self, "_paused_mode", False):
             self._paused_mode = False
             self._append_log(
-                "已暂停。关闭程序后重新打开，点击「开始汉化」会自动从"
-                "暂停标记处继续，无需从头开始。", "info")
+                "已暂停。关闭程序后重新打开，点击「手动继续」或「开始汉化」"
+                "可从暂停标记处续译。", "info")
             self.ProgressText.Text = "已暂停"
             self.StatusText.Text = "已暂停（可从断点继续）"
+            self._refresh_recovery_prompt()
             return
-        self.ProgressText.Text = "完成"
-        self.StatusText.Text = "完成"
+        if self._translation_result_ok:
+            self._set_pending_task(None)
+            self.Progress.Value = 100
+            self.ProgressText.Text = "完成"
+            self.StatusText.Text = "完成"
+        else:
+            self.ProgressText.Text = "未完成"
+            self.StatusText.Text = "任务未完成（可检查日志后手动继续）"
+        self._refresh_recovery_prompt()
+
+    def _restore_aux_progress(self) -> None:
+        if self._progress_before_aux is not None:
+            value, label = self._progress_before_aux
+            self.Progress.Value = value
+            self.ProgressText.Text = label
+            self._progress_before_aux = None
 
     def _set_busy(self, busy: bool) -> None:
         self.StartBtn.IsEnabled = not busy
@@ -997,30 +1193,43 @@ class GuiApp(XamlApplication):
         self.BrowseBtn.IsEnabled = not busy
         self.SaveBtn.IsEnabled = not busy
         self.AuditBtn.IsEnabled = not busy
+        self.LangBox.IsEnabled = not busy
         self.Progress.IsIndeterminate = busy
-        if not busy:
-            self.Progress.Value = 100
+        if busy:
+            self.RecoveryPanel.Visibility = Visibility.Collapsed
 
     # -- 日志 ---------------------------------------------------------------
 
     def _append_log(self, text: str, level: str = "info") -> None:
+        self._append_logs([(text, level)])
+
+    def _append_logs(self, entries: list[tuple[str, str]]) -> None:
+        if not entries:
+            return
         try:
-            run = Run()
-            run.Text = text + "\n"
-            run.Foreground = SolidColorBrush({
-                "err": _COLOR_ERR,
-                "ok": _COLOR_OK,
-                "info": _COLOR_INFO,
-            }.get(level, _COLOR_DEFAULT))
-            self.LogText.Inlines.Append(run)
-            self._log_lines += 1
-            if self._log_lines > 400:
-                self.LogText.Inlines.Clear()
-                self._log_lines = 0
-            try:
-                self.LogScroll.ChangeView(None, 1e18, None)
-            except Exception:
-                pass
+            follow = should_follow_log(
+                float(self.LogScroll.VerticalOffset),
+                float(self.LogScroll.ScrollableHeight),
+            )
+            if not self._log_brushes:
+                self._log_brushes = {
+                    "err": SolidColorBrush(_COLOR_ERR),
+                    "ok": SolidColorBrush(_COLOR_OK),
+                    "info": SolidColorBrush(_COLOR_INFO),
+                    "default": SolidColorBrush(_COLOR_DEFAULT),
+                }
+            for level, text in group_log_entries(entries):
+                run = Run()
+                run.Text = text
+                run.Foreground = self._log_brushes.get(
+                    level, self._log_brushes["default"])
+                self.LogText.Inlines.Append(run)
+            # 只有用户此前停在末尾时才跟随；阅读历史日志时不夺走位置。
+            # 批量日志仅滚动一次，避免重复布局。
+            if follow:
+                self.LogScroll.UpdateLayout()
+                self.LogScroll.ChangeViewWithOptionalAnimation(
+                    None, self.LogScroll.ScrollableHeight, None, True)
         except Exception as exc:
             import traceback
             try:
