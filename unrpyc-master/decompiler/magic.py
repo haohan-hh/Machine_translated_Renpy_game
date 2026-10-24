@@ -423,16 +423,32 @@ class FakePackageLoader(object):
         else:
             return None
 
-    # the new way of loading modules. It returns a ModuleSpec, that has
-    # the loader attribute set to this class.
+    # The modern import protocol, used by Python 3.4+ (and required by
+    # Python 3.12+). ``is_package=True`` gives every fake module a package
+    # search path so nested imports continue to use this loader.
 
     def find_spec(self, fullname, path, target=None):
         if fullname == self.root or fullname.startswith(self.root + "."):
-            return ModuleSpec(fullname, self)
+            return ModuleSpec(fullname, self, is_package=True)
         else:
             return None
 
-    # loader methods. This loads the module.
+    # ``create_module`` and ``exec_module`` are deliberately split so the
+    # import machinery owns sys.modules registration and import attributes.
+    # The returned FakePackage already registers itself for compatibility with
+    # the older loader path; exec_module has no source code to execute.
+
+    def create_module(self, spec):
+        """Create a fake package using Python's modern import protocol."""
+        return FakePackage(spec.name)
+
+    def exec_module(self, module):
+        """Fake packages have no code to execute after they are created."""
+        pass
+
+    # Legacy loader methods retained for Python 3.9-3.11 compatibility. They
+    # are no longer used by the import system in Python 3.12+ and load_module
+    # was removed from the standard loader protocol in Python 3.15.
 
     def load_module(self, fullname):
         return FakePackage(fullname)
