@@ -37,7 +37,12 @@ from .gui_state import (
     should_follow_log,
 )
 from .pipeline import run_pipeline
-from .translator import TranslationClient, TranslationConfig, tcp_error_hint
+from .translator import (
+    TranslationClient,
+    TranslationConfig,
+    TranslationError,
+    tcp_error_hint,
+)
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -54,7 +59,9 @@ PRESETS: dict[str, tuple[str, str]] = {
     "Kimi (Moonshot)": ("https://api.moonshot.cn/v1", "moonshot-v1-8k"),
     "通义千问": ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"),
     "智谱 GLM": ("https://open.bigmodel.cn/api/paas/v4", "glm-4-flash"),
-    "Ollama 本地": ("http://localhost:11434/v1", "qwen2.5:7b"),
+    # Keep the explicit tag so a fresh Ollama process resolves the model
+    # deterministically after the model store is moved to another drive.
+    "Ollama 本地": ("http://localhost:11434/v1", "qwen3-8b-q4_k_m:latest"),
     "自定": ("", ""),
 }
 SERVICES = list(PRESETS)
@@ -928,7 +935,24 @@ class GuiApp(XamlApplication):
             )
             client = TranslationClient(test_cfg)
             t0 = time.time()
-            resp = client.chat([{"role": "user", "content": "你好"}]).strip()
+            resp = ""
+            for attempt in range(3):
+                try:
+                    resp = client.chat(
+                        [{"role": "user", "content": "你好"}]).strip()
+                    break
+                except TranslationError as exc:
+                    detail = str(exc).lower()
+                    model_not_ready = (
+                        "http 404" in detail
+                        and ("model" in detail or "not_found" in detail)
+                    )
+                    if not model_not_ready or attempt >= 2:
+                        raise
+                    wait_s = attempt + 1
+                    self.msg_q.put(
+                        "模型正在注册或首次加载，%d 秒后自动重试…" % wait_s)
+                    time.sleep(wait_s)
             elapsed = int((time.time() - t0) * 1000)
             snippet = (resp or "")[:60]
             self.msg_q.put("TEST_OK|连接成功（%d ms）：%s" % (elapsed, snippet))
