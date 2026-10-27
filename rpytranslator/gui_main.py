@@ -32,6 +32,12 @@ from win32more import asyncui
 from . import APP_NAME
 from . import __version__ as PKG_VERSION
 from . import engine
+from .connection import (
+    endpoint_parts,
+    is_local_endpoint,
+    wait_for_model_registration,
+    wait_for_tcp,
+)
 from .gui_state import (
     group_log_entries, has_recoverable_translation, pending_matches,
     should_follow_log,
@@ -309,6 +315,9 @@ class GuiApp(XamlApplication):
         self._model_flyout: MenuFlyout | None = None
         # 下拉条目点击回调的强引用（防 GC 回收 delegate）
         self._menu_handlers: list = []
+        # ServiceBox.SelectionChanged fires while persisted settings load.
+        # Suppress it so it cannot overwrite a saved custom model.
+        self._loading_settings = False
 
     # -- 生命周期 ----------------------------------------------------------
 
@@ -435,22 +444,26 @@ class GuiApp(XamlApplication):
             data = {}
         if not isinstance(data, dict):
             data = {}
-        self.ApiUrlBox.Text = data.get("url", PRESETS[SERVICES[0]][0])
-        self.ApiKeyBox.Password = data.get("key", "")
-        self.ModelBox.Text = data.get("model", PRESETS[SERVICES[0]][1])
+        self._loading_settings = True
         try:
-            si = SERVICES.index(data.get("service", SERVICES[0]))
-            self.ServiceBox.SelectedIndex = si
-        except Exception:
-            self.ServiceBox.SelectedIndex = 0
-        try:
-            li = LANGUAGES.index(data.get("lang", LANGUAGES[0]))
-            self.LangBox.SelectedIndex = li
-        except Exception:
-            self.LangBox.SelectedIndex = 0
-        self.FontSwitch.IsOn = bool(data.get("font", True))
-        self.LangUiSwitch.IsOn = bool(data.get("lang_ui", True))
-        self.KeepTermsBox.Text = data.get("keep_terms", "")
+            self.ApiUrlBox.Text = data.get("url", PRESETS[SERVICES[0]][0])
+            self.ApiKeyBox.Password = data.get("key", "")
+            self.ModelBox.Text = data.get("model", PRESETS[SERVICES[0]][1])
+            try:
+                si = SERVICES.index(data.get("service", SERVICES[0]))
+                self.ServiceBox.SelectedIndex = si
+            except Exception:
+                self.ServiceBox.SelectedIndex = 0
+            try:
+                li = LANGUAGES.index(data.get("lang", LANGUAGES[0]))
+                self.LangBox.SelectedIndex = li
+            except Exception:
+                self.LangBox.SelectedIndex = 0
+            self.FontSwitch.IsOn = bool(data.get("font", True))
+            self.LangUiSwitch.IsOn = bool(data.get("lang_ui", True))
+            self.KeepTermsBox.Text = data.get("keep_terms", "")
+        finally:
+            self._loading_settings = False
         # 已保存的模型列表：旧配置无此字段时退化为「当前一项」（向后兼容）
         self._saved_models = list(data.get("saved_models") or [])
         if not self._saved_models and data.get("model"):
@@ -728,6 +741,8 @@ class GuiApp(XamlApplication):
     # -- 事件：服务 / 语言 --------------------------------------------------
 
     def OnServiceChanged(self, sender, e) -> None:
+        if self._loading_settings:
+            return
         idx = self.ServiceBox.SelectedIndex
         if idx < 0 or idx >= len(SERVICES):
             return
@@ -780,9 +795,12 @@ class GuiApp(XamlApplication):
         url = self.ApiUrlBox.Text.strip()
         key = self.ApiKeyBox.Password.strip()
         model = self.ModelBox.Text.strip()
-        if not url or not key or not model:
-            self._append_log("请填写完整的 API 地址 / Key / 模型", "err")
-            self._msgbox("请填写完整的 API 地址、API Key 与模型名称。", "配置不完整")
+        if not url or not model or (not key and not is_local_endpoint(url)):
+            self._append_log(
+                "请填写完整的 API 地址 / Key / 模型（本地服务可不填 Key）", "err")
+            self._msgbox(
+                "请填写完整的 API 地址、API Key 与模型名称（本地服务可不填 API Key）。",
+                "配置不完整")
             return
         lang = LANGUAGES[self.LangBox.SelectedIndex].split("（")[0]
         font = self.FontSwitch.IsOn
@@ -836,8 +854,9 @@ class GuiApp(XamlApplication):
         url = self.ApiUrlBox.Text.strip()
         key = self.ApiKeyBox.Password.strip()
         model = self.ModelBox.Text.strip()
-        if not url or not key or not model:
-            self._append_log("请填写完整的 API 地址 / Key / 模型", "err")
+        if not url or not model or (not key and not is_local_endpoint(url)):
+            self._append_log(
+                "请填写完整的 API 地址 / Key / 模型（本地服务可不填 Key）", "err")
             return
         self._test_mode = True
         self._progress_before_aux = (float(self.Progress.Value), self.ProgressText.Text)
@@ -855,29 +874,19 @@ class GuiApp(XamlApplication):
         self._append_log("正在测试连接: %s（模型 %s）…" % (url, model), "info")
 
     def _run_test_connection(self, config: TranslationConfig) -> None:
-        """分步测试连接：DNS 解析 → TCP 连接 → HTTP 请求，任一步失败立即反馈。
-
-        说明：urlopen 的 timeout 无法限制 DNS 解析耗时，因此 DNS 解析放在
-        独立守护线程中运行，用 join(timeout) 兜底，避免无限等待。
-        """
-        import socket
-        from urllib.parse import urlparse
-
+        """分步测试连接，并等待本地服务/模型注册完成。"""
         try:
-            u = urlparse(config.base_url)
-            if u.scheme not in ("http", "https") or not u.hostname:
-                self.msg_q.put("TEST_ERR|API 地址格式无效: %s" % config.base_url)
-                return
-            host = u.hostname
-            port = u.port or (443 if u.scheme == "https" else 80)
+            _scheme, host, port = endpoint_parts(config.base_url)
 
-            # 1) DNS 解析（getaddrinfo 无法设超时 → 线程 + join 兜底）
+            # DNS 解析本身没有可移植的超时参数，放到守护线程中并由
+            # join(15s) 兜底，避免某个坏 DNS 服务器冻结 GUI worker。
             resolved: list = []
 
             def _resolve() -> None:
                 try:
-                    resolved.append(
-                        socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM))
+                    import socket
+                    resolved.append(socket.getaddrinfo(
+                        host, port, 0, socket.SOCK_STREAM))
                 except Exception as e:  # noqa: BLE001
                     resolved.append(e)
 
@@ -893,38 +902,30 @@ class GuiApp(XamlApplication):
                 self.msg_q.put("TEST_ERR|DNS 解析失败: %s" % resolved[0])
                 return
 
-            # 2) TCP 连接（直连，不走 HTTP 代理）
-            #    localhost 在 Windows 上常同时解析出 IPv6(::1) 与 IPv4(127.0.0.1)，
-            #    而本地模型服务（Ollama / LM Studio）通常只监听 IPv4；只尝试首个
-            #    地址会误报“目标计算机积极拒绝”(WinError 10061)。逐个地址尝试，
-            #    并在全部失败后短暂等待重试一轮（服务可能刚启动）。
-            last_err: Exception | None = None
-            connected = False
-            for round_no in range(2):
-                for family, stype, proto, _, sockaddr in resolved[0]:
-                    sock = socket.socket(family, stype, proto)
-                    sock.settimeout(15)
-                    try:
-                        sock.connect(sockaddr)
-                        connected = True
-                    except Exception as e:  # noqa: BLE001
-                        last_err = e
-                    finally:
-                        sock.close()
-                    if connected:
-                        break
-                if connected or round_no == 1:
-                    break
-                time.sleep(0.8)
+            # 2) TCP 连接。启动脚本常在 GUI 之后拉起 ollama serve，
+            #    因此这里必须等待整个启动窗口，而不是只重试一次。
+            connected, last_err = wait_for_tcp(
+                host, port, timeout=30.0, addresses=resolved[0],
+                retry_interval=0.5)
             if not connected:
                 self.msg_q.put(
                     "TEST_ERR|TCP 连接失败: %s:%s - %s\n%s"
                     % (host, port, last_err, tcp_error_hint(last_err, host)))
                 return
 
-            # 3) HTTP 请求（含鉴权，验证地址 / Key / 模型）。
-            #    本地模型首次请求需把权重加载进显存，可能耗时 10~60 秒，
-            #    故测试超时放宽到 120 秒，避免“服务正常但被误判失败”。
+            # 3) Ollama 在 HTTP 监听后还可能尚未注册模型。先轮询模型清单，
+            #    再发 chat，避免把启动竞态误报成“模型不存在”。
+            if is_local_endpoint(config.base_url):
+                self.msg_q.put("服务已启动，正在等待模型注册…")
+                registered, detail = wait_for_model_registration(
+                    config.base_url, config.model, timeout=120.0,
+                    poll_interval=1.0, api_key=config.api_key)
+                if not registered:
+                    self.msg_q.put("TEST_ERR|%s" % detail)
+                    return
+
+            # 4) HTTP 请求（含鉴权，验证地址 / Key / 模型）。本地模型首次
+            #    加载权重可能耗时 10~60 秒，故请求超时放宽到 120 秒。
             self.msg_q.put("TCP 已连通，正在发送测试请求（本地模型首次加载可能较慢）…")
             test_cfg = TranslationConfig(
                 base_url=config.base_url,
@@ -936,7 +937,7 @@ class GuiApp(XamlApplication):
             client = TranslationClient(test_cfg)
             t0 = time.time()
             resp = ""
-            for attempt in range(3):
+            for attempt in range(4):
                 try:
                     resp = client.chat(
                         [{"role": "user", "content": "你好"}]).strip()
@@ -947,9 +948,15 @@ class GuiApp(XamlApplication):
                         "http 404" in detail
                         and ("model" in detail or "not_found" in detail)
                     )
-                    if not model_not_ready or attempt >= 2:
+                    # Ollama may expose the model in /api/tags while its
+                    # runner is still starting.  During that short window
+                    # the OpenAI-compatible route can return HTTP 500.
+                    if (is_local_endpoint(config.base_url)
+                            and "http 500" in detail):
+                        model_not_ready = True
+                    if not model_not_ready or attempt >= 3:
                         raise
-                    wait_s = attempt + 1
+                    wait_s = min(5, attempt + 1)
                     self.msg_q.put(
                         "模型正在注册或首次加载，%d 秒后自动重试…" % wait_s)
                     time.sleep(wait_s)
