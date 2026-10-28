@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import sys
 import threading
 import time
 from pathlib import Path
@@ -80,11 +81,21 @@ LANGUAGES = [
     "english（英语）",
 ]
 
-_CONFIG_PATH = Path(__file__).resolve().parent.parent / "rpytranslator_config.json"
+# In a frozen one-file build ``__file__`` points inside PyInstaller's
+# temporary extraction directory. Keep the user configuration beside the
+# launcher so it survives extraction cleanup and can travel with the app.
+if getattr(sys, "frozen", False):
+    _CONFIG_PATH = Path(sys.executable).resolve().with_name(
+        "rpytranslator_config.json"
+    )
+else:
+    _CONFIG_PATH = (Path(__file__).resolve().parent.parent
+                    / "config" / "rpytranslator_config.json")
 
 
 def _write_config(data: dict) -> None:
     """同目录原子替换，避免意外退出时把已有配置截断。"""
+    _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     pending = _CONFIG_PATH.with_name(_CONFIG_PATH.name + ".tmp")
     pending.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                        encoding="utf-8")

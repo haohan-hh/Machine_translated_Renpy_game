@@ -7,6 +7,9 @@ binaries = []
 hiddenimports = []
 tmp_ret = collect_all('win32more')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+# unrpyc imports this standard-library module dynamically from its bundled
+# source tree; include it explicitly for one-file builds.
+hiddenimports += ['pickletools']
 
 # unrpyc is loaded dynamically from a filesystem path at runtime, so PyInstaller
 # cannot discover it as a normal import. Include its source tree explicitly;

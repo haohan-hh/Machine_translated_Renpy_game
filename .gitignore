@@ -37,3 +37,9 @@ schinese_old_backup/
 # 本地推理模型配置（仅本机生效，不入库）
 *.Modelfile
 Modelfile
+
+# 本地运行时依赖、归档和下载工具
+/_dependencies/
+/archive/
+/config/
+/tools/downloaders/
