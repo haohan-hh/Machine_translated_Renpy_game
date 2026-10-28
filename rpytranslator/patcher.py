@@ -938,7 +938,7 @@ def _find_preferences_source(game_dir: Path) -> tuple[str | None, Path | None]:
     for fn in ("screens.rpyc", "screens.rpymc"):
         p = game_dir / fn
         if p.is_file():
-            text = _decompile_to_text(p)
+            text = _decompile_rpyc_source(p, p.name)
             if text and re.search(_PREF_SCREEN_RE, text):
                 return text, p
     # 3. 全目录搜索（源码）。跳过本工具注入的 zz_*.rpy 补丁——
