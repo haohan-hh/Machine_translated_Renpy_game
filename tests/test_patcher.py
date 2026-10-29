@@ -26,6 +26,16 @@ class PatcherTests(unittest.TestCase):
             self.assertEqual(found_path, compiled)
             decompile.assert_called_once_with(compiled, "screens.rpyc")
 
+    def test_raise_preferences_priority_overrides_archived_screen(self) -> None:
+        source = "init -501 screen preferences():\n    tag menu\n"
+        patched = patcher._raise_preferences_priority(source)
+        self.assertTrue(patched.startswith("init 1000 screen preferences():"))
+
+    def test_raise_preferences_priority_handles_plain_screen(self) -> None:
+        source = "screen preferences():\n    tag menu\n"
+        patched = patcher._raise_preferences_priority(source)
+        self.assertTrue(patched.startswith("init 1000 screen preferences():"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -69,6 +69,11 @@ _SKIP_DIRS = {"tl", "renpy", "cache", "saves", "log", "errors",
 _PREF_SCREEN_RE = re.compile(
     r"(?m)^ *(?:init\s+[+-]?\d+\s+)?screen\s+preferences\b")
 
+# Game templates commonly put preferences at init -501. If the archive and
+# the loose patch use the same priority, Ren'Py may let the archive definition
+# win depending on load order. Use a clearly later priority for the override.
+_LANGUAGE_UI_PRIORITY = 1000
+
 
 def _read_u16(data: bytes, off: int) -> int:
     return struct.unpack_from(">H", data, off)[0]
@@ -526,8 +531,7 @@ _LANG_UI_SNIPPET = (
     '            label _("Language")\n'
     "            $ _lang_ui_names = _lang_ui_languages()\n"
     "            for _lang_ui_i in _lang_ui_names:\n"
-    '                $ _lang_ui_label = "English" if _lang_ui_i is None else _lang_ui_i\n'
-    "                textbutton _(_lang_ui_label) selected "
+    "                textbutton _lang_ui_display_name(_lang_ui_i) selected "
     "(_preferences.language == _lang_ui_i) action "
     "Function(_lang_ui_switch, _lang_ui_i) style \"radio_button\"\n"
 )
@@ -695,30 +699,66 @@ _LANG_UI_HELPER = (
     "        _zz_font_choices = {}\n"
     "\n"
     "init python:\n"
+    "    def _lang_ui_display_name(language):\n"
+    "        # 语言码是运行时动态字符串，不能交给 _() 翻译：默认英文时，\n"
+    "        # translate schinese strings 尚未生效，会把 schinese 原样显示出来。\n"
+    "        # 这里直接映射显示名，同时保留未知语言码，确保按钮始终可见。\n"
+    "        if language is None:\n"
+    "            return \"English\"\n"
+    "        _code = str(language).lower()\n"
+    "        _names = {\n"
+    "            'schinese': \"简体中文\",\n"
+    "            'zh': \"简体中文\",\n"
+    "            'zh_cn': \"简体中文\",\n"
+    "            'zh_hans': \"简体中文\",\n"
+    "            'tchinese': \"繁体中文\",\n"
+    "            'zh_tw': \"繁体中文\",\n"
+    "            'zh_hant': \"繁体中文\",\n"
+    "            'japanese': \"日本語\",\n"
+    "            'korean': \"한국어\",\n"
+    "            'english': \"English\",\n"
+    "        }\n"
+    "        return _names.get(_code, str(language))\n"
+    "\n"
     "    def _lang_ui_languages():\n"
     "        # 可用语言列表（含默认英文 None）。跨 Ren'Py 版本兼容。\n"
     "        langs = []\n"
-    "        found = False\n"
-    "        for _fn_name in ('known_languages', 'get_languages'):\n"
-    "            _fn = getattr(renpy.translation, _fn_name, None)\n"
-    "            if _fn is None:\n"
+    "        # Ren'Py 8.2 在翻译初始化早期可能让 known_languages() 返回空表；\n"
+    "        # 空表不能视为成功，否则 game/tl/schinese 会被漏掉。\n"
+    "        _providers = (getattr(renpy, 'translation', None), renpy)\n"
+    "        for _provider in _providers:\n"
+    "            if _provider is None:\n"
     "                continue\n"
-    "            try:\n"
-    "                _langs = [_i for _i in _fn() if _i is not None]\n"
-    "            except Exception:\n"
-    "                continue\n"
-    "            langs = sorted(_langs)\n"
-    "            found = True\n"
-    "            break\n"
-    "        if not found:\n"
+    "            for _fn_name in ('known_languages', 'get_languages'):\n"
+    "                _fn = getattr(_provider, _fn_name, None)\n"
+    "                if _fn is None:\n"
+    "                    continue\n"
+    "                try:\n"
+    "                    _langs = [_i for _i in (_fn() or [])\n"
+    "                              if _i is not None and str(_i).lower() != 'none']\n"
+    "                except Exception:\n"
+    "                    continue\n"
+    "                if _langs:\n"
+    "                    langs = list(_langs)\n"
+    "                    break\n"
+    "            if langs:\n"
+    "                break\n"
+    "        if not langs:\n"
     "            import os\n"
     "            _tl_dir = os.path.join(config.gamedir, 'tl')\n"
     "            if os.path.isdir(_tl_dir):\n"
-    "                for _name in sorted(os.listdir(_tl_dir)):\n"
-    "                    if _name.lower() != 'none' and os.path.isdir(\n"
-    "                            os.path.join(_tl_dir, _name)):\n"
+    "                for _name in sorted(os.listdir(_tl_dir), key=str.lower):\n"
+    "                    if (_name.lower() != 'none' and\n"
+    "                            os.path.isdir(os.path.join(_tl_dir, _name))):\n"
     "                        langs.append(_name)\n"
-    "        return [None] + langs\n"
+    "        _seen = set()\n"
+    "        _unique = []\n"
+    "        for _name in langs:\n"
+    "            _key = str(_name).lower()\n"
+    "            if _key not in _seen:\n"
+    "                _seen.add(_key)\n"
+    "                _unique.append(_name)\n"
+    "        return [None] + sorted(_unique, key=lambda _x: str(_x).lower())\n"
     "\n"
     "    def _lang_ui_switch(language):\n"
     "        # 老版 Ren'Py 无 Preference('language')，直接切换语言。\n"
@@ -840,6 +880,38 @@ def _extract_screen_block(text: str, screen_name: str) -> str | None:
             break
         block.append(line)
     return "".join(block)
+
+
+def _raise_preferences_priority(block: str) -> str:
+    """Make an injected preferences screen win over archived definitions.
+
+    Ren'Py's stock screens are commonly declared at ``init -501``. Keeping
+    that priority in a loose patch is order-dependent when the original screen
+    remains inside an RPA archive, so normalize the first screen header to a
+    later priority while preserving its signature and line ending.
+    """
+    lines = block.splitlines(keepends=True)
+    if not lines:
+        return block
+    first = lines[0]
+    if first.endswith("\r\n"):
+        first_body, line_end = first[:-2], "\r\n"
+    elif first.endswith("\n"):
+        first_body, line_end = first[:-1], "\n"
+    else:
+        first_body, line_end = first, ""
+    match = re.match(
+        r"^(?P<indent>[ \t]*)(?:(?:init[ \t]+[+-]?\d+[ \t]+)?"
+        r"screen[ \t]+preferences\b)(?P<tail>.*)$",
+        first_body,
+    )
+    if match is None:
+        return block
+    lines[0] = (
+        f"{match.group('indent')}init {_LANGUAGE_UI_PRIORITY} "
+        f"screen preferences{match.group('tail')}{line_end}"
+    )
+    return "".join(lines)
 
 
 def _has_language_ui(game_dir: Path, language: str = "schinese") -> bool:
@@ -1011,7 +1083,7 @@ def _build_language_ui(source_text: str, with_font: bool = False,
         return None
     if _LANG_UI_MARKER in block:
         return None  # 已注入
-    out = block.rstrip() + "\n" + _LANG_UI_SNIPPET
+    out = _raise_preferences_priority(block).rstrip() + "\n" + _LANG_UI_SNIPPET
     if with_font:
         out = _apply_font_ui(out, language)
     return out + _LANG_UI_HELPER
@@ -1035,7 +1107,7 @@ def apply_language_ui(game_dir: Path, language: str = "schinese",
             res.ok = False
             res.message = "无法定位 preferences 屏幕块，跳过设置界面注入"
             return
-        body = block.rstrip() + "\n"
+        body = _raise_preferences_priority(block).rstrip() + "\n"
         if with_lang:
             body += _LANG_UI_SNIPPET
         # 字体选项仅在字体补丁确实就位时注入——否则屏幕会引用未定义的
@@ -1089,9 +1161,14 @@ def apply_language_ui(game_dir: Path, language: str = "schinese",
             # 不能只有标记没有按钮——历史上出现过「_has_language_ui 误判
             # 游戏已有语言界面 → 重注入时只写字体段」的坏文件：语言标记
             # 还在（helper 里），但语言列表按钮整个没了。判定「已注入」必须
-            # 看实际按钮代码（_lang_ui_label 只出现在语言段的按钮行里）。
+            # 看实际按钮代码，并要求覆盖屏幕使用较高 init 优先级。
+            # 兼容旧补丁中的 `_lang_ui_label` 与新补丁的直接显示名调用。
             sane = (_count_screen_defs(text, "preferences") == 1
-                    and "_lang_ui_label" in text)
+                    and ("_lang_ui_label" in text or
+                         "_lang_ui_display_name" in text)
+                    and re.search(
+                        r"(?m)^\s*init\s+1000\s+screen\s+preferences\b",
+                        text) is not None)
             if sane and (_FONT_UI_MARKER in text) == want_font:
                 res.ok = True
                 res.skip = True
