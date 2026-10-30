@@ -69,10 +69,10 @@ _SKIP_DIRS = {"tl", "renpy", "cache", "saves", "log", "errors",
 _PREF_SCREEN_RE = re.compile(
     r"(?m)^ *(?:init\s+[+-]?\d+\s+)?screen\s+preferences\b")
 
-# Game templates commonly put preferences at init -501. If the archive and
-# the loose patch use the same priority, Ren'Py may let the archive definition
-# win depending on load order. Use a clearly later priority for the override.
-_LANGUAGE_UI_PRIORITY = 1000
+# Game templates commonly put preferences at init -501. Ren'Py reserves
+# priorities outside -999..999 for internal use, so use the highest supported
+# project priority for the loose override.
+_LANGUAGE_UI_PRIORITY = 999
 
 
 def _read_u16(data: bytes, off: int) -> int:
@@ -525,16 +525,138 @@ def apply_font_patch(game_dir: Path) -> PatchResult:
 _LANG_UI_MARKER = "# ===== 语言切换（汉化工具自动生成） ====="
 
 _LANG_UI_SNIPPET = (
-    "        " + _LANG_UI_MARKER + "\n"
-    "        vbox:\n"
-    '            style_prefix "radio"\n'
-    '            label _("Language")\n'
-    "            $ _lang_ui_names = _lang_ui_languages()\n"
-    "            for _lang_ui_i in _lang_ui_names:\n"
-    "                textbutton _lang_ui_display_name(_lang_ui_i) selected "
+    _LANG_UI_MARKER + "\n"
+    "hbox:\n"
+    '    style_prefix "radio"\n'
+    "    box_wrap True\n"
+    '    label _("Language")\n'
+    "    $ _lang_ui_names = _lang_ui_languages()\n"
+    "    for _lang_ui_i in _lang_ui_names:\n"
+    "        textbutton _lang_ui_display_name(_lang_ui_i) selected "
     "(_preferences.language == _lang_ui_i) action "
     "Function(_lang_ui_switch, _lang_ui_i) style \"radio_button\"\n"
 )
+
+
+def _find_direct_child_vbox(lines: list[str], start: int,
+                            parent_indent: int) -> tuple[int | None, int]:
+    """Find a vbox directly inside a screen/use block, skipping comments."""
+    child_indent = parent_indent + 4
+    for i in range(start, len(lines)):
+        body = lines[i].rstrip("\r\n")
+        stripped = body.strip()
+        if not stripped:
+            continue
+        indent = len(body) - len(body.lstrip(" \t"))
+        if indent <= parent_indent:
+            break
+        if stripped.startswith("#"):
+            continue
+        if indent != child_indent:
+            continue
+        if re.match(r"^[ \t]*vbox\s*:\s*(?:#.*)?$", body):
+            return i, indent
+    return None, child_indent
+
+
+def _first_direct_child(lines: list[str], start: int,
+                        parent_indent: int) -> int | None:
+    """Return the first nonblank direct child line, including comments."""
+    child_indent = parent_indent + 4
+    for i in range(start, len(lines)):
+        body = lines[i].rstrip("\r\n")
+        if not body.strip():
+            continue
+        indent = len(body) - len(body.lstrip(" \t"))
+        if indent <= parent_indent:
+            break
+        if indent == child_indent:
+            return i
+    return None
+
+
+def _insert_language_ui(block: str) -> str:
+    """Place the language row at the top of the preferences content.
+
+    Appending it after the stock sliders can put it below a game's fixed-height
+    menu viewport, where it compiles successfully but is never visible.
+    """
+    lines = block.splitlines(keepends=True)
+    use_index = None
+    root_vbox_index = None
+    indent = 4
+    line_end = "\n"
+    for i, line in enumerate(lines):
+        body = line.rstrip("\r\n")
+        match = re.match(r"^(?P<indent>[ \t]*)use\s+game_menu\b", body)
+        if not match or not body.rstrip().endswith(":"):
+            continue
+        use_index = i
+        use_indent = len(match.group("indent"))
+        indent = use_indent + 4
+        line_end = "\r\n" if line.endswith("\r\n") else "\n"
+        root_vbox_index, root_indent = _find_direct_child_vbox(
+            lines, i + 1, use_indent)
+        if root_vbox_index is not None:
+            indent = root_indent + 4
+        break
+
+    if use_index is None:
+        for line in lines[:1]:
+            match = re.match(r"^(?P<indent>[ \t]*)(?:init\s+-?\d+\s+)?screen\b", line)
+            if match:
+                indent = len(match.group("indent")) + 4
+                break
+
+    injected = "".join(
+        (" " * indent + line if line else "") + line_end
+        for line in _LANG_UI_SNIPPET.splitlines()
+    )
+    if root_vbox_index is None:
+        root_vbox_index = use_index
+    if use_index is None:
+        return block.rstrip("\r\n") + line_end + injected
+    lines.insert(root_vbox_index + 1, injected)
+    return "".join(lines)
+
+
+def _append_to_preferences_vbox(block: str, snippet: str) -> str:
+    """Append a generated section inside the root vbox transcluded by game_menu."""
+    lines = block.splitlines(keepends=True)
+    use_index = None
+    root_vbox_index = None
+    child_indent = 4
+    line_end = "\n"
+    for i, line in enumerate(lines):
+        body = line.rstrip("\r\n")
+        match = re.match(r"^(?P<indent>[ \t]*)use\s+game_menu\b", body)
+        if not match or not body.rstrip().endswith(":"):
+            continue
+        use_index = i
+        use_indent = len(match.group("indent"))
+        child_indent = use_indent + 4
+        line_end = "\r\n" if line.endswith("\r\n") else "\n"
+        root_vbox_index, root_indent = _find_direct_child_vbox(
+            lines, i + 1, use_indent)
+        if root_vbox_index is not None:
+            child_indent = root_indent + 4
+        break
+    if root_vbox_index is None and use_index is None and lines:
+        match = re.match(
+            r"^(?P<indent>[ \t]*)(?:init\s+-?\d+\s+)?screen\b", lines[0])
+        if match:
+            screen_indent = len(match.group("indent"))
+            child_indent = screen_indent + 4
+            root_vbox_index, root_indent = _find_direct_child_vbox(
+                lines, 1, screen_indent)
+            if root_vbox_index is not None:
+                child_indent = root_indent + 4
+    injected = "".join(
+        (" " * child_indent + line if line else "") + line_end
+        for line in snippet.splitlines()
+    )
+    lines.append(injected)
+    return "".join(lines)
 
 # 字体选项（设置界面）：单选「汉化默认字体 / 微软雅黑」。
 # _zz_font_select / _zz_font_choices 定义在 zz_cn_font.rpy。为避免「字体补丁
@@ -651,21 +773,21 @@ def _apply_font_ui(block: str, language: str) -> str:
         lines[end + 1:end + 1] = _font_list_entries(indent, style_suffix)
         return "\n".join(lines) + "\n"
     # 无原生字体列表：自有「字体」段，仅在当前语言 == 汉化语言时显示
-    return block.rstrip("\n") + "\n" + (
-        "        " + _FONT_UI_MARKER + "\n"
-        f"        if _preferences.language == {language!r}:\n"
-        "            vbox:\n"
-        '                style_prefix "radio"\n'
-        '                label _("Font")\n'
-        "                if _zz_font_choices:\n"
-        "                    textbutton \"汉化默认字体\" selected "
+    return _append_to_preferences_vbox(block, (
+        _FONT_UI_MARKER + "\n"
+        f"if _preferences.language == {language!r}:\n"
+        "    vbox:\n"
+        '        style_prefix "radio"\n'
+        '        label _("Font")\n'
+        "        if _zz_font_choices:\n"
+        "            textbutton \"汉化默认字体\" selected "
         "(persistent._zz_font_choice != 'yahei') action "
         "Function(_zz_font_select, 'cjk') style \"radio_button\"\n"
-        "                    if 'yahei' in _zz_font_choices:\n"
-        "                        textbutton \"微软雅黑\" selected "
+        "        if 'yahei' in _zz_font_choices:\n"
+        "            textbutton \"微软雅黑\" selected "
         "(persistent._zz_font_choice == 'yahei') action "
         "Function(_zz_font_select, 'yahei') style \"radio_button\"\n"
-    )
+    ))
 
 
 def _font_ui_available(game_dir: Path) -> bool:
@@ -743,14 +865,16 @@ _LANG_UI_HELPER = (
     "                    break\n"
     "            if langs:\n"
     "                break\n"
-    "        if not langs:\n"
-    "            import os\n"
-    "            _tl_dir = os.path.join(config.gamedir, 'tl')\n"
-    "            if os.path.isdir(_tl_dir):\n"
-    "                for _name in sorted(os.listdir(_tl_dir), key=str.lower):\n"
-    "                    if (_name.lower() != 'none' and\n"
-    "                            os.path.isdir(os.path.join(_tl_dir, _name))):\n"
-    "                        langs.append(_name)\n"
+    "        # API results may be incomplete during startup; union them with\n"
+    "        # installed tl/<language> folders so every generated language\n"
+    "        # remains selectable even when Ren'Py returns a partial list.\n"
+    "        import os\n"
+    "        _tl_dir = os.path.join(config.gamedir, 'tl')\n"
+    "        if os.path.isdir(_tl_dir):\n"
+    "            for _name in sorted(os.listdir(_tl_dir), key=str.lower):\n"
+    "                if (_name.lower() != 'none' and\n"
+    "                        os.path.isdir(os.path.join(_tl_dir, _name))):\n"
+    "                    langs.append(_name)\n"
     "        _seen = set()\n"
     "        _unique = []\n"
     "        for _name in langs:\n"
@@ -763,6 +887,23 @@ _LANG_UI_HELPER = (
     "    def _lang_ui_switch(language):\n"
     "        # 老版 Ren'Py 无 Preference('language')，直接切换语言。\n"
     "        renpy.change_language(language)\n"
+    "\n"
+    "init python:\n"
+    "    if 'zz_language_ui_overlay' not in config.overlay_screens:\n"
+    "        config.overlay_screens.append('zz_language_ui_overlay')\n"
+    "\n"
+    "screen zz_language_ui_overlay():\n"
+    "    zorder 100\n"
+    "    if renpy.get_screen('preferences') is not None:\n"
+    "        hbox:\n"
+    "            xalign 0.5\n"
+    "            yalign 0.17\n"
+    "            spacing 12\n"
+    "            style_prefix 'radio'\n"
+    "            label _('Language')\n"
+    "            $ _zz_lang_overlay_names = _lang_ui_languages()\n"
+    "            for _zz_lang_overlay_i in _zz_lang_overlay_names:\n"
+    "                textbutton _lang_ui_display_name(_zz_lang_overlay_i) selected (_preferences.language == _zz_lang_overlay_i) action Function(_lang_ui_switch, _zz_lang_overlay_i) style 'radio_button'\n"
 )
 
 # 各语言语言码对应的「Ren'Py 语言显示名 → 中文显示名」
@@ -1071,9 +1212,42 @@ def _count_screen_defs(text: str, name: str) -> int:
     return sum(1 for ln in text.splitlines() if pat.match(ln))
 
 
+def _language_ui_is_top_aligned(text: str) -> bool:
+    """旧语言区若排在固定高度菜单内容之后，视为需要迁移重建。"""
+    block = _extract_screen_block(text, "preferences")
+    if block is None:
+        return False
+    lines = block.splitlines()
+    use_index = next((i for i, line in enumerate(lines)
+                      if re.match(r"^[ \t]*use\s+game_menu\b.*:\s*(?:#.*)?$",
+                                  line)), None)
+    if use_index is None:
+        return True
+    marker_index = next((i for i, line in enumerate(lines)
+                         if line.strip() == _LANG_UI_MARKER), None)
+    if marker_index is None:
+        return False
+    use_match = re.match(r"^([ \t]*)use\s+game_menu\b", lines[use_index])
+    if use_match is None:
+        return False
+    use_indent = len(use_match.group(1))
+    root_vbox_index, root_indent = _find_direct_child_vbox(
+        lines, use_index + 1, use_indent)
+    if root_vbox_index is not None:
+        first_child = _first_direct_child(
+            lines, root_vbox_index + 1, root_indent)
+        return (first_child == marker_index
+                and len(lines[marker_index]) -
+                len(lines[marker_index].lstrip(" \t")) == root_indent + 4)
+    first_child = _first_direct_child(lines, use_index + 1, use_indent)
+    return (first_child == marker_index
+            and len(lines[marker_index]) -
+            len(lines[marker_index].lstrip(" \t")) == use_indent + 4)
+
+
 def _build_language_ui(source_text: str, with_font: bool = False,
                       language: str = "schinese") -> str | None:
-    """在 preferences 屏幕块末尾注入语言选择器（及可选的字体选项）。
+    """在 preferences 内容顶部注入语言选择器（及可选的字体选项）。
 
     返回新的整个屏幕定义；屏幕块已注入过或定位不到时返回 None。
     字体选项优先追加进游戏的**原生字体列表**（避免出现两个 Font 段）。
@@ -1083,7 +1257,7 @@ def _build_language_ui(source_text: str, with_font: bool = False,
         return None
     if _LANG_UI_MARKER in block:
         return None  # 已注入
-    out = _raise_preferences_priority(block).rstrip() + "\n" + _LANG_UI_SNIPPET
+    out = _insert_language_ui(_raise_preferences_priority(block))
     if with_font:
         out = _apply_font_ui(out, language)
     return out + _LANG_UI_HELPER
@@ -1107,9 +1281,9 @@ def apply_language_ui(game_dir: Path, language: str = "schinese",
             res.ok = False
             res.message = "无法定位 preferences 屏幕块，跳过设置界面注入"
             return
-        body = _raise_preferences_priority(block).rstrip() + "\n"
+        body = _raise_preferences_priority(block)
         if with_lang:
-            body += _LANG_UI_SNIPPET
+            body = _insert_language_ui(body)
         # 字体选项仅在字体补丁确实就位时注入——否则屏幕会引用未定义的
         # _zz_font_choices / _zz_font_select（虽然 helper 有兜底空表，
         # 但缺补丁时字体选项本身也没有意义）。
@@ -1167,8 +1341,9 @@ def apply_language_ui(game_dir: Path, language: str = "schinese",
                     and ("_lang_ui_label" in text or
                          "_lang_ui_display_name" in text)
                     and re.search(
-                        r"(?m)^\s*init\s+1000\s+screen\s+preferences\b",
-                        text) is not None)
+                        rf"(?m)^\s*init\s+{_LANGUAGE_UI_PRIORITY}\s+screen\s+preferences\b",
+                        text) is not None
+                    and _language_ui_is_top_aligned(text))
             if sane and (_FONT_UI_MARKER in text) == want_font:
                 res.ok = True
                 res.skip = True
@@ -1178,7 +1353,7 @@ def apply_language_ui(game_dir: Path, language: str = "schinese",
             _inject(with_lang=True)
             if res.ok:
                 if not sane:
-                    res.message = "设置界面补丁结构异常（屏幕被重复写入），已重建"
+                    res.message = "设置界面补丁结构或布局异常，已重建"
                 else:
                     res.message = ("已为现有设置界面补上字体选项" if want_font
                                    else "已移除失效的字体选项（字体补丁缺失）")
