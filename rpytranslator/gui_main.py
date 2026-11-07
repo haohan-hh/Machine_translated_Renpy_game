@@ -35,6 +35,7 @@ from . import __version__ as PKG_VERSION
 from . import engine
 from .connection import (
     endpoint_parts,
+    ensure_ollama_service,
     is_local_endpoint,
     wait_for_model_registration,
     wait_for_tcp,
@@ -889,6 +890,16 @@ class GuiApp(XamlApplication):
         try:
             _scheme, host, port = endpoint_parts(config.base_url)
 
+            # The tray UI may be open while its API child is absent (common
+            # after moving OLLAMA_MODELS to another drive). Start the managed
+            # local service here so users do not have to run the CMD wrapper.
+            if is_local_endpoint(config.base_url) and port == 11434:
+                self.msg_q.put("正在检查 Ollama 服务；未启动时会自动启动…")
+                ready, detail = ensure_ollama_service(config.base_url)
+                if not ready:
+                    self.msg_q.put("TEST_ERR|%s" % detail)
+                    return
+
             # DNS 解析本身没有可移植的超时参数，放到守护线程中并由
             # join(15s) 兜底，避免某个坏 DNS 服务器冻结 GUI worker。
             resolved: list = []
@@ -1033,6 +1044,13 @@ class GuiApp(XamlApplication):
         pause_event=None,
     ) -> None:
         try:
+            _scheme, _host, port = endpoint_parts(config.base_url)
+            if is_local_endpoint(config.base_url) and port == 11434:
+                self.msg_q.put("正在检查 Ollama 服务；未启动时会自动启动…")
+                ready, detail = ensure_ollama_service(config.base_url)
+                if not ready:
+                    self.msg_q.put("RESULT_ERR|%s" % detail)
+                    return
             result = run_pipeline(
                 game_path=game_dir or "",
                 config=config,

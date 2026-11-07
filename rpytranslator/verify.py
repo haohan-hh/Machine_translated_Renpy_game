@@ -38,6 +38,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,14 @@ from .patcher import PatchResult
 # 运行时验证补丁文件名（game 根目录；zz_ 前缀是工具自动生成的约定，
 # engine 扫描 / 更新脚本时会跳过）
 RUNTIME_PATCH_NAME = "zz_verify_translations.rpy"
+# Language-switch probe files are separate from the dialogue-missing checker.
+# The probe uses Ren'Py's public change_language/translate_string APIs and
+# writes a report after the game starts, without changing game content.
+LANGUAGE_SWITCH_PATCH_NAME = "zz_language_switch_check.rpy"
+LANGUAGE_SWITCH_PROBE_FILE_NAME = "zz_language_switch_probe.rpy"
+LANGUAGE_SWITCH_REPORT_TEMPLATE = "{lang}.语言切换验证报告.txt"
+LANGUAGE_SWITCH_PROBE_TEXT = "__RPYTRANSLATOR_LANGUAGE_SWITCH_PROBE__"
+LANGUAGE_SWITCH_PROBE_TRANSLATION = "语言切换验证成功"
 # 运行时缺失报告文件名（放 tl/ 下，随汉化产物一起管理）
 RUNTIME_REPORT_TEMPLATE = "{lang}.运行时缺失报告.txt"
 # 自动修复补丁文件名（tl/<语言>/ 下）
@@ -93,7 +102,7 @@ def is_noise_text(what: str | None) -> bool:
 # 运行时验证补丁
 # ---------------------------------------------------------------------------
 
-# 内嵌的 Ren'Py 脚本（init 2000）。__LANG__ 在生成时替换为目标语言。
+# 内嵌的 Ren'Py 脚本（init 999）。__LANG__ 在生成时替换为目标语言。
 # 兼容 Ren'Py 7.4+ / 8.x：8.x 的翻译注册表位于
 #   renpy.game.script.translator (ScriptTranslator)
 # 7.x 早期版本位于 renpy.game.script.translations；脚本对两者做探测回退。
@@ -101,7 +110,7 @@ _RUNTIME_PATCH = r'''# -*- coding: utf-8 -*-
 # 运行时翻译缺失诊断（汉化工具自动生成，可安全删除）。
 # 游戏启动时比对 Ren'Py 对话翻译注册表，把运行时实际缺少 __LANG__ 翻译的
 # 对话写入 tl/__LANG__.运行时缺失报告.txt；再次运行汉化工具可据此自动补译。
-init 2000 python:
+init 999 python:
     import io as _vv_io
     import os as _vv_os
     _vv_lang = '__LANG__'
@@ -195,6 +204,300 @@ def write_verification_patch(game_dir: Path, language: str = "schinese",
     res.message = "已注入运行时翻译验证补丁（游戏启动时自动检查漏译）"
     if log_cb:
         log_cb("  ✓ " + res.message)
+        log_cb("    - " + res.detail)
+    return res
+
+
+# This script is intentionally generated instead of importing application
+# internals. It exercises the same public language-switch API as the screen
+# action and avoids depending on Ren'Py's private translation registries.
+_LANGUAGE_SWITCH_PATCH = r'''# -*- coding: utf-8 -*-
+# 语言切换链路验证（汉化工具自动生成，可安全删除）。
+# 打开设置屏幕后被 timer 调用；不主动切换语言，只观察用户选择后
+# 的偏好状态，并用 Ren'Py 官方 API 验证目标语言的探针译文。
+init 999 python:
+    import io as _ls_io
+    import os as _ls_os
+    _ls_lang = __LANG_REPR__
+    _ls_probe = __PROBE_REPR__
+    _ls_screen_names = __SCREEN_NAMES__
+    _ls_path = _ls_os.path.join(
+        config.gamedir, 'tl', _ls_lang + '.语言切换验证报告.txt')
+    _ls_ui_path = _ls_os.path.join(config.gamedir, 'zz_language_ui.rpy')
+    _ls_ui_signature = __UI_SIGNATURE__
+    _ls_state = {'language': '__rpytranslator_unset__', 'last_report': None,
+                 'passed': False, 'ui_action': None, 'known_languages': None,
+                 'requested': None, 'selection_ticks': 0}
+
+    def _ls_current_language():
+        try:
+            return getattr(_preferences, 'language', None)
+        except Exception:
+            try:
+                return getattr(renpy.game.preferences, 'language', None)
+            except Exception:
+                return None
+
+    def _ls_known_languages():
+        if _ls_state['known_languages'] is not None:
+            return _ls_state['known_languages']
+        _ls_values = []
+        _ls_api = False
+        for _ls_provider in (getattr(renpy, 'translation', None), renpy):
+            if _ls_provider is None:
+                continue
+            for _ls_name in ('known_languages', 'get_languages'):
+                _ls_fn = getattr(_ls_provider, _ls_name, None)
+                if _ls_fn is None:
+                    continue
+                try:
+                    _ls_values.extend(list(_ls_fn() or []))
+                    _ls_api = True
+                except Exception:
+                    continue
+        try:
+            _ls_tl = _ls_os.path.join(config.gamedir, 'tl')
+            if _ls_os.path.isdir(_ls_tl):
+                for _ls_name in _ls_os.listdir(_ls_tl):
+                    _ls_path_candidate = _ls_os.path.join(_ls_tl, _ls_name)
+                    if _ls_os.path.isdir(_ls_path_candidate):
+                        _ls_values.append(_ls_name)
+        except Exception:
+            pass
+        _ls_unique = []
+        for _ls_value in _ls_values:
+            if _ls_value is None:
+                continue
+            _ls_name = str(_ls_value)
+            if _ls_name and _ls_name.lower() != 'none' and _ls_name not in _ls_unique:
+                _ls_unique.append(_ls_name)
+        _ls_result = (_ls_unique, (_ls_api or bool(_ls_unique)))
+        _ls_state['known_languages'] = _ls_result
+        return _ls_result
+
+    def _ls_write(_ls_status, _ls_before, _ls_after, _ls_translated,
+                  _ls_active_translated, _ls_known, _ls_visible_screens,
+                  _ls_ui_action, _ls_requested, _ls_error=''):
+        try:
+            _ls_dir = _ls_os.path.dirname(_ls_path)
+            if not _ls_os.path.isdir(_ls_dir):
+                _ls_os.makedirs(_ls_dir)
+            with _ls_io.open(_ls_path, 'w', encoding='utf-8') as _ls_f:
+                _ls_f.write('status: %s\n' % _ls_status)
+                _ls_f.write('target_language: %s\n' % _ls_lang)
+                _ls_f.write('known_languages: %r\n' % (_ls_known,))
+                _ls_f.write('language_before: %r\n' % (_ls_before,))
+                _ls_f.write('language_after_switch: %r\n' % (_ls_after,))
+                _ls_f.write('probe_translation_target: %r\n' % (_ls_translated,))
+                _ls_f.write('probe_translation_active: %r\n' %
+                            (_ls_active_translated,))
+                _ls_f.write('preferences_screen_visible: %r\n' %
+                            (bool(_ls_visible_screens),))
+                _ls_f.write('visible_settings_screens: %r\n' %
+                            (_ls_visible_screens,))
+                _ls_f.write('ui_language_action_present: %r\n' % (_ls_ui_action,))
+                _ls_f.write('button_requested_language: %r\n' % (_ls_requested,))
+                _ls_f.write('ui_click_simulated: False\n')
+                _ls_f.write('ui_signature: %s\n' % _ls_ui_signature)
+                _ls_f.write('check_scope: records a requested UI language and verifies the active preference and probe translation\n')
+                if _ls_error:
+                    _ls_f.write('error: %s\n' % _ls_error)
+            return True
+        except Exception as _ls_exc:
+            try:
+                renpy.log('Language-switch verification report could not be written: %r' %
+                          (_ls_exc,))
+            except Exception:
+                pass
+            return False
+
+    def _ls_observe_language_switch():
+        if _ls_state['passed']:
+            return
+        _ls_current = _ls_current_language()
+        _ls_previous = _ls_state['language']
+        try:
+            _ls_requested = _rpytranslator_requested_language
+        except Exception:
+            _ls_requested = None
+        _ls_previous_requested = _ls_state['requested']
+        if (_ls_previous != '__rpytranslator_unset__' and
+                _ls_previous == _ls_current and
+                _ls_previous_requested == _ls_requested and
+                not (_ls_requested == _ls_lang and _ls_current != _ls_lang) and
+                _ls_state['last_report'] is not None and
+                _ls_state['last_report'][0] in ('READY', 'PASS')):
+            return
+        _ls_state['language'] = _ls_current
+        _ls_state['requested'] = _ls_requested
+        _ls_translated = None
+        _ls_active_translated = None
+        _ls_known, _ls_known_api = _ls_known_languages()
+        _ls_visible_screens = []
+        _ls_ui_action = _ls_state['ui_action']
+        _ls_error = ''
+        try:
+            for _ls_name in _ls_screen_names:
+                try:
+                    if renpy.get_screen(_ls_name):
+                        _ls_visible_screens.append(_ls_name)
+                except Exception:
+                    pass
+            if _ls_ui_action is None:
+                try:
+                    with _ls_io.open(_ls_ui_path, 'r', encoding='utf-8-sig') as _ls_ui_f:
+                        _ls_ui_source = _ls_ui_f.read()
+                    _ls_ui_action = (
+                        'Language(_lang_ui_i)' in _ls_ui_source and
+                        'Function(_lang_ui_note_selection, _lang_ui_i)' in _ls_ui_source and
+                        'Function(_ls_observe_language_switch)' in _ls_ui_source)
+                except Exception:
+                    _ls_ui_action = False
+                _ls_state['ui_action'] = _ls_ui_action
+            if not _ls_visible_screens or not _ls_ui_action:
+                _ls_error = 'injected preferences screen or Language action is missing'
+            elif not _ls_known_api:
+                _ls_error = 'known_languages API unavailable'
+            elif _ls_lang not in _ls_known:
+                _ls_error = 'target language is not registered'
+            else:
+                # The synthetic strings entry checks that Ren'Py loaded a
+                # real translation in the same language selected by the UI.
+                _ls_translated = renpy.translate_string(
+                    _ls_probe, language=_ls_lang)
+                if _ls_current == _ls_lang:
+                    _ls_active_translated = renpy.translate_string(_ls_probe)
+                if (_ls_translated is None or
+                        _ls_translated == _ls_probe):
+                    _ls_error = 'probe translation is unavailable'
+                elif (_ls_current == _ls_lang and
+                      _ls_active_translated != _ls_translated):
+                    _ls_error = 'active language does not return the target translation'
+        except Exception as _ls_exc:
+            _ls_error = repr(_ls_exc)
+        if _ls_error:
+            _ls_status = 'ERROR' if 'API unavailable' in _ls_error else 'FAIL'
+        elif _ls_state['passed']:
+            _ls_status = 'PASS'
+        elif (_ls_current == _ls_lang and
+              _ls_requested == _ls_lang and
+              _ls_previous != '__rpytranslator_unset__' and
+              _ls_previous != _ls_lang):
+            _ls_status = 'PASS'
+        elif _ls_requested == _ls_lang and _ls_current != _ls_lang:
+            _ls_state['selection_ticks'] += 1
+            if _ls_state['selection_ticks'] >= 4:
+                _ls_status = 'FAIL'
+                _ls_error = 'language button selection did not activate the target language'
+            else:
+                _ls_status = 'READY'
+        else:
+            _ls_state['selection_ticks'] = 0
+            _ls_status = 'READY'
+        _ls_report_key = (_ls_status, _ls_current, _ls_error)
+        if _ls_report_key == _ls_state['last_report']:
+            return
+        if _ls_write(_ls_status, _ls_previous, _ls_current, _ls_translated,
+                     _ls_active_translated, _ls_known, _ls_visible_screens,
+                     _ls_ui_action, _ls_requested, _ls_error):
+            _ls_state['last_report'] = _ls_report_key
+            if _ls_status == 'PASS':
+                _ls_state['passed'] = True
+'''
+
+
+def language_switch_report_path(game_dir: Path, language: str) -> Path:
+    """Return the startup report path for the language-switch probe."""
+    return game_dir / "tl" / LANGUAGE_SWITCH_REPORT_TEMPLATE.format(lang=language)
+
+
+def read_language_switch_report(path: Path) -> dict[str, str]:
+    """Read the last language-switch probe result without trusting its values."""
+    result: dict[str, str] = {}
+    try:
+        for line in Path(path).read_text(
+                encoding="utf-8-sig", errors="ignore").splitlines():
+            key, sep, value = line.partition(":")
+            if sep and key.strip():
+                result[key.strip()] = value.strip()
+    except OSError:
+        return {}
+    return result
+
+
+def write_language_switch_probe(game_dir: Path, language: str = "schinese",
+                                screen_names: list[str] | None = None,
+                                log_cb=None) -> PatchResult:
+    """Install an idempotent runtime probe for the injected language UI.
+
+    The probe translation is deliberately a generated string. A timer in the
+    injected preferences overlay records readiness, then verifies the actual
+    preference change after the player uses the official Language action.
+    This avoids silently switching the language during game startup.
+    """
+    res = PatchResult()
+    game_dir = Path(game_dir)
+    if not re.fullmatch(r"[A-Za-z0-9_]+", str(language)):
+        res.message = "语言切换验证失败：语言代码格式无效"
+        return res
+    patch = game_dir / LANGUAGE_SWITCH_PATCH_NAME
+    tl_dir = game_dir / "tl" / language
+    probe_file = tl_dir / LANGUAGE_SWITCH_PROBE_FILE_NAME
+    ui_patch = game_dir / "zz_language_ui.rpy"
+    try:
+        ui_signature = hashlib.sha256(ui_patch.read_bytes()).hexdigest()[:16]
+    except OSError:
+        ui_signature = "missing"
+    valid_screens = [name for name in (screen_names or ["preferences"])
+                     if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(name))]
+    if not valid_screens:
+        valid_screens = ["preferences"]
+    patch_text = (_LANGUAGE_SWITCH_PATCH
+                  .replace("__LANG_REPR__", repr(language))
+                  .replace("__PROBE_REPR__", repr(LANGUAGE_SWITCH_PROBE_TEXT))
+                  .replace("__SCREEN_NAMES__", repr(valid_screens))
+                  .replace("__UI_SIGNATURE__", repr(ui_signature)))
+    probe_text = (
+        "# 语言切换探针（汉化工具自动生成）\n"
+        f"translate {language} strings:\n"
+        f"    old {LANGUAGE_SWITCH_PROBE_TEXT!r}\n"
+        f"    new {LANGUAGE_SWITCH_PROBE_TRANSLATION!r}\n"
+    )
+    try:
+        patch.parent.mkdir(parents=True, exist_ok=True)
+        tl_dir.mkdir(parents=True, exist_ok=True)
+        patch_changed = (not patch.is_file() or
+                         patch.read_text(encoding="utf-8-sig", errors="ignore")
+                         != patch_text)
+        probe_changed = (not probe_file.is_file() or
+                         probe_file.read_text(encoding="utf-8-sig",
+                                              errors="ignore") != probe_text)
+        if patch_changed:
+            patch.write_text(patch_text, encoding="utf-8-sig")
+            res.files.append(patch)
+        if probe_changed:
+            probe_file.write_text(probe_text, encoding="utf-8-sig")
+            res.files.append(probe_file)
+        if patch_changed or probe_changed:
+            # Do not report a result from an older version of the injected
+            # check as though it validated the new files.
+            try:
+                language_switch_report_path(game_dir, language).unlink()
+            except FileNotFoundError:
+                pass
+    except OSError as exc:
+        res.ok = False
+        res.message = f"写语言切换验证探针失败: {exc}"
+        return res
+    res.ok = True
+    res.skip = not bool(res.files)
+    res.message = ("语言切换验证探针已存在，跳过" if res.skip else
+                   "已注入语言切换自动验证探针")
+    res.detail = (f"在游戏设置中打开语言选项后检查 "
+                  f"{language_switch_report_path(game_dir, language).name}；"
+                  "使用简体中文按钮后会自动记录 PASS/FAIL")
+    if log_cb:
+        log_cb("  " + ("- " if res.skip else "✓ ") + res.message)
         log_cb("    - " + res.detail)
     return res
 

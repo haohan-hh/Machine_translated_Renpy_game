@@ -8,11 +8,20 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
+from pathlib import Path
 import socket
+import subprocess
+import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
+
+
+_OLLAMA_START_LOCK = threading.Lock()
+_OLLAMA_START_PROCESS: subprocess.Popen | None = None
 
 
 def endpoint_parts(base_url: str) -> tuple[str, str, int]:
@@ -41,6 +50,97 @@ def is_local_endpoint(base_url: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _ollama_project_root() -> Path:
+    """Return the folder containing the launcher and bundled dependencies."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def ensure_ollama_service(
+    base_url: str,
+    *,
+    timeout: float = 60.0,
+    launcher: str | os.PathLike[str] | None = None,
+) -> tuple[bool, str]:
+    """Ensure the bundled Ollama server is reachable.
+
+    The desktop Ollama app can be opened without starting its API child when
+    its model directory was moved to another drive.  In that state a normal
+    connection test reports a misleading "service not started" error until
+    ``start_ollama_fixed.cmd`` is run.  For the standard local Ollama endpoint
+    we first probe ``/api/version`` and, only when it is unavailable, launch
+    the repository wrapper with its explicit E: model directory.  Calls are
+    serialized so a test and a translation started together never launch two
+    tray instances.
+    """
+    try:
+        scheme, host, port = endpoint_parts(base_url)
+    except ValueError as exc:
+        return False, str(exc)
+    if not (is_local_endpoint(base_url) and port == 11434):
+        return True, ""
+
+    parsed = urlparse(base_url)
+    version_url = "%s://%s/api/version" % (scheme, parsed.netloc)
+
+    def _version_ready() -> bool:
+        status, _payload, _detail = _json_get(
+            version_url, timeout=min(2.0, max(0.5, timeout)))
+        return status == 200
+
+    if _version_ready():
+        return True, ""
+
+    root = _ollama_project_root()
+    script = Path(launcher) if launcher else root / "start_ollama_fixed.cmd"
+    if not script.is_absolute():
+        script = root / script
+    if not script.exists():
+        return False, "Ollama 启动脚本不存在: %s" % script
+
+    global _OLLAMA_START_PROCESS
+    with _OLLAMA_START_LOCK:
+        # Keep the lock until readiness resolves. A connection test and a
+        # translation can enter together while the first launch is still
+        # starting; releasing the lock immediately after Popen would let both
+        # launch a tray app before either /api/version check succeeds.
+        if _version_ready():
+            return True, ""
+        try:
+            env = os.environ.copy()
+            env.update({
+                "OLLAMA_HOST": "127.0.0.1:11434",
+                "OLLAMA_NO_CLOUD": "1",
+                "OLLAMA_MODELS": str(root / "_dependencies"
+                                    / "ollama_user_data_live" / "models"),
+            })
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            _OLLAMA_START_PROCESS = subprocess.Popen(
+                ["cmd.exe", "/d", "/c", str(script)],
+                cwd=str(root), env=env, creationflags=creationflags,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            return False, "无法启动 Ollama: %s" % exc
+
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if _version_ready():
+                return True, ""
+            if time.monotonic() >= deadline:
+                process = _OLLAMA_START_PROCESS
+                code = process.poll() if process is not None else None
+                suffix = ("（启动脚本退出码 %s）" % code
+                          if code not in (None, 0) else "")
+                return False, "Ollama 服务未在 %.0f 秒内就绪%s" % (
+                    timeout, suffix)
+            time.sleep(0.5)
 
 
 def wait_for_tcp(

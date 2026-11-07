@@ -22,6 +22,8 @@ from .extract import (
 )
 from .verify import (
     build_missing_fix, runtime_report_path, write_verification_patch,
+    language_switch_report_path, read_language_switch_report,
+    write_language_switch_probe,
 )
 from .generator import write_translation_files
 from .housekeeping import dedupe_translate_blocks, remove_stale_rpyc
@@ -64,6 +66,44 @@ class PipelineResult:
     audit: object | None = None   # AuditSummary（补漏查缺结果）
     message: str = ""
     errors: list[str] = field(default_factory=list)
+
+
+def _install_language_switch_probe(result: PipelineResult, game_dir: Path,
+                                   language: str, log) -> None:
+    """Add a runtime check when our generated settings screen is installed."""
+    ui_patch = Path(game_dir) / "zz_language_ui.rpy"
+    try:
+        ui_source = ui_patch.read_text(encoding="utf-8-sig", errors="ignore")
+    except OSError:
+        ui_source = ""
+    required = (
+        "Language(_lang_ui_i)" in ui_source and
+        "Function(_lang_ui_note_selection, _lang_ui_i)" in ui_source and
+        "timer 0.25 repeat True action Function(_ls_observe_language_switch)" in ui_source and
+        "Function(_ls_observe_language_switch)" in ui_source
+    )
+    if not required:
+        log("未检测到工具生成的语言切换界面，跳过其运行时验证")
+        return
+    screen_names = re.findall(
+        r"(?m)^\s*init\s+999\s+screen\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+        ui_source)
+    probe_result = write_language_switch_probe(
+        game_dir, language, screen_names=screen_names, log_cb=log)
+    result.post_patches.append(probe_result)
+    if not probe_result.ok:
+        log("语言切换验证探针安装失败: %s" % probe_result.message)
+        result.errors.append(probe_result.message)
+        return
+    report = read_language_switch_report(
+        language_switch_report_path(game_dir, language))
+    status = report.get("status")
+    if status == "PASS":
+        log("上次语言切换检测已通过")
+    elif status == "READY":
+        log("语言切换界面已就绪；在游戏设置中选择简体中文后会自动验证切换结果")
+    elif status in {"FAIL", "ERROR"}:
+        log("上次语言切换检测未通过: %s" % report.get("error", status))
 
 
 def _dedupe_by_text(units) -> tuple[list, dict[str, list[int]]]:
@@ -741,9 +781,26 @@ def run_pipeline(
                 result.removed_rpyc = removed_rpyc
                 # 仍可能“运行时缺翻译”（提取覆盖不到的对话，表现为部分英文），
                 # 因此继续做运行时验证 / 按运行时 identifier 自动补译。
+                if apply_font_patch or apply_language_ui:
+                    result.post_patches.extend(apply_all(
+                        info.game_dir, language=language,
+                        with_font=apply_font_patch,
+                        with_language_ui=apply_language_ui,
+                    ))
+                    for pr in result.post_patches:
+                        if not pr.ok:
+                            log(f"  ! {pr.message}")
+                            result.errors.append(pr.message)
+                        elif pr.skip:
+                            log(f"  - {pr.message}")
+                        else:
+                            log(f"  ✓ {pr.message}")
                 if apply_verification:
                     result.post_patches.append(
                         write_verification_patch(info.game_dir, language, log_cb=log))
+                if apply_language_ui:
+                    _install_language_switch_probe(
+                        result, info.game_dir, language, log)
                 if runtime_report_path(info.game_dir, language).is_file():
                     log("检测到运行时缺失报告（游戏内仍有对话缺少翻译），"
                         "正在按运行时 identifier 自动补译…")
@@ -764,6 +821,12 @@ def run_pipeline(
                     result.message = "\n".join(lines)
                     return result
                 result.message = f"汉化已是最新：tl/{zh} 已覆盖当前版本全部文本{extra}"
+                patch_messages = [
+                    p.message for p in result.post_patches
+                    if p.ok and not p.skip and p.message
+                ]
+                if patch_messages:
+                    result.message += "\n" + "\n".join(patch_messages)
                 result.ok = True
                 return result
             # stale_ids 非空：提取出的 identifier 与现有 tl 不一致（提取器
@@ -1037,6 +1100,8 @@ def run_pipeline(
     if apply_verification:
         result.post_patches.append(
             write_verification_patch(info.game_dir, language, log_cb=log))
+    if apply_language_ui:
+        _install_language_switch_probe(result, info.game_dir, language, log)
     if runtime_report_path(info.game_dir, language).is_file():
         result.post_patches.append(build_missing_fix(
             info.game_dir, language, client=client,

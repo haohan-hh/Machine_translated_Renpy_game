@@ -213,6 +213,37 @@ def copy_system_cjk_font(game_dir: Path) -> Path | None:
     """从系统复制一个中文字体到 game/fonts/，返回目标路径。"""
     key = "windows" if os.name == "nt" else sys.platform
     candidates = list(_SYSTEM_FONTS.get(key, []))
+    if key == "windows":
+        # Prefer the font selected for this user's Windows interface. LOGFONTW
+        # stores lfFaceName after the 28-byte numeric header; the system Fonts
+        # registry maps the localized face name to its installed font file.
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Control Panel\Desktop\WindowMetrics") as metrics:
+                raw, _kind = winreg.QueryValueEx(metrics, "MessageFont")
+            face = raw[28:92].decode("utf-16-le", errors="ignore").split("\0", 1)[0].strip()
+            if face:
+                with winreg.OpenKey(
+                        winreg.HKEY_LOCAL_MACHINE,
+                        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts") as fonts:
+                    preferred = []
+                    for index in range(winreg.QueryInfoKey(fonts)[1]):
+                        name, filename, _kind = winreg.EnumValue(fonts, index)
+                        if face.casefold() in name.casefold():
+                            path = str(Path(os.environ.get("WINDIR", r"C:\Windows"))
+                                       / "Fonts" / filename)
+                            variant = name.casefold()
+                            is_variant = any(tag in variant for tag in (
+                                " bold", " light", " italic", " semibold",
+                                " black", " condensed"))
+                            preferred.append((is_variant, path, face))
+                    preferred.sort(key=lambda item: item[0])
+                    candidates = [(path, face) for _, path, face in preferred] + candidates
+        except (OSError, ImportError, ValueError):
+            pass
     # 非 Windows 也顺带尝试 Windows 常用字体（跨系统）
     if key != "windows":
         candidates += _SYSTEM_FONTS["windows"]
@@ -306,8 +337,8 @@ def _build_font_patch(cjk_font_rel: str, original_font: str,
     - 上面的覆盖仍漏掉屏幕里**显式**写 `font "xxx.ttf"` 的元素（属性优先级
       最高）。这层用 config.font_replacement_map 把所有游戏字体重定向到中文
       字体——Ren'Py 在加载字体时即替换，绕过 screen 的 font= 属性。
-    - **设置界面字体选项**：init -1 探测系统微软雅黑（msyh.ttc，只加入
-      config.searchpath，不复制文件）；init 999 定义 `_zz_set_font(f)`
+    - **设置界面字体选项**：中文字体补丁使用当前系统可用的中文字体，
+      设置界面只提供「系统字体」选项。init 999 定义 `_zz_set_font(f)`
       （gui 变量 + 默认样式 + 全部命名样式 + font_replacement_map 一站式
       应用）与 `_zz_font_select(choice)`（设置界面调用：记住选择并即时
       重建样式）。启动时按 persistent._zz_font_choice 应用上次选择。
@@ -346,28 +377,10 @@ def _build_font_patch(cjk_font_rel: str, original_font: str,
         "# 说明：界面样式在 init 阶段读取 gui.*_font 构建并写死字体，因此先于\n"
         "#       样式构建（init -1）把 gui.*_font 换成中文字体路径；init 999\n"
         "#       再统一应用（gui 变量、默认样式、全部命名样式、字体替换映射），\n"
-        "#       并提供设置界面可切换的字体选项（汉化默认字体 / 微软雅黑）。\n"
+        "#       并提供设置界面中的「系统字体」选项。\n"
         f"{warn_var}"
         "init -1 python:\n"
         f"    _zh_cn_font = \"{esc}\"\n"
-        "\n"
-        "    # 探测系统微软雅黑（不复制进游戏目录，加入搜索路径即可引用）\n"
-        "    _zz_yahei = None\n"
-        "    import os as _zz_os\n"
-        "    _zz_fonts_dir = _zz_os.path.join(\n"
-        "        _zz_os.environ.get('WINDIR',\n"
-        "            _zz_os.environ.get('SystemRoot', 'C:\\\\Windows')),\n"
-        "        'Fonts')\n"
-        "    for _zz_c in ('msyh.ttc', 'msyh.ttf'):\n"
-        "        try:\n"
-        "            if _zz_os.path.isfile(\n"
-        "                    _zz_os.path.join(_zz_fonts_dir, _zz_c)):\n"
-        "                _zz_yahei = _zz_c\n"
-        "                if _zz_fonts_dir not in config.searchpath:\n"
-        "                    config.searchpath.append(_zz_fonts_dir)\n"
-        "                break\n"
-        "        except Exception:\n"
-        "            pass\n"
         "\n"
         "    # 抢在 screens 样式构建前替换 gui 字体变量（定义于 init -2）\n"
         "    try:\n"
@@ -380,10 +393,8 @@ def _build_font_patch(cjk_font_rel: str, original_font: str,
         "                setattr(_zh_gui, _k, _zh_cn_font)\n"
         "\n"
         "init 999 python:\n"
-        "    # 字体选项表：cjk=汉化默认字体；yahei=系统微软雅黑（探测到才有）\n"
-        "    _zz_font_choices = {'cjk': _zh_cn_font}\n"
-        "    if _zz_yahei is not None:\n"
-        "        _zz_font_choices['yahei'] = _zz_yahei\n"
+        "    # 字体选项表：system 使用当前系统字体补丁。\n"
+        "    _zz_font_choices = {'system': _zh_cn_font}\n"
         f"    _zz_rep_font_list = [{rep_list_lit}]\n"
         "\n"
         "    def _zz_all_style_items():\n"
@@ -449,9 +460,17 @@ def _build_font_patch(cjk_font_rel: str, original_font: str,
         "        except Exception:\n"
         "            pass\n"
         "\n"
-        "    # 启动时应用用户上次的选择（默认汉化字体）\n"
+        "    # 启动时应用用户上次的选择。旧版的 yahei/cjk 值统一迁移到 system。\n"
+        "    _zz_saved_font_choice = getattr(\n"
+        "        persistent, '_zz_font_choice', 'system')\n"
+        "    if _zz_saved_font_choice in ('yahei', 'cjk'):\n"
+        "        _zz_saved_font_choice = 'system'\n"
+        "        try:\n"
+        "            persistent._zz_font_choice = 'system'\n"
+        "        except Exception:\n"
+        "            pass\n"
         "    _zz_set_font(_zz_font_choices.get(\n"
-        "        persistent._zz_font_choice, _zh_cn_font))\n"
+        "        _zz_saved_font_choice, _zh_cn_font))\n"
     )
 
 
@@ -469,33 +488,37 @@ def apply_font_patch(game_dir: Path) -> PatchResult:
     res = PatchResult()
     patch = game_dir / "zz_cn_font.rpy"
 
-    # 已有补丁、字体文件仍在、且已是「带字体选项」的新版补丁 → 跳过。
-    # 旧版补丁（无 _zz_font_select，设置界面不可切换字体）在此升级重写。
+    # 已有补丁、字体文件仍在、且已是当前「系统字体」版 → 跳过。
+    # 旧版补丁（包括带 yahei/cjk 选项的版本）在此升级重写。
     if patch.is_file():
         text = patch.read_text(encoding="utf-8-sig", errors="ignore")
         m = re.search(r"^# 中文字体: (.+)$", text, re.M)
         if (m and (game_dir / m.group(1).strip()).is_file()
-                and "_zz_font_select" in text):
+                and "_zz_font_select" in text
+                and "_zz_font_choices = {'system': _zh_cn_font}" in text
+                and '微软雅黑' not in text
+                and '汉化默认字体' not in text):
             res.ok = True
             res.skip = True
             res.message = "中文字体补丁已存在，跳过"
             return res
 
-    # 1. 优先使用游戏自带的中文字体
-    cjk_font = find_game_cjk_font(game_dir)
-    if cjk_font is not None:
-        rel = cjk_font.relative_to(game_dir).as_posix()
-        res.message = f"使用游戏自带中文字体: {rel}"
+    # 1. 优先复制当前系统界面字体，确保设置中的「系统字体」名实相符。
+    copied = copy_system_cjk_font(game_dir)
+    if copied is not None:
+        cjk_font = copied
+        rel = copied.relative_to(game_dir).as_posix()
+        res.files.append(copied)
+        res.message = f"已复制当前系统中文字体到 {rel}"
     else:
-        # 2. 复制系统字体
-        copied = copy_system_cjk_font(game_dir)
-        if copied is None:
+        # 2. 找不到可用系统字体时，退回游戏自带的中文字体。
+        cjk_font = find_game_cjk_font(game_dir)
+        if cjk_font is None:
             res.ok = False
             res.message = "未找到中文字体，且系统无可用中文字体（中文可能显示为方框）"
             return res
-        rel = copied.relative_to(game_dir).as_posix()
-        res.files.append(copied)
-        res.message = f"已复制系统字体到 {rel}"
+        rel = cjk_font.relative_to(game_dir).as_posix()
+        res.message = f"系统字体不可用，改用游戏自带中文字体: {rel}"
 
     original_font = find_original_default_font(game_dir)
     # 枚举所有非 CJK 字体，用于 font_replacement_map（覆盖屏幕里
@@ -526,6 +549,7 @@ _LANG_UI_MARKER = "# ===== 语言切换（汉化工具自动生成） ====="
 
 _LANG_UI_SNIPPET = (
     _LANG_UI_MARKER + "\n"
+    'timer 0.25 repeat True action Function(_ls_observe_language_switch)\n'
     "hbox:\n"
     '    style_prefix "radio"\n'
     "    box_wrap True\n"
@@ -534,7 +558,8 @@ _LANG_UI_SNIPPET = (
     "    for _lang_ui_i in _lang_ui_names:\n"
     "        textbutton _lang_ui_display_name(_lang_ui_i) selected "
     "(_preferences.language == _lang_ui_i) action "
-    "Function(_lang_ui_switch, _lang_ui_i) style \"radio_button\"\n"
+    "[Function(_lang_ui_note_selection, _lang_ui_i), "
+    "Language(_lang_ui_i)] style \"radio_button\"\n"
 )
 
 
@@ -601,6 +626,44 @@ def _insert_language_ui(block: str) -> str:
             indent = root_indent + 4
         break
 
+    # Custom settings screens often use ``viewport: ...; has vbox`` rather
+    # than ``use game_menu``. Insert as the viewport's first child so the
+    # language selector shares the same scrollable layout as the controls.
+    if use_index is None:
+        for i, line in enumerate(lines):
+            body = line.rstrip("\r\n")
+            viewport = re.match(
+                r"^(?P<indent>[ \t]*)viewport\b.*:\s*(?:#.*)?$", body)
+            if viewport is None:
+                continue
+            viewport_indent = len(viewport.group("indent"))
+            for j in range(i + 1, len(lines)):
+                child = lines[j].rstrip("\r\n")
+                stripped = child.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                current_indent = len(child) - len(child.lstrip(" \t"))
+                if current_indent <= viewport_indent:
+                    break
+                if (current_indent == viewport_indent + 4 and
+                        re.match(r"^has\s+vbox\b", stripped)):
+                    indent = current_indent
+                    line_end = "\r\n" if lines[j].endswith("\r\n") else "\n"
+                    injected = "".join(
+                        (" " * indent + item if item else "") + line_end
+                        for item in _LANG_UI_SNIPPET.splitlines())
+                    lines.insert(j + 1, injected)
+                    return "".join(lines)
+                if (current_indent == viewport_indent + 4 and
+                        re.match(r"^vbox\s*:\s*(?:#.*)?$", stripped)):
+                    indent = current_indent + 4
+                    line_end = "\r\n" if lines[j].endswith("\r\n") else "\n"
+                    injected = "".join(
+                        (" " * indent + item if item else "") + line_end
+                        for item in _LANG_UI_SNIPPET.splitlines())
+                    lines.insert(j + 1, injected)
+                    return "".join(lines)
+
     if use_index is None:
         for line in lines[:1]:
             match = re.match(r"^(?P<indent>[ \t]*)(?:init\s+-?\d+\s+)?screen\b", line)
@@ -658,7 +721,100 @@ def _append_to_preferences_vbox(block: str, snippet: str) -> str:
     lines.append(injected)
     return "".join(lines)
 
-# 字体选项（设置界面）：单选「汉化默认字体 / 微软雅黑」。
+
+def _append_to_settings_viewport(block: str, snippet: str) -> str:
+    """Append a generated options section inside a custom viewport vbox."""
+    lines = block.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        body = line.rstrip("\r\n")
+        viewport = re.match(
+            r"^(?P<indent>[ \t]*)viewport\b.*:\s*(?:#.*)?$", body)
+        if viewport is None:
+            continue
+        viewport_indent = len(viewport.group("indent"))
+        for j in range(i + 1, len(lines)):
+            child = lines[j].rstrip("\r\n")
+            stripped = child.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            current_indent = len(child) - len(child.lstrip(" \t"))
+            if current_indent <= viewport_indent:
+                break
+            has_vbox = (current_indent == viewport_indent + 4 and
+                        re.match(r"^has\s+vbox\b", stripped))
+            child_vbox = (current_indent == viewport_indent + 4 and
+                          re.match(r"^vbox\s*:\s*(?:#.*)?$", stripped))
+            if has_vbox or child_vbox:
+                content_indent = current_indent if has_vbox else current_indent + 4
+                end = j + 1
+                while end < len(lines):
+                    item = lines[end].rstrip("\r\n")
+                    if item.strip():
+                        item_indent = len(item) - len(item.lstrip(" \t"))
+                        if item_indent < content_indent:
+                            break
+                    end += 1
+                newline = "\r\n" if line.endswith("\r\n") else "\n"
+                generated = "".join(
+                    (" " * content_indent + item if item else "") + newline
+                    for item in snippet.splitlines())
+                lines.insert(end, generated)
+                return "".join(lines)
+    return _append_to_preferences_vbox(block, snippet)
+
+
+def _insert_custom_font_ui(block: str, language: str) -> str:
+    """Place the system-font control directly below the language selector."""
+    if _FONT_UI_MARKER in block:
+        return block
+    lines = block.splitlines(keepends=True)
+    marker_index = next((i for i, line in enumerate(lines)
+                         if line.strip() == _LANG_UI_MARKER), None)
+    if marker_index is None:
+        return _append_to_settings_viewport(block, (
+            _FONT_UI_MARKER + "\n"
+            f"if _preferences.language == {language!r}:\n"
+            "    vbox:\n"
+            '        style_prefix "radio"\n'
+            '        label _("Font")\n'
+            "        if _zz_font_choices:\n"
+            '            textbutton "系统字体" selected '
+            "(persistent._zz_font_choice == 'system') action "
+            "Function(_zz_font_select, 'system') style \"radio_button\"\n"
+        ))
+    indent = len(lines[marker_index]) - len(lines[marker_index].lstrip(" \t"))
+    language_row = next((i for i in range(marker_index + 1, len(lines))
+                         if re.match(r"^[ \t]*hbox\s*:", lines[i]) and
+                         len(lines[i]) - len(lines[i].lstrip(" \t")) == indent),
+                        None)
+    if language_row is None:
+        return block
+    end = language_row + 1
+    while end < len(lines):
+        body = lines[end].rstrip("\r\n")
+        if body.strip():
+            current_indent = len(body) - len(body.lstrip(" \t"))
+            if current_indent <= indent:
+                break
+        end += 1
+    newline = "\r\n" if lines[language_row].endswith("\r\n") else "\n"
+    font_indent = indent
+    rows = [
+        (font_indent, _FONT_UI_MARKER),
+        (font_indent, f"if _preferences.language == {language!r}:"),
+        (font_indent + 4, 'label _("Font")'),
+        (font_indent + 4, "if _zz_font_choices:"),
+        (font_indent + 8,
+         'textbutton "系统字体" selected '
+         "(persistent._zz_font_choice == 'system') action "
+         "Function(_zz_font_select, 'system') style \"radio_button\""),
+    ]
+    generated = "".join((" " * row_indent + row) + newline
+                        for row_indent, row in rows)
+    lines.insert(end, generated)
+    return "".join(lines)
+
+# 字体选项（设置界面）：单选「系统字体」。
 # _zz_font_select / _zz_font_choices 定义在 zz_cn_font.rpy。为避免「字体补丁
 # 缺失时屏幕引用未定义变量」（NameError），这里做两层保护：
 #   1. apply_language_ui 只在 zz_cn_font.rpy 确实含这些定义时才注入本段
@@ -747,13 +903,9 @@ def _font_list_entries(indent: str, style_suffix: str) -> list[str]:
     return [
         f"{indent}{_FONT_UI_MARKER}",
         f"{indent}if _zz_font_choices:",
-        f"{indent}    textbutton \"汉化默认字体\" selected "
-        f"(persistent._zz_font_choice != 'yahei') action "
-        f"Function(_zz_font_select, 'cjk'){style_suffix}",
-        f"{indent}    if 'yahei' in _zz_font_choices:",
-        f"{indent}        textbutton \"微软雅黑\" selected "
-        f"(persistent._zz_font_choice == 'yahei') action "
-        f"Function(_zz_font_select, 'yahei'){style_suffix}",
+        f"{indent}    textbutton \"系统字体\" selected "
+        f"(persistent._zz_font_choice == 'system') action "
+        f"Function(_zz_font_select, 'system'){style_suffix}",
     ]
 
 
@@ -773,20 +925,18 @@ def _apply_font_ui(block: str, language: str) -> str:
         lines[end + 1:end + 1] = _font_list_entries(indent, style_suffix)
         return "\n".join(lines) + "\n"
     # 无原生字体列表：自有「字体」段，仅在当前语言 == 汉化语言时显示
-    return _append_to_preferences_vbox(block, (
+    append = (_append_to_preferences_vbox if "use game_menu" in block
+              else _append_to_settings_viewport)
+    return append(block, (
         _FONT_UI_MARKER + "\n"
         f"if _preferences.language == {language!r}:\n"
         "    vbox:\n"
         '        style_prefix "radio"\n'
         '        label _("Font")\n'
         "        if _zz_font_choices:\n"
-        "            textbutton \"汉化默认字体\" selected "
-        "(persistent._zz_font_choice != 'yahei') action "
-        "Function(_zz_font_select, 'cjk') style \"radio_button\"\n"
-        "        if 'yahei' in _zz_font_choices:\n"
-        "            textbutton \"微软雅黑\" selected "
-        "(persistent._zz_font_choice == 'yahei') action "
-        "Function(_zz_font_select, 'yahei') style \"radio_button\"\n"
+        "            textbutton \"系统字体\" selected "
+        "(persistent._zz_font_choice == 'system') action "
+        "Function(_zz_font_select, 'system') style \"radio_button\"\n"
     ))
 
 
@@ -821,6 +971,11 @@ _LANG_UI_HELPER = (
     "        _zz_font_choices = {}\n"
     "\n"
     "init python:\n"
+    "    _rpytranslator_requested_language = None\n"
+    "    def _lang_ui_note_selection(language):\n"
+    "        global _rpytranslator_requested_language\n"
+    "        _rpytranslator_requested_language = language\n"
+    "\n"
     "    def _lang_ui_display_name(language):\n"
     "        # 语言码是运行时动态字符串，不能交给 _() 翻译：默认英文时，\n"
     "        # translate schinese strings 尚未生效，会把 schinese 原样显示出来。\n"
@@ -884,26 +1039,6 @@ _LANG_UI_HELPER = (
     "                _unique.append(_name)\n"
     "        return [None] + sorted(_unique, key=lambda _x: str(_x).lower())\n"
     "\n"
-    "    def _lang_ui_switch(language):\n"
-    "        # 老版 Ren'Py 无 Preference('language')，直接切换语言。\n"
-    "        renpy.change_language(language)\n"
-    "\n"
-    "init python:\n"
-    "    if 'zz_language_ui_overlay' not in config.overlay_screens:\n"
-    "        config.overlay_screens.append('zz_language_ui_overlay')\n"
-    "\n"
-    "screen zz_language_ui_overlay():\n"
-    "    zorder 100\n"
-    "    if renpy.get_screen('preferences') is not None:\n"
-    "        hbox:\n"
-    "            xalign 0.5\n"
-    "            yalign 0.17\n"
-    "            spacing 12\n"
-    "            style_prefix 'radio'\n"
-    "            label _('Language')\n"
-    "            $ _zz_lang_overlay_names = _lang_ui_languages()\n"
-    "            for _zz_lang_overlay_i in _zz_lang_overlay_names:\n"
-    "                textbutton _lang_ui_display_name(_zz_lang_overlay_i) selected (_preferences.language == _zz_lang_overlay_i) action Function(_lang_ui_switch, _zz_lang_overlay_i) style 'radio_button'\n"
 )
 
 # 各语言语言码对应的「Ren'Py 语言显示名 → 中文显示名」
@@ -1023,7 +1158,7 @@ def _extract_screen_block(text: str, screen_name: str) -> str | None:
     return "".join(block)
 
 
-def _raise_preferences_priority(block: str) -> str:
+def _raise_screen_priority(block: str, screen_name: str) -> str:
     """Make an injected preferences screen win over archived definitions.
 
     Ren'Py's stock screens are commonly declared at ``init -501``. Keeping
@@ -1043,16 +1178,21 @@ def _raise_preferences_priority(block: str) -> str:
         first_body, line_end = first, ""
     match = re.match(
         r"^(?P<indent>[ \t]*)(?:(?:init[ \t]+[+-]?\d+[ \t]+)?"
-        r"screen[ \t]+preferences\b)(?P<tail>.*)$",
+        r"screen[ \t]+" + re.escape(screen_name) + r"\b)(?P<tail>.*)$",
         first_body,
     )
     if match is None:
         return block
     lines[0] = (
         f"{match.group('indent')}init {_LANGUAGE_UI_PRIORITY} "
-        f"screen preferences{match.group('tail')}{line_end}"
+        f"screen {screen_name}{match.group('tail')}{line_end}"
     )
     return "".join(lines)
+
+
+def _raise_preferences_priority(block: str) -> str:
+    """Compatibility wrapper for the standard preferences screen."""
+    return _raise_screen_priority(block, "preferences")
 
 
 def _has_language_ui(game_dir: Path, language: str = "schinese") -> bool:
@@ -1102,7 +1242,24 @@ def _has_language_ui(game_dir: Path, language: str = "schinese") -> bool:
         text = _decompile_rpyc_source(p, p.name)
         if text and _check(text):
             return True
+    # Settings destinations may be custom screens stored elsewhere in RPA
+    # archives (for example mm_preferences / quick_preferences).
+    for _name, block, _source in _find_custom_settings_screens(game_dir):
+        if _screen_has_language_ui(block, language):
+            return True
     return False
+
+
+def _screen_has_language_ui(block: str, language: str = "schinese") -> bool:
+    """Check one screen body for a real, non-commented language selector."""
+    if _LANG_UI_MARKER in block and _language_ui_is_current(block):
+        return True
+    stripped = _strip_comments(block)
+    if any(re.search(pattern, stripped) for pattern in _LANG_UI_PATTERNS):
+        return True
+    return bool(re.search(
+        r'Language\(\s*["\'](?:' + re.escape(language) +
+        r'|chinese)["\']', stripped))
 
 
 def _decompile_rpyc_source(src: Path | bytes, name: str) -> str | None:
@@ -1206,27 +1363,157 @@ def _find_preferences_source(game_dir: Path) -> tuple[str | None, Path | None]:
     return None, None
 
 
+_MENU_SCREEN_CALL_RE = re.compile(
+    r"\bShowMenu\s*\(\s*(['\"])([A-Za-z_][A-Za-z0-9_]*)\1")
+_SETTING_SCREEN_NAME_RE = re.compile(r"(?:pref|option|setting)", re.I)
+_SETTING_SCRIPT_HINTS = (
+    "screen", "menu", "pref", "option", "setting", "section", "ingame", "mm_",
+)
+
+
+def _find_custom_settings_screens(
+        game_dir: Path) -> list[tuple[str, str, str]]:
+    """Find custom settings screens reached through Ren'Py's ShowMenu action.
+
+    Reads loose sources and likely screen/menu scripts in RPA archives, then
+    returns (screen name, source block, source label) rows for custom settings
+    destinations such as ``mm_preferences`` and ``quick_preferences``.
+    """
+    from . import rpa_loader
+
+    sources: list[tuple[str, str]] = []
+    seen_sources: set[str] = set()
+
+    def add_source(label: str, text: str | None) -> None:
+        if text is None or label in seen_sources:
+            return
+        seen_sources.add(label)
+        sources.append((label, text))
+
+    for dirpath, dirnames, filenames in os.walk(game_dir):
+        dirnames[:] = [d for d in dirnames if d.lower() not in _SKIP_DIRS]
+        for fn in sorted(filenames):
+            if Path(fn).suffix.lower() not in (".rpy", ".rpym"):
+                continue
+            if fn.lower().startswith("zz_"):
+                continue
+            path = Path(dirpath) / fn
+            try:
+                add_source(str(path), path.read_text(
+                    encoding="utf-8-sig", errors="ignore"))
+            except OSError:
+                continue
+
+    for rpa in sorted(game_dir.glob("*.rpa")):
+        if not rpa.is_file():
+            continue
+        try:
+            index = rpa_loader.parse_rpa_index(rpa)
+        except (OSError, ValueError):
+            continue
+        for name, entry in index.items():
+            lowered = name.lower()
+            stem = Path(lowered).name
+            if not lowered.endswith((".rpy", ".rpym", ".rpyc", ".rpymc")):
+                continue
+            if stem.startswith("zz_") or not any(
+                    hint in stem for hint in _SETTING_SCRIPT_HINTS):
+                continue
+            try:
+                data = rpa_loader._read_entry(rpa, entry)
+            except (OSError, ValueError):
+                continue
+            if not data:
+                continue
+            if lowered.endswith((".rpy", ".rpym")):
+                text = data.decode("utf-8-sig", errors="ignore")
+            else:
+                text = _decompile_rpyc_source(data, Path(name).name)
+            add_source(f"{rpa.name}::{name}", text)
+
+    requested = {"mm_preferences", "quick_preferences"}
+    for _label, text in sources:
+        stripped = _strip_comments(text)
+        requested.update(
+            name for _quote, name in _MENU_SCREEN_CALL_RE.findall(stripped)
+            if _SETTING_SCREEN_NAME_RE.search(name))
+
+    found: dict[str, tuple[str, str]] = {}
+    for label, text in sources:
+        for name in requested:
+            if name == "preferences" or name in found:
+                continue
+            block = _extract_screen_block(text, name)
+            if block is not None:
+                found[name] = (block, label)
+    return [(name, block, label) for name, (block, label)
+            in sorted(found.items())]
+
+
 def _count_screen_defs(text: str, name: str) -> int:
     """统计文本里 ``screen <name>`` 定义的个数（含 ``init -N`` 前缀写法）。"""
     pat = re.compile(r"^\s*(?:init\s+-?\d+\s+)?screen\s+" + re.escape(name) + r"\b")
     return sum(1 for ln in text.splitlines() if pat.match(ln))
 
 
-def _language_ui_is_top_aligned(text: str) -> bool:
-    """旧语言区若排在固定高度菜单内容之后，视为需要迁移重建。"""
-    block = _extract_screen_block(text, "preferences")
+def _language_ui_is_top_aligned(text: str,
+                               screen_name: str = "preferences") -> bool:
+    """Require the generated selector at the start of its settings content."""
+    block = _extract_screen_block(text, screen_name)
     if block is None:
         return False
     lines = block.splitlines()
     use_index = next((i for i, line in enumerate(lines)
                       if re.match(r"^[ \t]*use\s+game_menu\b.*:\s*(?:#.*)?$",
                                   line)), None)
-    if use_index is None:
-        return True
     marker_index = next((i for i, line in enumerate(lines)
                          if line.strip() == _LANG_UI_MARKER), None)
     if marker_index is None:
         return False
+    if use_index is None:
+        viewport_index = next((i for i, line in enumerate(lines)
+                               if re.match(r"^[ \t]*viewport\b.*:\s*(?:#.*)?$",
+                                           line)), None)
+        if viewport_index is None:
+            return False
+        viewport_indent = len(lines[viewport_index]) - len(
+            lines[viewport_index].lstrip(" \t"))
+        # A viewport may declare properties such as ``xysize`` or
+        # ``scrollbars`` before its layout root. Mirror the injector and skip
+        # those direct-child properties until ``has vbox``/``vbox`` appears.
+        root_index = None
+        for i in range(viewport_index + 1, len(lines)):
+            body = lines[i].rstrip("\r\n")
+            stripped = body.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            current_indent = len(body) - len(body.lstrip(" \t"))
+            if current_indent <= viewport_indent:
+                break
+            if (current_indent == viewport_indent + 4 and
+                    (re.match(r"^has\s+vbox\b", stripped) or
+                     re.match(r"^vbox\s*:", stripped))):
+                root_index = i
+                break
+        if root_index is None:
+            return False
+        root_line = lines[root_index].strip()
+        if re.match(r"^has\s+vbox\b", root_line):
+            expected_indent = viewport_indent + 4
+            expected_index = root_index + 1
+        elif re.match(r"^vbox\s*:", root_line):
+            expected_indent = viewport_indent + 8
+            expected_index = root_index + 1
+        else:
+            return False
+        while expected_index < len(lines) and (
+                not lines[expected_index].strip() or
+                (lines[expected_index].lstrip().startswith("#") and
+                 lines[expected_index].strip() != _LANG_UI_MARKER)):
+            expected_index += 1
+        return (expected_index == marker_index and
+                len(lines[marker_index]) -
+                len(lines[marker_index].lstrip(" \t")) == expected_indent)
     use_match = re.match(r"^([ \t]*)use\s+game_menu\b", lines[use_index])
     if use_match is None:
         return False
@@ -1245,19 +1532,88 @@ def _language_ui_is_top_aligned(text: str) -> bool:
             len(lines[marker_index].lstrip(" \t")) == use_indent + 4)
 
 
+def _font_ui_is_current(text: str,
+                        screen_name: str | None = None) -> bool:
+    """Require the generated font-choice block to use the current system label."""
+    if screen_name is not None:
+        text = _extract_screen_block(text, screen_name) or ""
+    lines = text.splitlines()
+    marker_index = next((i for i, line in enumerate(lines)
+                         if line.strip() == _FONT_UI_MARKER), None)
+    if marker_index is None:
+        return False
+    # Both generated variants keep their complete button within the next dozen
+    # lines; bound the scan so unrelated native controls cannot affect it.
+    generated = "\n".join(lines[marker_index + 1:marker_index + 14])
+    if not ('textbutton "系统字体"' in generated
+            and 'textbutton "微软雅黑"' not in generated
+            and 'textbutton "汉化默认字体"' not in generated):
+        return False
+    if screen_name not in (None, "preferences") and "viewport" in text:
+        language_index = next((i for i, line in enumerate(lines)
+                               if line.strip() == _LANG_UI_MARKER), None)
+        if language_index is None or marker_index <= language_index:
+            return False
+        font_indent = len(lines[marker_index]) - len(
+            lines[marker_index].lstrip(" \t"))
+        if marker_index - language_index > 45:
+            return False
+        meaningful = [(i, line) for i, line in
+                      enumerate(lines[marker_index + 1:], marker_index + 1)
+                      if line.strip() and not line.lstrip().startswith("#")]
+        if len(meaningful) < 4:
+            return False
+        condition_index, condition = meaningful[0]
+        label_index, label = meaningful[1]
+        choices_index, choices = meaningful[2]
+        button_index, button = meaningful[3]
+        condition_indent = len(condition) - len(condition.lstrip(" \t"))
+        label_indent = len(label) - len(label.lstrip(" \t"))
+        choices_indent = len(choices) - len(choices.lstrip(" \t"))
+        button_indent = len(button) - len(button.lstrip(" \t"))
+        return (
+            condition_index > marker_index and
+            all(not line.strip() or line.lstrip().startswith("#")
+                for line in lines[marker_index + 1:condition_index]) and
+            condition_indent == font_indent and
+            condition.strip().startswith("if _preferences.language ==") and
+            label_indent == font_indent + 4 and
+            label.strip() == 'label _(\"Font\")' and
+            choices_indent == font_indent + 4 and
+            choices.strip() == "if _zz_font_choices:" and
+            button_indent == font_indent + 8 and
+            'textbutton "系统字体"' in button)
+    return True
+
+
+def _language_ui_is_current(text: str,
+                            screen_name: str = "preferences") -> bool:
+    """Require the official action and timer in the generated screen body."""
+    block = _extract_screen_block(text, screen_name) or text
+    return (
+        _LANG_UI_MARKER in block and
+        "Language(_lang_ui_i)" in block and
+        "Function(_lang_ui_note_selection, _lang_ui_i)" in block and
+        "timer 0.25 repeat True action Function(_ls_observe_language_switch)" in block and
+        "screen zz_language_ui_overlay" not in block and
+        "_zz_lang_overlay_i" not in block
+    )
+
+
 def _build_language_ui(source_text: str, with_font: bool = False,
-                      language: str = "schinese") -> str | None:
-    """在 preferences 内容顶部注入语言选择器（及可选的字体选项）。
+                      language: str = "schinese",
+                      screen_name: str = "preferences") -> str | None:
+    """Inject language/font selectors into one settings screen definition.
 
     返回新的整个屏幕定义；屏幕块已注入过或定位不到时返回 None。
     字体选项优先追加进游戏的**原生字体列表**（避免出现两个 Font 段）。
     """
-    block = _extract_screen_block(source_text, "preferences")
+    block = _extract_screen_block(source_text, screen_name)
     if block is None:
         return None
     if _LANG_UI_MARKER in block:
         return None  # 已注入
-    out = _insert_language_ui(_raise_preferences_priority(block))
+    out = _insert_language_ui(_raise_screen_priority(block, screen_name))
     if with_font:
         out = _apply_font_ui(out, language)
     return out + _LANG_UI_HELPER
@@ -1270,51 +1626,85 @@ def apply_language_ui(game_dir: Path, language: str = "schinese",
     patch = game_dir / "zz_language_ui.rpy"
 
     def _inject(with_lang: bool) -> None:
-        """从游戏原始 preferences 屏幕重建注入文件（with_lang 控制是否含语言）。"""
+        """Rebuild overrides for stock and reachable custom settings screens."""
         source, src_path = _find_preferences_source(game_dir)
-        if source is None:
-            res.ok = False
-            res.message = "未找到 preferences 屏幕定义，无法注入设置界面选项"
-            return
-        block = _extract_screen_block(source, "preferences")
-        if block is None or _LANG_UI_MARKER in block:
-            res.ok = False
-            res.message = "无法定位 preferences 屏幕块，跳过设置界面注入"
-            return
-        body = _raise_preferences_priority(block)
-        if with_lang:
-            body = _insert_language_ui(body)
         # 字体选项仅在字体补丁确实就位时注入——否则屏幕会引用未定义的
         # _zz_font_choices / _zz_font_select（虽然 helper 有兜底空表，
         # 但缺补丁时字体选项本身也没有意义）。
         want_font = with_font and _font_ui_available(game_dir)
-        if want_font:
-            # 有原生字体列表 → 追加进去；否则注入自有段（仅在中文下显示）
-            body = _apply_font_ui(body, language)
+        screens: list[tuple[str, str, str]] = []
+        if source is not None:
+            block = _extract_screen_block(source, "preferences")
+            if block is not None:
+                screens.append(("preferences", block,
+                                src_path.name if src_path else "归档内 screens 脚本"))
+        screens.extend(_find_custom_settings_screens(game_dir))
+        generated: list[str] = []
+        for screen_name, block, source_label in screens:
+            if _LANG_UI_MARKER in block or _FONT_UI_MARKER in block:
+                continue
+            add_language = (with_lang and not
+                           _screen_has_language_ui(block, language))
+            if not add_language and not want_font:
+                continue
+            body = _raise_screen_priority(block, screen_name)
+            if add_language:
+                body = _insert_language_ui(body)
+            if want_font:
+                if screen_name == "preferences":
+                    body = _apply_font_ui(body, language)
+                else:
+                    body = _insert_custom_font_ui(body, language)
+            generated.append(
+                f"# Settings screen override: {screen_name} ({source_label})\n"
+                + body.rstrip() + "\n")
+        if not generated:
+            res.ok = False
+            res.message = "未找到可注入的设置界面屏幕定义"
+            return
         try:
             header = (
                 "# -*- coding: utf-8 -*-\n"
-                "# 设置界面选项（汉化工具自动生成）：语言切换 / 字体选择。\n"
-                f"# 来源: {src_path.name if src_path else '归档内 screens 脚本'}\n\n"
+                "# 设置界面选项（汉化工具自动生成）：语言切换 / 字体选择。\n\n"
             )
-            patch.write_text(header + body + _LANG_UI_HELPER,
-                             encoding="utf-8-sig")
+            content = (header + "\n".join(generated) + _LANG_UI_HELPER)
+            if (patch.is_file() and
+                    patch.read_text(encoding="utf-8-sig", errors="ignore")
+                    == content):
+                res.ok = True
+                res.skip = True
+                res.message = "设置界面选项已注入，跳过"
+                return
+            patch.write_text(content, encoding="utf-8-sig")
         except OSError as e:
             res.ok = False
             res.message = f"写设置界面补丁失败: {e}"
             return
         res.files.append(patch)
         res.ok = True
+        custom_count = max(0, len(screens) - (1 if source is not None else 0))
         bits = ([] + ["语言切换"] if with_lang else []) + \
                (["字体选项"] if want_font else [])
+        if custom_count:
+            bits.append(f"自定义设置界面 {custom_count} 个")
         res.detail = "重启游戏后，在 设置 界面即可使用「%s」" % "、".join(bits)
         res.message = "已注入设置界面选项（%s）" % "、".join(bits)
 
     # 只有字体补丁确实就位时，字体选项才有意义（见 _font_ui_available）
     want_font = with_font and _font_ui_available(game_dir)
 
-    # 1. 游戏已有语言切换 → 仅当需要字体选项时注入字体（不重复加语言）
-    if _has_language_ui(game_dir, language):
+    # A title may expose a stock preferences screen in its pause menu while
+    # routing the main-menu Options button to custom screens. Check those
+    # reachable screens independently so one built-in selector cannot hide a
+    # missing selector from the screen the player actually uses.
+    custom_screens = _find_custom_settings_screens(game_dir)
+    custom_missing_language = any(
+        not _screen_has_language_ui(block, language)
+        for _name, block, _source in custom_screens)
+    has_language_ui = _has_language_ui(game_dir, language)
+
+    # 1. Existing language UI → only add font controls where needed.
+    if has_language_ui and not custom_missing_language:
         if not want_font:
             res.ok = True
             res.skip = True
@@ -1337,13 +1727,43 @@ def apply_language_ui(game_dir: Path, language: str = "schinese",
             # 还在（helper 里），但语言列表按钮整个没了。判定「已注入」必须
             # 看实际按钮代码，并要求覆盖屏幕使用较高 init 优先级。
             # 兼容旧补丁中的 `_lang_ui_label` 与新补丁的直接显示名调用。
-            sane = (_count_screen_defs(text, "preferences") == 1
-                    and ("_lang_ui_label" in text or
-                         "_lang_ui_display_name" in text)
-                    and re.search(
+            custom_sane = all(
+                _screen_has_language_ui(original, language) or
+                (_count_screen_defs(text, name) == 1 and
+                 _language_ui_is_current(text, name) and
+                 _language_ui_is_top_aligned(text, name))
+                for name, original, _source in custom_screens)
+            preferences_source, _preferences_path = _find_preferences_source(
+                game_dir)
+            preferences_block = (_extract_screen_block(
+                preferences_source, "preferences")
+                if preferences_source is not None else None)
+            preferences_needs_language = (
+                preferences_block is not None and
+                not _screen_has_language_ui(preferences_block, language))
+            preferences_override_expected = (
+                preferences_block is not None and
+                (preferences_needs_language or want_font))
+            generated_names = (["preferences"] if
+                               preferences_override_expected and want_font
+                               else []) + [name for name, _block, _source
+                                           in custom_screens]
+            font_sane = (not want_font or all(
+                _font_ui_is_current(text, name)
+                for name in generated_names))
+            preferences_sane = not preferences_override_expected
+            if preferences_override_expected:
+                preferences_sane = (
+                    _count_screen_defs(text, "preferences") == 1 and
+                    re.search(
                         rf"(?m)^\s*init\s+{_LANGUAGE_UI_PRIORITY}\s+screen\s+preferences\b",
-                        text) is not None
-                    and _language_ui_is_top_aligned(text))
+                        text) is not None and
+                    (not preferences_needs_language or
+                     (_language_ui_is_top_aligned(text) and
+                      _language_ui_is_current(text))) and
+                    (not want_font or
+                     _font_ui_is_current(text, "preferences")))
+            sane = (preferences_sane and custom_sane and font_sane)
             if sane and (_FONT_UI_MARKER in text) == want_font:
                 res.ok = True
                 res.skip = True
@@ -1447,7 +1867,7 @@ def apply_all(game_dir: Path, language: str = "schinese",
     if with_font:
         results.append(apply_font_patch(game_dir))
     if with_language_ui:
-        # 字体补丁启用时，设置界面同时提供「字体」选项（汉化默认 / 微软雅黑）
+        # 字体补丁启用时，设置界面同时提供「系统字体」选项。
         results.append(apply_language_ui(game_dir, language,
                                          with_font=with_font))
         name_res = ensure_language_name(game_dir, language)
