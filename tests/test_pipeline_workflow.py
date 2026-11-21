@@ -1,6 +1,7 @@
 """Exercise the user's scan → merge → translate → audit workflow on disk."""
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import threading
@@ -12,7 +13,7 @@ from rpytranslator.audit import run_audit
 from rpytranslator.generator import parse_existing_translations
 from rpytranslator.pipeline import run_pipeline
 from rpytranslator.reports import read_retry_entries
-from rpytranslator.translator import PauseRequested
+from rpytranslator.translator import PauseRequested, TranslationClient, TranslationConfig
 from rpytranslator.verify import FIX_FILE_NAME, runtime_report_path
 
 
@@ -120,6 +121,30 @@ class PipelineWorkflowTests(unittest.TestCase):
         self.assertEqual(hand.read_bytes(), original.replace("把门关好。".encode(), "关上大门。".encode()))
         self.assertFalse(self.queue.exists())
 
+    def test_historical_setting_and_image_conditions_are_not_retried_as_dialogue(self):
+        self.story.write_text(
+            'image border = ConditionSwitch(\n    "renpy.variant(\'small\') and bright", "day",\n'
+            '    "True", "night")\ndefine gui.language = "unicode"\n'
+            'label start:\n    "Walk ahead." id walk\n', encoding="utf-8")
+        condition = "renpy.variant('small') and bright"
+        patch_file = self.out / "hand.rpy"
+        original = (f'# story.rpy:2\ntranslate schinese old_condition:\n    # "{condition}"\n'
+                    f'    "{condition}"\n\ntranslate schinese strings:\n'
+                    '    # story.rpy:4\n    old "unicode"\n    new "unicode"\n\n'
+                    '    # missing_engine.rpy:10\n    old "Recover files"\n    new "Recover files"\n\n'
+                    '# story.rpy:6\ntranslate schinese walk:\n    # "Walk ahead."\n    "向前走。"\n')
+        patch_file.write_text(original, encoding="utf-8")
+        self.queue.write_text(f'story.rpy:2  {condition}\nstory.rpy:4  unicode\n'
+                              'missing_engine.rpy:10  Recover files\n', encoding="utf-8")
+        model = RecordingModel({"Recover files": "恢复文件"})
+        result = self.translate(model)
+        self.assertTrue(result.ok, result.message)
+        self.assertEqual(model.calls, [("Recover files",)])
+        self.assertEqual(patch_file.read_text(encoding="utf-8"),
+                         original.replace('new "Recover files"', 'new "恢复文件"'))
+        self.assertEqual(result.audit.counts, {})
+        self.assertFalse(self.queue.exists())
+
     def test_file_count_includes_runtime_and_audit_writes_once_then_returns_to_zero(self):
         self.story.write_text(
             'label start:\n    "The wind stopped." id wind\n    "Look outside." id view\n'
@@ -168,6 +193,81 @@ class PipelineWorkflowTests(unittest.TestCase):
         self.assertEqual(parse_existing_translations(self.out, "schinese")[0], {"walk": "继续走。", "turn": "向左转。"})
         self.assertFalse(marker.exists())
         self.assertFalse((self.out.parent / ".schinese.汉化进度.json").exists())
+
+    def test_resume_distinguishes_accepted_and_failed_identical_answers_per_group(self):
+        same = "风已经停了。"
+        self.story.write_text(f'label start:\n    "{same}" id wind\nscreen menu_box():\n    text "{same}"\n',
+                              encoding="utf-8")
+        calls = []
+
+        class PauseOnFailedMenu(RecordingModel):
+            def translate_texts(self, texts, *, item_cb, **_):
+                calls.append(tuple(texts))
+                if len(calls) == 1:
+                    item_cb(same, same)
+                    return [same]
+                self.failed_texts.add(same)
+                item_cb(same, same)   # identical fallback, not a successful answer
+                raise PauseRequested()
+
+        first = self.translate(PauseOnFailedMenu())
+        self.assertTrue(first.paused, first.message)
+        self.assertEqual(calls, [(same,), (same,)])
+        checkpoint = self.out.parent / ".schinese.汉化进度.json"
+        recorded = json.loads(checkpoint.read_text(encoding="utf-8-sig"))
+        self.assertEqual(recorded["dialogues"], recorded["strings"])
+        self.assertEqual(recorded["confirmed_unchanged"], {"dialogues": [same], "strings": []})
+        marker = self.out.parent / ".schinese.暂停标记.txt"
+        self.assertEqual(marker.read_text(encoding="utf-8-sig").splitlines(), [f"story.rpy:4  {same}"])
+        self.assertIn("剩余 1 条", first.message)
+        resume_model = RecordingModel({same: same})
+        resumed = self.translate(resume_model)
+        self.assertTrue(resumed.ok, resumed.message)
+        self.assertEqual(resume_model.calls, [(same,)])
+        self.assertEqual(parse_existing_translations(self.out, "schinese"), ({"wind": same}, {same: same}))
+        self.assertFalse(marker.exists())
+        self.assertFalse(checkpoint.exists())
+
+    def test_pausing_while_qwen_splits_a_batch_saves_the_completed_half(self):
+        source = ["The sky is clear.", "风停了。", "Open the door.", "We can go."]
+        self.story.write_text('label start:\n' + ''.join(f'    "{t}" id line{i}\n' for i, t in enumerate(source)),
+                              encoding="utf-8")
+        model = TranslationClient(TranslationConfig(model="qwen3:8b", chunk_items=40))
+        pause = threading.Event()
+
+        def response_to_first_half(messages, *args, **kwargs):
+            self.assertIn("The sky is clear.", messages[-1]["content"])
+            self.assertNotIn("Open the door.", messages[-1]["content"])
+            pause.set()
+            return '["天空晴朗。", "风停了。"]'
+
+        with patch.object(model, "_extract_qwen3_names", return_value=[]), \
+                patch.object(model, "chat", side_effect=response_to_first_half):
+            first = self.translate(model, pause_event=pause)
+        self.assertTrue(first.paused, first.message)
+        self.assertIn("剩余 2 条", first.message)
+        marker = self.out.parent / ".schinese.暂停标记.txt"
+        self.assertEqual([line.split("  ", 1)[1] for line in marker.read_text(encoding="utf-8-sig").splitlines()],
+                         source[2:])
+        resume_model = RecordingModel({source[2]: "把门打开。", source[3]: "我们走吧。"})
+        resumed = self.translate(resume_model)
+        self.assertTrue(resumed.ok, resumed.message)
+        self.assertEqual(resume_model.calls, [tuple(source[2:])])
+
+    def test_legacy_checkpoint_reuses_translations_but_rechecks_ambiguous_identical_values(self):
+        self.story.write_text('label start:\n    "The sun is up." id sunrise\n'
+                              '    "风停了。" id wind\n    "Close the door." id door\n', encoding="utf-8")
+        cache = self.out.parent / ".schinese.汉化进度.json"
+        old = {"dialogues": {"The sun is up.": "日出了。", "风停了。": "风停了。",
+                             "Close the door.": "Close the door."}, "strings": {}, "protected_terms": []}
+        cache.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8-sig")
+        model = RecordingModel({"风停了。": "风停了。", "Close the door.": "把门关上。"})
+        resumed = self.translate(model)
+        self.assertTrue(resumed.ok, resumed.message)
+        self.assertEqual(model.calls, [("风停了。", "Close the door.")])
+        self.assertEqual(parse_existing_translations(self.out, "schinese")[0],
+                         {"sunrise": "日出了。", "wind": "风停了。", "door": "把门关上。"})
+        self.assertFalse(cache.exists())
 
     def test_game_controlled_dynamic_string_is_never_requested_or_replaced(self):
         self.story.write_text('screen forecast():\n    text "Weather forecast"\n', encoding="utf-8")

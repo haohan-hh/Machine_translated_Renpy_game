@@ -42,6 +42,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from .audit import reusable_dialogue
 from .extract import encode_say_string
 from .patcher import PatchResult, monitored_settings_screens
 from .tl_files import (TranslationMergeError, editable_output_path, index_tl_directory,
@@ -670,15 +671,17 @@ def load_tl_dialogue_map(tl_lang_dir: Path, language: str) -> dict[str, str]:
     与生成器输出格式一致，也兼容官方/手工格式。多行文本以还原后的
     真实换行存储。
     """
-    return _reusable_dialogue(index_tl_directory(tl_lang_dir, language).values())
+    return _reusable_dialogue(index_tl_directory(tl_lang_dir, language).values(), language)
 
 
-def _reusable_dialogue(docs) -> dict[str, str]:
+def _reusable_dialogue(docs, language, protected=(), *, needed=None) -> dict[str, str]:
     mapping = unambiguous_translations(
         (entry.original.strip(), entry.translation.strip())
         for doc in docs for entry in doc.entries
-        if entry.identifier and entry.original and entry.translation)
-    return {src: dst for src, dst in mapping.items() if dst and dst != src}
+        if entry.identifier and entry.original and entry.translation
+        and (needed is None or entry.original.strip() in needed))
+    return {src: dst for src, dst in mapping.items()
+            if dst and dst != src and reusable_dialogue(src, dst, language, protected)}
 
 
 # ---------------------------------------------------------------------------
@@ -729,7 +732,6 @@ def build_missing_fix(
     old_fix = docs.get(fix_file)
     installed = {entry.identifier for path, doc in docs.items() if path != fix_file
                  for entry in doc.entries if entry.identifier}
-    reusable = _reusable_dialogue(docs.values())
     lines = list(old_fix.lines) if old_fix else []
     claimed = set(installed)
     if old_fix:
@@ -742,6 +744,8 @@ def build_missing_fix(
 
     target = target_language_name(language)
     protected = set(names or ()) | set(getattr(client, "detected_names", ()))
+    reusable = _reusable_dialogue(docs.values(), language, protected,
+                                  needed={i.what.strip() for i in items if i.is_say and i.identifier not in claimed})
     pending: dict[str, list[MissingItem]] = {}
     resolved: list[tuple[MissingItem, str]] = []
     reused = kept = unsupported = 0
@@ -766,28 +770,39 @@ def build_missing_fix(
             pending.setdefault(key, []).append(item)
 
     error = ""
+    interrupted = False
     if pending and client is not None:
-        try:
-            translated = client.translate_texts(list(pending), target=target, names=names or [])
-        except PauseRequested:
-            raise
-        except (TranslationError, OSError, RuntimeError, ValueError) as exc:
-            translated = []
-            error = str(exc)
-        protected.update(getattr(client, "detected_names", ()))
-        failed = getattr(client, "failed_texts", ())
-        for key, value in zip(list(pending), translated):
-            if key in failed or not isinstance(value, str) or not value.strip():
-                continue
+        requested = list(pending)
+
+        def record(key, value):
+            nonlocal kept
+            if key not in pending or key in getattr(client, "failed_texts", ()):
+                return
+            if not isinstance(value, str) or not value.strip():
+                return
             value = value.strip()
             if value == key:
+                protected.update(getattr(client, "detected_names", ()))
                 if not valid_unchanged_text(key, target, protected):
-                    continue
+                    return
                 kept += len(pending[key])
             resolved.extend((item, value) for item in pending.pop(key))
+
+        try:
+            translated = client.translate_texts(requested, target=target, names=names or [], item_cb=record)
+            # Clients may report a result in the return value only. Items
+            # already recorded via callbacks are no longer in pending.
+            for key, value in zip(requested, translated):
+                record(key, value)
+        except PauseRequested:
+            interrupted = True
+        except (TranslationError, OSError, RuntimeError, ValueError) as exc:
+            error = str(exc)
     remaining = sum(len(group) for group in pending.values()) + unsupported
     if resolved:
         newline = old_fix.newline if old_fix else "\n"
+        report_order = {item.identifier: idx for idx, item in enumerate(items)}
+        resolved.sort(key=lambda pair: report_order[pair[0].identifier])
         if not old_fix:
             lines.append("# 运行时缺失对话自动补译（汉化工具生成）" + newline)
         if lines and not lines[-1].endswith(("\r", "\n")):
@@ -816,5 +831,7 @@ def build_missing_fix(
         detail += f"（{error}）"
     if log_cb:
         log_cb("运行时补译：" + detail)
+    if interrupted:
+        raise PauseRequested(f"运行时补译已暂停，尚有 {remaining} 条；重新开始会从缺失报告继续")
     return PatchResult(ok=not remaining, skip=not changed and not remaining,
                        files=[fix_file] if changed else [], message="运行时补译：" + detail)

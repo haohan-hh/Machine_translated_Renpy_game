@@ -4,12 +4,10 @@ from __future__ import annotations
 import io
 import json
 import os
-import shutil
 import socket
-import subprocess
+import sys
 import threading
 import tempfile
-import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -28,73 +26,89 @@ from rpytranslator.connection import (
 
 
 class ConnectionReadinessTests(unittest.TestCase):
-    @unittest.skipUnless(os.name == "nt", "Windows launcher integration")
-    def test_cmd_launches_with_inherited_store_and_waits_without_console_input(self):
-        # Run the real batch logic on a fresh port. Only the tray executable,
-        # its arguments and the port are substituted; the user's app is never used.
-        original = (Path(__file__).resolve().parents[1] / "start_ollama_fixed.cmd").read_text()
-        cmd = Path(os.environ["SystemRoot"]) / "System32" / "cmd.exe"
-        tray_name = f"tray-fixture-{os.getpid()}.exe"
-        for mode in ("already-ready", "configured", "bundled", "ollama-default"):
+    def test_cold_start_runs_without_wrapper_and_uses_same_model_store(self):
+        # A real child records its environment. Redirecting the version endpoint to
+        # a private port keeps the user's Ollama process and model store untouched.
+        from rpytranslator import connection
+
+        for mode in ("already-ready", "configured", "bundled", "legacy", "ollama-default"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                record = root / "tray.log"
+                record = root / "child.json"
+                fixture = root / "server.py"
+                fixture.write_text("import os, json, pathlib\n"
+                                   "keys = ['OLLAMA_MODELS', 'OLLAMA_HOST', 'OLLAMA_NUM_PARALLEL']\n"
+                                   "pathlib.Path('child.json').write_text(json.dumps([os.getenv(k) for k in keys]))",
+                                   encoding="utf-8")
+                selected = None
+                if mode in ("bundled", "configured", "legacy"):
+                    name = "ollama_user_data" if mode == "legacy" else "ollama_user_data_live"
+                    selected = root / "_dependencies" / name / "models"
+                    layout = "manifests" if mode == "legacy" else "manifests-v2"
+                    manifest = selected / layout / "example.test" / "library" / "model" / "latest"
+                    manifest.parent.mkdir(parents=True)
+                    manifest.touch()
+                    if mode == "legacy":
+                        (root / "_dependencies" / "ollama_user_data_live" / "models").mkdir(parents=True)
+                env = dict(os.environ, OLLAMA_NUM_PARALLEL="3")
+                env.pop("OLLAMA_MODELS", None)
+                if mode == "configured":
+                    selected = root / "custom model store"
+                    env["OLLAMA_MODELS"] = str(selected)
                 probes = []
-                delay = 1.3 if mode == "configured" else 0
 
                 class Version(BaseHTTPRequestHandler):
                     def log_message(self, *args):
                         pass
 
                     def do_GET(self):
-                        probes.append(time.monotonic())
-                        ready = mode == "already-ready" or (
-                            record.exists() and time.time() - record.stat().st_mtime >= delay)
+                        probes.append(self.path)
+                        ready = mode == "already-ready" or record.is_file()
                         self.send_response(200 if ready else 503)
-                        self.send_header("Content-Type", "application/json")
                         self.end_headers()
                         self.wfile.write(b'{"version":"test"}' if ready else b'{"error":"starting"}')
 
                 with HTTPServer(("127.0.0.1", 0), Version) as api:
-                    alt = f"127.0.0.1:{api.server_port}"
-                    batch = original.replace("127.0.0.1:11434", alt).replace("ollama app.exe", tray_name)
-                    batch = batch.replace("--hide --fast-startup", "/d /c capture.cmd")
-                    wrapper = root / "start_ollama_fixed.cmd"
-                    wrapper.write_text(batch, encoding="ascii")
-                    env = dict(os.environ, LOCALAPPDATA=str(root / "appdata"), TRAY_LOG=str(record))
-                    env.pop("OLLAMA_MODELS", None)
-                    bundled = root / "_dependencies" / "ollama_user_data_live" / "models"
-                    if mode in ("bundled", "configured"):
-                        (bundled / "manifests" / "registry.ollama.ai").mkdir(parents=True)
-                    selected = None
-                    if mode == "configured":
-                        selected = root / "custom model store"
-                        (selected / "manifests" / "private-registry").mkdir(parents=True)
-                        env["OLLAMA_MODELS"] = str(selected)
-                    elif mode == "bundled":
-                        selected = bundled
-                    if mode != "already-ready":
-                        app = Path(env["LOCALAPPDATA"]) / "Programs" / "Ollama"
-                        app.mkdir(parents=True)
-                        shutil.copyfile(cmd, app / tray_name)
-                        (app / "capture.cmd").write_text(
-                            '@echo off\nset OLLAMA_MODELS > "%TRAY_LOG%" 2>nul\n', encoding="ascii")
+                    origin = f"http://127.0.0.1:{api.server_port}"
                     threading.Thread(target=api.serve_forever, daemon=True).start()
                     try:
-                        result = subprocess.run([str(cmd), "/d", "/c", str(wrapper)], cwd=root, env=env,
-                                                stdin=subprocess.DEVNULL, capture_output=True, timeout=15,
-                                                creationflags=subprocess.CREATE_NO_WINDOW)
+                        with (patch("rpytranslator.connection._ollama_origin", return_value=origin),
+                              patch("rpytranslator.connection._ollama_project_root", return_value=root),
+                              patch("rpytranslator.connection._ollama_server_command",
+                                    return_value=[sys.executable, str(fixture)]) as command,
+                              patch.dict(os.environ, env, clear=True)):
+                            ready, detail = ensure_ollama_service(origin + "/v1", timeout=5)
+                            if mode != "already-ready" and connection._OLLAMA_START_PROCESS:
+                                connection._OLLAMA_START_PROCESS.wait(timeout=3)
                     finally:
                         api.shutdown()
-                self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+                self.assertTrue(ready, detail)
                 if mode == "already-ready":
+                    command.assert_not_called()
                     self.assertFalse(record.exists())
-                    self.assertEqual(len(probes), 1)
                 else:
-                    logged = record.read_text(encoding="mbcs").strip()
-                    self.assertEqual(logged, f"OLLAMA_MODELS={selected}" if selected else "")
-                    self.assertGreaterEqual(probes[-1] - probes[0], delay)
-                    self.assertLess(len(probes), 12)
+                    command.assert_called_once_with(root)
+                    self.assertEqual(json.loads(record.read_text()),
+                                     [str(selected) if selected else None, origin.split("://")[1], "3"])
+                self.assertEqual(set(probes), {"/api/version"})
+
+    def test_cold_start_finds_desktop_portable_or_path_without_using_working_directory(self):
+        from rpytranslator.connection import _ollama_server_command
+        name = "ollama.exe" if os.name == "nt" else "ollama"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = dict(os.environ, LOCALAPPDATA=str(root / "appdata"), PATH=str(root / "tools"))
+            candidates = [root / "tools" / name]
+            if os.name == "nt":
+                candidates += [root / "_dependencies" / "ollama_program" / name,
+                               root / "appdata" / "Programs" / "Ollama" / name]
+            with patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(FileNotFoundError):
+                    _ollama_server_command(root)
+                for candidate in candidates:
+                    candidate.parent.mkdir(parents=True)
+                    candidate.touch(mode=0o700)
+                    self.assertEqual(_ollama_server_command(root), [str(candidate), "serve"])
 
     def test_local_endpoint_detection_allows_empty_ollama_key(self) -> None:
         self.assertTrue(is_local_endpoint("http://localhost:11434/v1"))

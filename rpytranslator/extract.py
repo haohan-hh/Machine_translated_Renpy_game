@@ -25,33 +25,16 @@ from pathlib import Path
 # 基础：与 Ren'Py 一致的代码规范化
 # ---------------------------------------------------------------------------
 
-# 不能作为说话人标识符的 Ren'Py 语句关键字
+# Script-level statements. A screen-language word such as `text` or `button`
+# can be a character's name in script language, even if defined in another
+# file or dynamically. Screen, style and ATL bodies are dispatched separately.
 NON_WHO_KEYWORDS = {
     "play", "stop", "queue", "show", "hide", "scene", "with", "window",
     "voice", "pause", "call", "jump", "return", "label", "menu", "define",
     "default", "init", "image", "transform", "style", "screen", "translate",
     "python", "if", "elif", "else", "while", "for", "pass", "break",
-    "continue", "renpy", "not", "and", "or", "in", "is", "id",
-    # 屏幕/样式语言关键字与属性（`thumb "..."` 等不能被当作对话）
-    "add", "text", "textbutton", "imagebutton", "button", "bar", "vbar",
-    "hbar", "frame", "window", "fixed", "hbox", "vbox", "grid", "viewport",
-    "use", "key", "input", "style_prefix", "size_group", "properties",
-    "tile", "side", "scrollbar", "vscrollbar", "slider", "vslider", "label",
-    # style 属性（`color "#000"`、`thumb "gui/..."`、`scrollbars "vertical"`、
-    # `layout "subtitle"`、`background "gui/..."` 等是样式配置，不是对话）
-    "color", "layout", "thumb", "base_bar", "background", "foreground",
-    "xalign", "yalign", "xanchor", "yanchor", "xpos", "ypos", "xoffset",
-    "yoffset", "xsize", "ysize", "xpadding", "ypadding", "xmargin", "ymargin",
-    "spacing", "padding", "xfill", "yfill", "xmaximum", "ymaximum",
-    "xminimum", "yminimum", "text_align", "textalign", "size", "font",
-    "italic", "bold", "underline", "kerning", "line_spacing", "first_indent",
-    "rest_indent", "xzoom", "yzoom", "rotate", "alpha", "blend", "time",
-    "xcenter", "ycenter", "offset", "area", "hover_foreground",
-    "idle_foreground", "hover_background", "idle_background",
-    "selected_hover_background", "selected_idle_background",
-    "insensitive_background", "bar_vertical", "bar_invert", "unscrollable",
-    "thumb_offset", "left_gutter", "right_gutter", "top_gutter",
-    "bottom_gutter", "xscrollbar", "yscrollbar", "guiprop", "guivar",
+    "continue", "renpy", "not", "and", "or", "in", "is", "as", "id",
+    "camera", "layeredimage", "testcase", "rpy",
 }
 
 
@@ -228,73 +211,75 @@ def _parse_string_literal(s: str, pos: int, *, spoken: bool = False) -> tuple[st
     quote = m.group(1)
     triple = len(quote) == 3
     body_start = pos + len(quote)
-    i = body_start
-    n = len(s)
-    while i < n:
-        if triple and s.startswith(quote, i):
-            body = s[body_start:i]
-            return _unescape(body, quote), i + 3
-        if not triple and s[i] == quote[0]:
-            body = s[body_start:i]
-            return (_say_value(body) if spoken else _unescape(body, quote)), i + 1
-        if s[i] == "\\":
-            i += 2
-            continue
-        i += 1
+    end = _quoted_end(s, pos, quote)
+    if end is not None:
+        body = s[body_start:end - len(quote)]
+        return (_say_value(body) if spoken and not triple else _unescape(body, quote)), end
     # 未闭合：仅对三引号容忍（可能跨行）
     if triple:
-        return _unescape(s[body_start:], quote), n
+        return _unescape(s[body_start:], quote), len(s)
     return None, pos
 
 
-def strip_comment(line: str) -> str:
-    """去掉行内注释（# 后为注释），保留字符串内的 #。"""
-    in_str: str | None = None
-    i = 0
-    n = len(line)
-    while i < n:
-        ch = line[i]
-        if in_str:
-            if ch == "\\":
-                i += 2
-                continue
-            if line.startswith(in_str * 3, i):
-                i += 3
-                in_str = None
-                continue
-            if ch == in_str:
-                in_str = None
-            i += 1
-            continue
-        if ch in ('"', "'"):
-            if line.startswith(ch * 3, i):
-                in_str = ch
-                i += 3
-            else:
-                in_str = ch
-                i += 1
-            continue
-        if ch == "#":
-            return line[:i]
-        i += 1
-    return line
+def _quoted_end(text: str, pos: int, quote: str) -> int | None:
+    i = pos + len(quote)
+    while i < len(text):
+        if text.startswith(quote, i):
+            return i + len(quote)
+        i += 2 if text[i] == "\\" else 1
+    return None
 
 
-def _opens_triple(code: str) -> str | None:
-    """返回本行是否开启了未闭合的三引号字符串及其引号字符。"""
-    i, n = 0, len(code)
-    while i < n:
-        ch = code[i]
-        if ch == "\\":
-            i += 2
+def _expression_delimiter(text: str, start: int, stops: str, *, say_clauses: bool = False) -> int | None:
+    """Find a top-level delimiter without splitting Python strings or nested calls."""
+    pos = start
+    closing = []
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    while pos < len(text):
+        ch = text[pos]
+        if not closing:
+            if ch in stops:
+                return pos
+            if say_clauses and ch.isspace() and re.match(r"\s+(?:nointeract|id|with)\b", text[pos:]):
+                return pos
+        if ch in ('"', "'", "`"):
+            quote = ch * 3 if text.startswith(ch * 3, pos) else ch
+            end = _quoted_end(text, pos, quote)
+            if end is None:
+                return None
+            pos = end
             continue
-        if ch in ('"', "'") and code.startswith(ch * 3, i):
-            rest = code[i + 3:]
-            if ch * 3 in rest:
-                i = rest.index(ch * 3) + i + 6
-                continue
-            return ch
-        i += 1
+        if ch in pairs:
+            closing.append(pairs[ch])
+        elif ch in ")]}":
+            if not closing or ch != closing.pop():
+                return None
+        pos += 1
+    return pos if not closing else None
+
+
+def _say_arguments(text: str, start: int) -> tuple[str, int] | None:
+    """Mirror ArgumentInfo.get_code(): only argument separators and prefixes change.
+
+    In particular, expressions keep their original quoting, interior spacing
+    and even whitespace immediately before a comma; never evaluate game code.
+    """
+    pos, parts = start + 1, []
+    while pos < len(text):
+        end = _expression_delimiter(text, pos, ",)")
+        if end is None or end == len(text):
+            return None
+        arg = text[pos:end].lstrip()
+        if arg:
+            prefix = re.match(r"(?:(\*\*?)|([^\W\d]\w*)\s*=(?!=))\s*", arg)
+            if prefix:
+                arg = (prefix[1] or prefix[2] + "=") + arg[prefix.end():]
+            parts.append(arg)
+        elif text[end] != ")":
+            return None
+        if text[end] == ")":
+            return "(" + ", ".join(parts) + ")", end + 1
+        pos = end + 1
     return None
 
 
@@ -305,45 +290,49 @@ class _LogicalLine:
 
 
 def _logical_lines(raw: str) -> list[_LogicalLine]:
-    """把物理行合并为逻辑行：未闭合的三引号字符串会吸收后续行。
-    同时去除注释（跨行字符串内的 # 除外）。"""
-    lines = raw.replace("\ufeff", "").split("\n")
+    """按 Ren'Py 的字符串、括号及反斜杠续行规则分句，保留物理行号。"""
     result: list[_LogicalLine] = []
-    buf: list[str] = []
-    start_line = 0
-    open_quote: str | None = None
-
-    def flush():
-        nonlocal buf
-        if buf:
-            result.append(_LogicalLine("\n".join(buf), start_line))
-            buf = []
-
-    for idx, line in enumerate(lines, 1):
-        if open_quote:
-            # 跨行字符串内部：保留原文（不做注释剥离）
-            buf.append(line)
-            if open_quote * 3 in line:
-                open_quote = None
-                flush()
-            continue
-
-        code = strip_comment(line)
-        op = _opens_triple(code)
-        if op:
-            if not buf:
-                start_line = idx
-            buf.append(code)
-            open_quote = op
-        else:
-            if buf:
-                buf.append(code)
-                open_quote = None
-                flush()
+    parts: list[str] = []
+    depth = 0
+    quote = ""
+    start = 1
+    for number, physical in enumerate(raw.removeprefix("\ufeff").split("\n"), 1):
+        line = physical.removesuffix("\r")
+        i, end = 0, len(line)
+        continued = False
+        while i < end:
+            c = line[i]
+            if quote:
+                if c == "\\":
+                    i += 2
+                elif line.startswith(quote, i):
+                    i += len(quote)
+                    quote = ""
+                else:
+                    i += 1
+            elif c in ('"', "'", "`"):
+                quote = c * 3 if line.startswith(c * 3, i) else c
+                i += len(quote)
+            elif c == "#":
+                end = i
+            elif c == "\\" and i + 1 == end:
+                # Keep the newline for source locations, but leave only
+                # whitespace between tokens when parsing the joined statement.
+                end = i
+                continued = True
             else:
-                result.append(_LogicalLine(code, idx))
-    if buf:
-        flush()
+                if c in "([{":
+                    depth += 1
+                elif depth and c in ")]}":
+                    depth -= 1
+                i += 1
+        parts.append(line[:end])
+        if not (quote or depth or continued):
+            result.append(_LogicalLine("\n".join(parts), start))
+            parts.clear()
+            start = number + 1
+    if parts:
+        result.append(_LogicalLine("\n".join(parts), start))
     return result
 
 
@@ -365,9 +354,56 @@ _SCREEN_PROP_RE = re.compile(
 # define/default 中的 Character 调用
 _CHARACTER_RE = re.compile(r'\b\w*Character\s*\(')
 _CHARACTER_NAME_ARG = re.compile(r'\s*(?:name\s*=\s*)?(?:_\(\s*)?')
+# These Ren'Py settings contain identifiers, layout choices, or a file name,
+# even when a game assigns an ordinary quoted string. Real labels can use the
+# very same words; exclude only these assignments, never the words themselves.
+_NON_TEXT_SETTINGS = frozenset({
+    "gui.language", "gui.unscrollable", "config.language", "config.save_directory",
+    "config.version", "config.window", "config.window_icon", "build.name",
+})
+_DEFINE_ASSIGNMENT = re.compile(r'^(?:define|default)\s+([\w.]+)(?:\[[^\]]*\])?\s*(?:=|\+=)\s*')
+_IMAGE_EXPRESSION = re.compile(r"^image\s+[\w.]+(?:\s+[\w.]+)*\s*=(?!=)\s*")
 # 判断字符串是否值得翻译时，剥离 {标签} / [插值] / {#...} 特殊标记
 _STRIP_TAG_RE = re.compile(r"\{[^{}]*\}")
 _STRIP_INSERT_RE = re.compile(r"\[[^\[\]]*\]")
+
+
+def nontext_source_literals(raw: str) -> set[tuple[int, str, bool]]:
+    """Identify only source-proven false translation keys from older releases.
+
+    The last field distinguishes a string key (a direct engine setting) from a
+    dialogue ID (a conditional displayable's Python condition). A genuine UI
+    translation with the same spelling is never disqualified as a dialogue.
+    """
+    result = set()
+    for line in _logical_lines(raw):
+        code = line.text.strip()
+        definition = _DEFINE_ASSIGNMENT.match(code)
+        if definition and definition[1] in _NON_TEXT_SETTINGS:
+            pos = definition.end()
+            value, end = _parse_string_literal(code, pos)
+            if value is not None and not code[end:].strip():
+                result.add((line.line + code.count("\n", 0, pos), value, True))
+            continue
+        assignment = definition or _IMAGE_EXPRESSION.match(code)
+        if not assignment or "ConditionSwitch" not in code[assignment.end():]:
+            continue
+        rhs = code[assignment.end():]
+        try:
+            expr = ast.parse(rhs, mode="eval").body
+        except (SyntaxError, ValueError, RecursionError):
+            continue  # Without a complete expression, the old entry cannot be verified.
+        if not (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name)
+                and expr.func.id == "ConditionSwitch" and len(expr.args) % 2 == 0
+                and not any(isinstance(arg, ast.Starred) for arg in expr.args)):
+            continue
+        rhs_line = line.line + code.count("\n", 0, assignment.end())
+        # ConditionSwitch alternates condition, displayable, condition,
+        # displayable. A Text(_("...")) used as a displayable is real UI.
+        for condition in expr.args[::2]:
+            if isinstance(condition, ast.Constant) and isinstance(condition.value, str):
+                result.add((rhs_line + condition.lineno - 1, condition.value, False))
+    return result
 
 
 @dataclass
@@ -393,9 +429,6 @@ class RpyExtractor:
         # 这个基准下（`<global>.sub`），而不是链式叠加——见 _resolve_label_name。
         self._global_label: str | None = None
         self._stack: list[_Ctx] = []
-        self._open_define_parens = 0   # 跨行 define 未闭合的括号数
-        self._open_define: list[str] = []
-        self._define_line = 0
 
     # -- 通用 --------------------------------------------------------------
 
@@ -470,47 +503,14 @@ class RpyExtractor:
     def _indent_of(text: str) -> int:
         return len(text) - len(text.lstrip(" \t"))
 
-    @staticmethod
-    def _paren_net(text: str) -> int:
-        """统计一行中未闭合的 ( ) 数（忽略字符串与注释内的括号）。"""
-        depth = 0
-        i, n = 0, len(text)
-        while i < n:
-            ch = text[i]
-            if ch == "\\":
-                i += 2
-                continue
-            if ch in ('"', "'"):
-                quote = ch
-                triple = text.startswith(quote * 3, i)
-                if triple:
-                    end = text.find(quote * 3, i + 3)
-                    i = n if end == -1 else end + 3
-                else:
-                    i += 1
-                    while i < n:
-                        if text[i] == "\\":
-                            i += 2
-                            continue
-                        if text[i] == quote:
-                            break
-                        i += 1
-                    i += 1
-                continue
-            if ch == "#":
-                break
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-            i += 1
-        return depth
-
     # -- 主流程 ------------------------------------------------------------
 
     def parse(self, raw: str) -> ExtractionResult:
-        for ll in _logical_lines(raw):
+        lines = _logical_lines(raw)
+        for ll in lines:
             self._process_line(ll)
+        for unit in _underscore_strings(lines, self.filename):
+            self._add_string(unit.text, unit.line, context=unit.context)
         return ExtractionResult(
             dialogues=self.dialogues, strings=self.strings,
             files={self.filename: self.dialogues}, skipped=self.skipped,
@@ -529,16 +529,6 @@ class RpyExtractor:
 
         top = self._stack[-1] if self._stack else None
 
-        # 跨行 define 的延续行（ConditionSwitch / 字典 / 列表参数等），忽略
-        if self._open_define_parens:
-            self._open_define.append(stripped)
-            self._open_define_parens += self._paren_net(text)
-            if self._open_define_parens <= 0:
-                self._open_define_parens = 0
-                self._add_character_names(" ".join(self._open_define), self._define_line)
-                self._open_define.clear()
-            return
-
         # python / translate 块内：忽略语句（_() 字符串另由全局扫描处理）
         if top and top.kind in (_PYTHON, _TRANSLATE):
             return
@@ -546,6 +536,9 @@ class RpyExtractor:
         # 屏幕内文本控件：text / textbutton / label "文本"
         # （屏幕内没有 say 对话；其余语句一律跳过）
         if top and top.kind == _SCREEN:
+            if re.match(r"python\b.*:\s*$", stripped):
+                self._stack.append(_Ctx(_PYTHON, indent))
+                return
             sm = _SCREEN_TEXT_RE.match(stripped)
             if sm:
                 value, _ = _parse_string_literal(stripped, sm.start(2))
@@ -559,7 +552,12 @@ class RpyExtractor:
             return
 
         # 语句关键字
+        # `init -10 screen ...` uses the same sublanguage as `screen ...`;
+        # `init:` on its own contains regular script statements.
         keyword = self._keyword_of(stripped)
+        if keyword == "init":
+            stripped = re.sub(r"^init(?:\s+[+-]?\d+)?\s+(?=[A-Za-z_])", "", stripped)
+            keyword = self._keyword_of(stripped)
         if keyword == "label":
             self._handle_label(stripped)
             return
@@ -576,7 +574,7 @@ class RpyExtractor:
                     self._label = full
                     self._alternate = None
             return
-        if keyword in ("python", "init") and self._is_python_stmt(stripped):
+        if keyword == "python":
             self._stack.append(_Ctx(_PYTHON, indent))
             return
         if keyword == "translate":
@@ -589,14 +587,15 @@ class RpyExtractor:
         if keyword == "screen":
             self._stack.append(_Ctx(_SCREEN, indent))
             return
-        if keyword in ("style", "transform", "image", "layeredimage") and stripped.endswith(":"):
-            # style / transform / image (ATL) 块内只有属性语句，无对话
+        if (keyword in ("style", "transform", "image", "layeredimage", "show", "scene",
+                        "camera", "hide", "testcase") and stripped.endswith(":")):
+            # Style, ATL, and testcase bodies have their own grammar.
             self._stack.append(_Ctx(_PYTHON, indent))
             return
         if keyword in ("define", "default"):
             self._handle_define(stripped, ll.line)
             return
-        if keyword == "$":
+        if stripped.startswith("$"):
             return  # 单行 python
 
         # menu 上下文中的裸字符串 = 菜单选项/标题（仅限菜单体缩进）
@@ -628,12 +627,6 @@ class RpyExtractor:
     def _keyword_of(stripped: str) -> str | None:
         m = re.match(r"(\w+)", stripped)
         return m.group(1) if m else None
-
-    @staticmethod
-    def _is_python_stmt(stripped: str) -> bool:
-        if stripped.startswith("python"):
-            return True
-        return bool(re.match(r"^init(?:\s+[+-]?\d+)?\s+python\b", stripped))
 
     def _resolve_label_name(self, name: str) -> str:
         """按 Ren'Py 语义解析 label 名，返回完整名。
@@ -686,24 +679,15 @@ class RpyExtractor:
         return bool(_STRING_START.match(stripped))
 
     def _handle_define(self, stripped: str, line_no: int):
-        """define/default 语句：
-        1) 值直接是字符串（跳过明显非文本内容）
-        2) Character("名称") / DynamicCharacter(...) 的首个字符串参数
-        3) 跨行表达式（括号未闭合）时忽略后续参数行
-        """
-        self._open_define_parens += self._paren_net(stripped)
-        m = re.match(r'^(?:define|default)\s+[\w.]+(?:\[[^\]]*\])?\s*(?:=|\+=)\s*', stripped)
-        if m:
+        """提取直接定义的文本和 Character 的显示名称。"""
+        m = _DEFINE_ASSIGNMENT.match(stripped)
+        if m and m[1] not in _NON_TEXT_SETTINGS:
             value, _ = _parse_string_literal(stripped, m.end())
             if value is not None and self._is_translatable_plain_string(value):
                 # xxxVars.name = '...' 通常是角色名，与 Character 名称一样保留原文
                 ctx = "character" if re.search(r"\w+Vars\.name\s*=", stripped) else "define"
                 self._add_string(value, line_no, context=ctx)
-        if self._open_define_parens > 0:
-            self._open_define = [stripped]
-            self._define_line = line_no
-        else:
-            self._add_character_names(stripped, line_no)
+        self._add_character_names(stripped, line_no)
 
     def _add_character_names(self, stripped: str, line_no: int):
         for cm in _CHARACTER_RE.finditer(stripped):
@@ -714,7 +698,7 @@ class RpyExtractor:
             start = _CHARACTER_NAME_ARG.match(stripped, cm.end()).end()
             value, _ = _parse_string_literal(stripped, start)
             if value is not None and self._is_translatable_plain_string(value):
-                self._add_string(value, line_no, context="character")
+                self._add_string(value, line_no + stripped.count("\n", 0, start), context="character")
 
     @staticmethod
     def _is_translatable_plain_string(value: str) -> bool:
@@ -742,7 +726,7 @@ class RpyExtractor:
         m = re.match(r"^([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)", stripped)
         if m:
             who = m.group(1)
-            if who not in NON_WHO_KEYWORDS or who == "extend":
+            if who not in NON_WHO_KEYWORDS:
                 r = self._parse_say_rest(stripped, m.end())
                 if r is not None:
                     return r
@@ -773,7 +757,7 @@ class RpyExtractor:
             who = s[:pos].strip()
             while True:
                 j = i
-                while j < n and s[j] in " \t":
+                while j < n and s[j].isspace():
                     j += 1
                 m = re.match(r"([+-]?[A-Za-z_]\w*)", s[j:])
                 if not m:
@@ -782,13 +766,13 @@ class RpyExtractor:
                 i = j + len(m.group(1))
             # 临时属性：@ -a +b
             j = i
-            while j < n and s[j] in " \t":
+            while j < n and s[j].isspace():
                 j += 1
             if j < n and s[j] == "@":
                 i = j + 1
                 while True:
                     j = i
-                    while j < n and s[j] in " \t":
+                    while j < n and s[j].isspace():
                         j += 1
                     m = re.match(r"([+-]?[A-Za-z_]\w*)", s[j:])
                     if not m:
@@ -797,7 +781,7 @@ class RpyExtractor:
                     i = j + len(m.group(1))
 
         # 第一个字符串（必需）
-        while i < n and s[i] in " \t":
+        while i < n and s[i].isspace():
             i += 1
         what, i = _parse_string_literal(s, i, spoken=True)
         if what is None:
@@ -811,25 +795,29 @@ class RpyExtractor:
 
         # 字典键等代码形式：`"key" : value` / `'key' : value` → 不是 say
         j = i
-        while j < n and s[j] in " \t":
+        while j < n and s[j].isspace():
             j += 1
         if j < n and s[j] == ":":
             return None
 
         # 解析尾部标记
         while i < n:
-            while i < n and s[i] in " \t":
+            while i < n and s[i].isspace():
                 i += 1
             if i >= n:
                 break
-            if s.startswith("nointeract", i) and (i + 10 == n or s[i + 10] in " \t"):
+            if s.startswith("nointeract", i) and (i + 10 == n or s[i + 10].isspace()):
                 interact = False
                 i += 10
                 continue
-            m = re.match(r"with\s+([A-Za-z_][\w.]*|\([^)]*\))", s[i:])
+            m = re.match(r"with\s+", s[i:])
             if m:
-                with_expr = m.group(1)
-                i += len(m.group(0))
+                start = i + m.end()
+                end = _expression_delimiter(s, start, "", say_clauses=True)
+                if end is None or end <= start or with_expr is not None:
+                    return None
+                with_expr = s[start:end].rstrip()
+                i = end
                 continue
             m = re.match(r"id\s+([\w]+)", s[i:])
             if m:
@@ -837,19 +825,10 @@ class RpyExtractor:
                 i += len(m.group(0))
                 continue
             if s[i] == "(":
-                depth = 0
-                j = i
-                while j < n:
-                    if s[j] == "(":
-                        depth += 1
-                    elif s[j] == ")":
-                        depth -= 1
-                        if depth == 0:
-                            j += 1
-                            break
-                    j += 1
-                arguments = s[i:j]
-                i = j
+                parsed = _say_arguments(s, i)
+                if parsed is None or arguments is not None:
+                    return None
+                arguments, i = parsed
                 continue
             # 追加字符串（monologue 模式）
             v, ni = _parse_string_literal(s, i, spoken=True)
@@ -857,7 +836,7 @@ class RpyExtractor:
                 whats.append(v)
                 i = ni
                 continue
-            break
+            return None  # Never turn a partially parsed instruction into a simpler say.
 
         kwargs = dict(
             attributes=tuple(attributes) if attributes else None,
@@ -874,31 +853,67 @@ class RpyExtractor:
 # _() 字符串全局扫描
 # ---------------------------------------------------------------------------
 
-_UNDERSCORE_RE = re.compile(
-    r'\b(_p|___|__|_)\s*\(\s*'
-    r'(?P<quote>"""|\'\'\'|"|\')'
-)
+_CALL_OR_QUOTED = re.compile(r'''\b(?P<marker>_p|___|__|_)\s*\(\s*|["'`]''')
+
+
+def _paragraph_text(text: str) -> str:
+    """Return the key Ren'Py's _p registers after joining wrapped paragraphs."""
+    lines = [line.strip() for line in text.split("\n")]
+    if lines and not lines[0]:
+        lines.pop(0)
+    if lines and not lines[-1]:
+        lines.pop()
+    parts, paragraph = [], []
+    for line in lines:
+        if line:
+            paragraph.append(line)
+            if not re.search(r"\{p[^}]*\}$", line):
+                continue
+        parts.append(" ".join(paragraph) + ("" if line else "\n\n"))
+        paragraph.clear()
+    return "".join(parts) + " ".join(paragraph)
 
 
 def scan_underscore_strings(text: str, filename: str) -> list[StringUnit]:
     """扫描 _()/__()/___()/_p() 字符串调用（对应 Ren'Py STRING_RE）。
     基于逻辑行扫描，支持跨行三引号字符串。"""
+    return _underscore_strings(_logical_lines(text), filename)
+
+
+def _underscore_strings(lines: list[_LogicalLine], filename: str) -> list[StringUnit]:
     result: list[StringUnit] = []
     seen: set[str] = set()
-    for ll in _logical_lines(text):
+    for ll in lines:
+        if "_" not in ll.text:
+            continue
         i = 0
-        while True:
-            m = _UNDERSCORE_RE.search(ll.text, i)
-            if not m:
-                break
-            value, end = _parse_string_literal(ll.text, m.start("quote"))
-            i = end if end > m.start() else m.start() + 1
-            if value is not None and value not in seen and 0 < len(value) <= 2000:
+        while m := _CALL_OR_QUOTED.search(ll.text, i):
+            if not m["marker"]:
+                quote = m[0] * 3 if ll.text.startswith(m[0] * 3, m.start()) else m[0]
+                i = _quoted_end(ll.text, m.start(), quote) or len(ll.text)
+                continue
+            i = m.end()
+            parts = []
+            while i < len(ll.text):
+                if ll.text[i] in "uU" and i + 1 < len(ll.text) and ll.text[i + 1] in "\"'":
+                    i += 1
+                part, end = _parse_string_literal(ll.text, i)
+                if part is None:
+                    break
+                parts.append(part)
+                i = end
+                while i < len(ll.text) and ll.text[i].isspace():
+                    i += 1
+            if not parts or ll.text[i:i + 1] != ")":
+                continue  # A computed expression has no single static translation key.
+            i += 1
+            value = "".join(parts)
+            if m["marker"] == "_p":
+                value = _paragraph_text(value)
+            if value not in seen and RpyExtractor._is_translatable_text(value):
                 seen.add(value)
-                if not RpyExtractor._is_translatable_text(value):
-                    continue
                 result.append(StringUnit(text=value, filename=filename,
-                                         line=ll.line, context="_()"))
+                                         line=ll.line + ll.text.count("\n", 0, m.start()), context="_()"))
     return result
 
 
@@ -914,14 +929,7 @@ def extract_rpy_file(path: str | Path) -> ExtractionResult:
     except OSError as e:
         return ExtractionResult(skipped=[f"无法读取 {p}: {e}"])
 
-    extractor = RpyExtractor(p)
-    result = extractor.parse(raw)
-
-    for u in scan_underscore_strings(raw, str(p)):
-        if u.text not in extractor.seen_strings:
-            extractor.seen_strings.add(u.text)
-            result.strings.append(u)
-    return result
+    return RpyExtractor(p).parse(raw)
 
 
 def extract_rpy_files(files: list[Path]) -> ExtractionResult:

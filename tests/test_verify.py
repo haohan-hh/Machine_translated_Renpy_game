@@ -6,10 +6,10 @@ import textwrap
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from rpytranslator import patcher
-from rpytranslator.translator import TranslationError
+from rpytranslator.translator import PauseRequested, TranslationError
 from rpytranslator.verify import (
     FIX_FILE_NAME,
     LANGUAGE_SWITCH_PATCH_NAME,
@@ -307,11 +307,38 @@ class MissingFixTests(unittest.TestCase):
         self.assertFalse(first.ok)
         self.assertIn("1 条待补译", first.message)
         self.assertEqual(first.files, [self.fix])
-        client.translate_texts.assert_called_once_with(["Good evening.", "Good night."], target="Japanese", names=["Mio"])
+        client.translate_texts.assert_called_once_with(["Good evening.", "Good night."], target="Japanese", names=["Mio"], item_cb=ANY)
         self.assertNotIn("translate japanese last", self.fix.read_text(encoding="utf-8-sig"))
         client.translate_texts.return_value = ["お休み。"]
         self.assertTrue(build_missing_fix(self.game, self.lang, client).ok)
-        client.translate_texts.assert_called_with(["Good night."], target="Japanese", names=[])
+        client.translate_texts.assert_called_with(["Good night."], target="Japanese", names=[], item_cb=ANY)
+
+    def test_pause_saves_resolved_runtime_ids_and_resumes_only_missing_text(self) -> None:
+        self.report_items(("first", "The gate is open."), ("second", "The gate is open."),
+                          ("unanswered", "Good night."), ("variable", "[player]"))
+        client = Mock(detected_names=(), failed_texts=set())
+
+        def pause_with_partial(texts, *, item_cb, **_):
+            self.assertEqual(texts, ["The gate is open.", "Good night."])
+            item_cb(texts[0], "門が開いています。")
+            raise PauseRequested()
+
+        client.translate_texts.side_effect = pause_with_partial
+        with self.assertRaisesRegex(PauseRequested, "尚有 1 条"):
+            build_missing_fix(self.game, self.lang, client=client)
+        saved = self.fix.read_text(encoding="utf-8-sig")
+        for identifier in ("first", "second", "variable"):
+            self.assertIn(f"translate japanese {identifier}:", saved)
+        self.assertNotIn("translate japanese unanswered:", saved)
+
+        client.translate_texts.side_effect = None
+        client.translate_texts.return_value = ["お休み。"]
+        resumed = build_missing_fix(self.game, self.lang, client=client)
+        client.translate_texts.assert_called_with(["Good night."], target="Japanese", names=[], item_cb=ANY)
+        self.assertTrue(resumed.ok, resumed.message)
+        final = self.fix.read_text(encoding="utf-8-sig")
+        self.assertTrue(final.startswith(saved))
+        self.assertIn("translate japanese unanswered:", final)
 
     def test_mismatched_truncated_and_complex_reports_do_not_overwrite_the_patch(self) -> None:
         self.report_items(("multi", "First of two."))
@@ -348,7 +375,7 @@ class MissingFixTests(unittest.TestCase):
         self.assertFalse(self.fix.exists())
         self.assertEqual(compiled.read_bytes(), b"existing compiled fix")
         self.assertIn("もしもし", result.files[0].read_text(encoding="utf-8-sig"))
-        client.translate_texts.assert_called_once_with(["Hello"], target="Japanese", names=[])
+        client.translate_texts.assert_called_once_with(["Hello"], target="Japanese", names=[], item_cb=ANY)
 
     def test_names_and_interpolations_register_without_request_and_keep_whitespace(self) -> None:
         self.report_items(("named", r"\n Mio [player]  "), ("var", "[party[hero].name!q]"), ("sign", "..."))
@@ -369,7 +396,7 @@ class MissingFixTests(unittest.TestCase):
         fix = self.game / "tl" / lang / FIX_FILE_NAME
         self.report_items(("match", "Good day."), ("failed", "Please wait."), ("unknown", "ヴェラ"))
         client = Mock(detected_names=(), failed_texts=set())
-        def generate(texts, *, target, names):
+        def generate(texts, *, target, names, item_cb):
             self.assertEqual(target, "English")
             client.detected_names = ("ヴェラ",)
             client.failed_texts.add("Please wait.")

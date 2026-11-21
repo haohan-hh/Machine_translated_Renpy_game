@@ -460,6 +460,47 @@ class PatcherTests(unittest.TestCase):
                                      if 'textbutton _("Window")' in line))
         self.assertTrue(patcher._language_ui_is_top_aligned(patched))
 
+    def test_menu_inherits_each_block_indent_without_reparenting_game_controls(self) -> None:
+        # Roads has an eight-space indent jump after `use` and four after `vbox`.
+        # Four spaces are conventional in Ren'Py but are not required at every level.
+        for use_indent, box_indent, contents_indent in ((4, 12, 16), (2, 4, 6), (4, 8, 16)):
+            with self.subTest(indents=(use_indent, box_indent, contents_indent)):
+                src = ("screen preferences():\n" + ' ' * use_indent + "use game_menu('Options'): # settings\n"
+                       + '\n' + ' ' * box_indent + "vbox:\n" + ' ' * contents_indent + "xalign .5\n"
+                       + ' ' * contents_indent + "hbox: # original game options\n"
+                       + ' ' * (contents_indent + 4) + "textbutton 'Window' action NullAction()\n")
+                result = patcher._build_language_ui(src, with_font=True)
+                box = result.index(' ' * box_indent + 'vbox:')
+                row = result.index(' ' * contents_indent + patcher._LANG_UI_MARKER)
+                game_controls = result.index(' ' * contents_indent + 'hbox: # original game options')
+                self.assertLess(box, row)
+                self.assertLess(row, game_controls)
+                self.assertIn('\n' + ' ' * contents_indent + 'timer 0.25', result)
+                self.assertTrue(patcher._language_ui_is_top_aligned(result))
+
+    def test_font_stays_inside_viewport_before_dedented_screen_siblings(self) -> None:
+        src = ("screen preferences():\n  viewport:\n       mousewheel True\n       has vbox\n"
+               "       textbutton 'Chinese' action Language('schinese')\n"
+               "  textbutton 'Back' action Return()\n")
+        generated = patcher._apply_font_ui(src, 'schinese')
+        self.assertIn('\n       ' + patcher._FONT_UI_MARKER + '\n', generated)
+        self.assertLess(generated.index(patcher._FONT_UI_MARKER), generated.index("textbutton 'Back'"))
+        src = src.replace('viewport:\n       mousewheel True\n       has vbox\n',
+                          "use game_menu('Options'):\n     vbox:\n")
+        generated = patcher._apply_font_ui(src, 'schinese')
+        self.assertIn('\n       ' + patcher._FONT_UI_MARKER + '\n', generated)
+        self.assertLess(generated.index(patcher._FONT_UI_MARKER), generated.index("textbutton 'Back'"))
+
+    def test_flush_left_comment_between_controls_does_not_drop_remainder_of_menu(self) -> None:
+        src = ("screen preferences():\n    vbox:\n        text 'Sound'\n"
+               "# Controls below the sound section.\n        text 'Music'\n"
+               "# This introduces the next screen.\nscreen help():\n    pass\n")
+        generated = patcher._build_language_ui(src)
+        self.assertIn("text 'Sound'", generated)
+        self.assertIn("text 'Music'", generated)
+        self.assertNotIn('introduces the next screen', generated)
+        self.assertNotIn('screen help()', generated)
+
     def test_language_picker_sibling_to_existing_root_vbox_is_unhealthy(self) -> None:
         text = (
             f"init {patcher._LANGUAGE_UI_PRIORITY} screen preferences():\n"
@@ -471,6 +512,13 @@ class PatcherTests(unittest.TestCase):
             "        vbox:\n"
             '            textbutton _("Window")\n'
         )
+        self.assertFalse(patcher._language_ui_is_top_aligned(text))
+
+    def test_picker_wrapping_original_controls_in_its_hbox_is_unhealthy(self) -> None:
+        text = ("screen preferences():\n    use game_menu('Preferences'):\n"
+                f"        {patcher._LANG_UI_MARKER}\n        hbox:\n"
+                "            style_prefix 'radio'\n            vbox:\n"
+                "                text 'Window'\n")
         self.assertFalse(patcher._language_ui_is_top_aligned(text))
 
     def test_old_bottom_aligned_language_picker_is_not_considered_healthy(self) -> None:

@@ -5,6 +5,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -14,6 +15,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from concurrent.futures import Future
+from enum import Enum
 from http.client import HTTPException
 from urllib.parse import urlparse
 
@@ -83,23 +85,49 @@ def _ollama_project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _ollama_server_command(root: Path) -> list[str]:
+    """Find the CLI supplied with the desktop app or this portable installation."""
+    candidates = []
+    if os.name == "nt":
+        appdata = os.environ.get("LOCALAPPDATA")
+        if appdata:
+            candidates.append(Path(appdata) / "Programs" / "Ollama" / "ollama.exe")
+        candidates.append(root / "_dependencies" / "ollama_program" / "ollama.exe")
+    for path in candidates:
+        if path.is_file():
+            return [str(path), "serve"]
+    # Match absolute PATH entries on every supported Python/Windows version;
+    # do not implicitly search the terminal's current game directory.
+    binary = "ollama.exe" if os.name == "nt" else "ollama"
+    for location in os.get_exec_path():
+        directory = Path(location.strip('"'))
+        candidate = directory / binary
+        if directory.is_absolute() and candidate.is_file() and os.access(candidate, os.X_OK):
+            return [str(candidate), "serve"]
+    raise FileNotFoundError("未找到 Ollama 程序；请安装 Ollama 或将其加入 PATH。")
+
+
+def _ollama_server_env(root: Path, origin: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env["OLLAMA_HOST"] = urlparse(origin).netloc
+    if not env.get("OLLAMA_MODELS"):
+        stores = [root / "_dependencies" / name / "models"
+                  for name in ("ollama_user_data_live", "ollama_user_data")]
+        for models in stores:
+            if any(p.is_file() for p in models.glob("manifests*/*/*/*/*")):
+                env["OLLAMA_MODELS"] = str(models)
+                break
+    env.setdefault("OLLAMA_NO_CLOUD", "1")
+    return env
+
+
 def ensure_ollama_service(
     base_url: str,
     *,
     timeout: float = 60.0,
     launcher: str | os.PathLike[str] | None = None,
 ) -> tuple[bool, str]:
-    """Ensure the bundled Ollama server is reachable.
-
-    The desktop Ollama app can be opened without starting its API child when
-    its model directory was moved to another drive.  In that state a normal
-    connection test reports a misleading "service not started" error until
-    ``start_ollama_fixed.cmd`` is run.  For the standard local Ollama endpoint
-    we first probe ``/api/version`` and, only when it is unavailable, launch
-    the repository wrapper, which honors the configured model directory. Calls are
-    serialized so a test and a translation started together never launch two
-    tray instances.
-    """
+    """Reuse a manually opened Ollama; start its API with the same store when needed."""
     try:
         endpoint_parts(base_url)
     except ValueError as exc:
@@ -116,28 +144,25 @@ def ensure_ollama_service(
     if _version_ready():
         return True, ""
 
-    root = _ollama_project_root()
-    script = Path(launcher) if launcher else root / "start_ollama_fixed.cmd"
-    if not script.is_absolute():
-        script = root / script
-    if not script.exists():
-        return False, "Ollama 启动脚本不存在: %s" % script
-
     global _OLLAMA_START_PROCESS
     with _OLLAMA_START_LOCK:
-        # Keep the lock until readiness resolves. A connection test and a
-        # translation can enter together while the first launch is still
-        # starting; releasing the lock immediately after Popen would let both
-        # launch a tray app before either /api/version check succeeds.
         if _version_ready():
             return True, ""
+        root = _ollama_project_root()
         try:
-            creationflags = 0
-            if os.name == "nt":
-                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            if launcher is None:
+                command = _ollama_server_command(root)
+                env = _ollama_server_env(root, origin)
+            else:
+                # Older callers can still explicitly provide their own launcher.
+                script = root / Path(launcher)
+                if not script.is_file():
+                    return False, "Ollama 启动脚本不存在: %s" % script
+                command = (["cmd.exe", "/d", "/c", str(script)]
+                           if os.name == "nt" and script.suffix.lower() in (".cmd", ".bat") else [str(script)])
+                env = None
             _OLLAMA_START_PROCESS = subprocess.Popen(
-                ["cmd.exe", "/d", "/c", str(script)],
-                cwd=str(root), creationflags=creationflags,
+                command, cwd=str(root), env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -145,14 +170,18 @@ def ensure_ollama_service(
             return False, "无法启动 Ollama: %s" % exc
 
         deadline = time.monotonic() + max(0.0, timeout)
+        exited_at = None
         while True:
             if _version_ready():
                 return True, ""
             code = _OLLAMA_START_PROCESS.poll()
             if code not in (None, 0):
-                if code == 4:
-                    return False, "未找到 Ollama 桌面程序，请确认已安装 Ollama。"
-                return False, "Ollama 启动脚本退出，退出码 %s" % code
+                # The tray can win the port between our readiness probe and
+                # `serve`. Briefly wait for its API before reporting the exit.
+                if exited_at is None:
+                    exited_at = time.monotonic()
+                if time.monotonic() >= min(deadline, exited_at + 3):
+                    return False, "Ollama 启动进程已退出（退出码 %s），服务仍未就绪。请查看 Ollama 日志。" % code
             if time.monotonic() >= deadline:
                 return False, "Ollama 服务未在 %.0f 秒内就绪" % timeout
             time.sleep(0.5)
@@ -254,6 +283,8 @@ def _read_json(request: urllib.request.Request, timeout: float) -> tuple[int, ob
             body = exc.read().decode("utf-8", errors="replace")[:300]
         except Exception:
             pass
+        finally:
+            exc.close()
         return exc.code, None, body or str(exc.reason)
     except (OSError, HTTPException) as exc:
         return 0, None, str(exc)
@@ -264,6 +295,174 @@ def _json_get(url: str, *, timeout: float, api_key: str = "") -> tuple[int, obje
     if api_key:
         request.add_header("Authorization", "Bearer " + api_key)
     return _read_json(request, timeout)
+
+
+class ModelPrompt(Enum):
+    ABSENT = "absent"
+    PRESENT = "present"
+    UNKNOWN = "unknown"
+    REMOTE = "remote"
+
+
+def _modelfile_prompt(text: str) -> ModelPrompt:
+    """Read Ollama's generated directives, never examples inside a quoted TEMPLATE/LICENSE."""
+    has_from = False
+    template_state = ModelPrompt.ABSENT
+    lines = iter(text.splitlines())
+    for line in lines:
+        fields = line.strip().split(None, 1)
+        if len(fields) != 2 or fields[0].startswith("#"):
+            continue
+        key, value = fields[0].upper(), fields[1].strip()
+        if key == "MESSAGE":
+            role_value = value.split(None, 1)
+            if role_value[0].upper() == "SYSTEM":
+                key = "SYSTEM"
+            value = role_value[1] if len(role_value) == 2 else ""
+        if value.startswith('"""'):
+            content = value[3:]
+            if '"""' not in content:
+                parts = [content]
+                for continuation in lines:
+                    parts.append(continuation)
+                    if '"""' in continuation:
+                        break
+                else:
+                    return ModelPrompt.UNKNOWN
+                content = "\n".join(parts)
+            value = content.split('"""', 1)[0]
+        elif value.startswith('"') and value.endswith('"'):
+            value = value[1:-1]
+        if key == "SYSTEM" and value.strip():
+            return ModelPrompt.PRESENT
+        if key == "TEMPLATE":
+            template_state = _template_prompt(value)
+            if template_state == ModelPrompt.PRESENT:
+                return template_state
+        if key == "FROM" and value.strip():
+            has_from = True
+    return template_state if has_from else ModelPrompt.UNKNOWN
+
+
+# Some chat templates supply fixed instructions even without a SYSTEM layer.
+# Role delimiters or {{ .System }} alone only render a caller-provided message.
+_FIXED_TEMPLATE_PROMPT = re.compile(
+    r"(?:<\|im_start\|>system|<\|start_header_id\|>system<\|end_header_id\|>|<\|system\|>|<<SYS>>)"
+    r"(?:\s|\\[rn])*[^\W\d_]"
+    r"|(?:\{%[- ]*set\s+(?:default_)?system_(?:message|prompt)\s*=|\|\s*default\()\s*[\"'][^\W\d_]"
+    r"|(?:^|}})\s*(?:you are\b|你是|你的任务是)", re.I | re.M)
+
+_TEMPLATE_TAG = re.compile(r"(\{\{.*?\}\}|\{%.*?%\}|\{#.*?#\})", re.S)
+_TEMPLATE_STRING = re.compile(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`[^`]*`''', re.S)
+_CHAT_DELIMITERS = re.compile(
+    r"<\|[\w.:/-]+\|>|</?(?:s|think|tools|tool_call|tool_response)>|\[/?INST\]|<</?SYS>>|\\[nrt]"
+    r"|\b(?:system|user|assistant|tool|name|arguments)\b", re.I)
+
+
+def _template_prompt(template: str) -> ModelPrompt:
+    """Recognize plain turn serialization without executing a server-supplied template."""
+    active = True
+    parents = []
+    fragments = []
+    for part in _TEMPLATE_TAG.split(template):
+        if part.startswith('{#'):
+            continue
+        if part.startswith('{%'):
+            action = part[2:-2].strip(' -\r\n\t')
+            keyword = action.split(None, 1)[0] if action else ''
+            if keyword == 'if':
+                parents.append(active)
+                # Qwen documents its tool protocol here. This app sends no tools.
+                active = active and action != 'if tools'
+            elif keyword in ('else', 'elif', 'endif'):
+                if not parents:
+                    return ModelPrompt.UNKNOWN
+                active = parents.pop() if keyword == 'endif' else parents[-1]
+            if active and keyword == 'set':
+                # Assigned prose may be printed later as {{ variable }}.
+                fragments.extend(_TEMPLATE_STRING.findall(action))
+            elif active and keyword not in ('if', 'elif', 'else', 'endif', 'for', 'endfor'):
+                # Includes, macros and output extensions can supply text outside
+                # the literal fragments we can inspect without running a template.
+                return ModelPrompt.UNKNOWN
+            continue
+        if not active:
+            continue
+        if part.startswith('{{'):
+            expression = part[2:-2].strip(' -\r\n\t')
+            if not expression.startswith('/*'):
+                fragments.extend(_TEMPLATE_STRING.findall(expression))
+        else:
+            fragments.append(part)
+    if parents:
+        return ModelPrompt.UNKNOWN
+    # An unfamiliar literal in a print expression, conditional fallback or plain
+    # text might be an instruction in any language. Preserve the provider default.
+    if _FIXED_TEMPLATE_PROMPT.search(template):
+        return ModelPrompt.PRESENT
+    return (ModelPrompt.UNKNOWN if any(re.search(r"[^\W\d_]", _CHAT_DELIMITERS.sub(' ', f)) for f in fragments)
+            else ModelPrompt.ABSENT)
+
+
+def _model_prompt_from_show(payload: object) -> ModelPrompt:
+    if not isinstance(payload, dict) or payload.get("error"):
+        return ModelPrompt.UNKNOWN
+    system = payload.get("system", "")
+    if not isinstance(system, str):
+        return ModelPrompt.UNKNOWN
+    if system.strip():
+        return ModelPrompt.PRESENT
+    messages = payload.get("messages", [])
+    if not isinstance(messages, list):
+        return ModelPrompt.UNKNOWN
+    for message in messages:
+        if not isinstance(message, dict) or not isinstance(message.get("role"), str):
+            return ModelPrompt.UNKNOWN
+        if message["role"].lower() == "system":
+            content = message.get("content")
+            if not isinstance(content, str):
+                return ModelPrompt.UNKNOWN
+            if content.strip():
+                return ModelPrompt.PRESENT
+    info = payload.get("model_info", {})
+    if not isinstance(info, dict):
+        return ModelPrompt.UNKNOWN
+    template = payload.get("template", "")
+    templates = [template]
+    # Some providers expose a GGUF template only as tokenizer metadata. An
+    # empty SYSTEM layer with a generic outer template is not sufficient.
+    templates.extend(value for key, value in info.items() if isinstance(key, str)
+                     and (key == 'tokenizer.chat_template' or key.startswith('tokenizer.chat_template.')))
+    states = [_template_prompt(item) if isinstance(item, str) else ModelPrompt.UNKNOWN for item in templates]
+    if ModelPrompt.PRESENT in states:
+        return ModelPrompt.PRESENT
+    template_state = ModelPrompt.UNKNOWN if ModelPrompt.UNKNOWN in states else ModelPrompt.ABSENT
+    modelfile = payload.get("modelfile")
+    if isinstance(modelfile, str) and modelfile.strip():
+        directives = _modelfile_prompt(modelfile)
+        return directives if directives is not ModelPrompt.ABSENT else template_state
+    # Current Ollama omits empty optional fields. An unrelated JSON object or
+    # proxy's generic success response must never count as a promptless model.
+    if "system" in payload or (isinstance(template, str) and template.strip() and isinstance(payload.get("details"), dict)):
+        return template_state
+    return ModelPrompt.UNKNOWN
+
+
+def selected_model_prompt(base_url: str, model: str, *, api_key: str = "", timeout: float = 4) -> ModelPrompt:
+    """Inspect only the selected local service; other OpenAI-compatible APIs need not expose presets."""
+    if not is_local_endpoint(base_url):
+        return ModelPrompt.REMOTE
+    parsed = urlparse(base_url.strip())
+    if parsed.path.rstrip("/") not in ("", "/v1", "/chat/completions", "/v1/chat/completions"):
+        return ModelPrompt.UNKNOWN
+    req = urllib.request.Request(
+        parsed._replace(path="/api/show", fragment="").geturl(),
+        data=json.dumps({"model": model}).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"})
+    if api_key:
+        req.add_header("Authorization", "Bearer " + api_key)
+    status, payload, _detail = _read_json(req, timeout)
+    return _model_prompt_from_show(payload) if status == 200 else ModelPrompt.UNKNOWN
 
 
 def wait_for_model_registration(

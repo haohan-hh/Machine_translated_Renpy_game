@@ -929,13 +929,12 @@ class GuiApp(XamlApplication):
                 timeout=120,
                 max_retries=1,
             )
-            client = TranslationClient(test_cfg)
+            client = TranslationClient(test_cfg, log=self.msg_q.put)
             t0 = time.monotonic()
             resp = ""
             for attempt in range(4):
                 try:
-                    resp = client.chat(
-                        [{"role": "user", "content": "你好"}]).strip()
+                    resp = client.test_connection()
                     break
                 except TranslationError as exc:
                     detail = str(exc).lower()

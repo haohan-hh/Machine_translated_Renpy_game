@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from rpytranslator.audit import AuditItem, classify, plan_retry_queue, run_audit
 from rpytranslator.extract import (DialogueUnit, RpyExtractor, StringUnit,
-                                   extract_rpy_files, make_dialogue_identifier)
+                                   extract_rpy_files, make_dialogue_identifier, nontext_source_literals)
 from rpytranslator.generator import parse_existing_translations, write_translation_files
 from rpytranslator.glossary import save_game_terms
 from rpytranslator.reports import parse_external_report, read_retry_entries, read_retry_queue
@@ -73,12 +73,87 @@ class TranslationFilesTests(unittest.TestCase):
         self.assertEqual(result.dialogues[0].what, 'Two words. One  more. [[name].')
         self.assertEqual(result.strings[0].text, 'UI  spaces')
 
+    def test_multiline_code_is_not_speech_but_marked_ui_keeps_its_key_and_line(self):
+        source = self.game / "expressions.rpy"
+        source.write_text('''image panel = ConditionSwitch(
+    "renpy.variant('small')", "mobile",  # ) and _( "Comment" )
+    "renpy.showing(']#')", Text(
+        _(u"A #lit "
+          "button")
+    ),
+    "True", "normal")
+define variants = [
+    "not a narration",
+    {
+        "condition": "a value",
+    },
+]
+define gui.language = "unicode"
+define build.name = "game_binary"
+define config.name = "Visible title"
+define e = Character(
+    "Chief May")
+label start:
+    e \\
+        "Still real speech [hero]." id continued
+    "An opening ( and # stay in dialogue."
+    "Expressions like _('quoted code') are speech here."
+    $ label_ = _("dynamic " + variable)
+screen info():
+    text "unicode"
+''', encoding="utf-8")
+        result = extract_rpy_files([source])
+        self.assertEqual([(d.who, d.what, d.line) for d in result.dialogues], [
+            ("e", "Still real speech [hero].", 20),
+            (None, "An opening ( and # stay in dialogue.", 22),
+            (None, "Expressions like _('quoted code') are speech here.", 23),
+        ])
+        self.assertEqual(result.dialogues[0].identifier, "continued")
+        self.assertCountEqual([(u.text, u.line, u.context) for u in result.strings], [
+            ("A #lit button", 4, "_()"), ("Visible title", 16, "define"),
+            ("Chief May", 18, "character"), ("unicode", 26, "screen"),
+        ])
+
+    def test_p_key_matches_displayed_wrapped_paragraphs_and_keeps_hash_inside_the_quote(self):
+        result = RpyExtractor("about.rpy").parse('''define gui.about = _p("""
+    A "quoted" # sign
+    and closing brackets )].
+
+    Another {p}
+    final line.
+""")  # _( "Ignored" )
+label next:
+    "Outside."
+''')
+        self.assertEqual([(s.text, s.line) for s in result.strings], [
+            ('A "quoted" # sign and closing brackets )].\n\nAnother {p}final line.', 1)])
+        self.assertEqual([(d.what, d.line) for d in result.dialogues], [("Outside.", 9)])
+
+    def test_historical_filter_uses_only_proven_condition_positions_and_setting_literals(self):
+        source = '''image panel = ConditionSwitch(
+    "common key", Text(_("common key")),
+    "True", "ordinary displayable")
+image ambiguous = ConditionSwitch(*options, "unknown role", fallback)
+define gui.language = "unicode"
+default config.window = "prefix-" + phase
+screen keys():
+    text "unicode"
+label start:
+    "common key"
+'''
+        self.assertEqual(nontext_source_literals(source), {
+            (2, "common key", False), (3, "True", False), (5, "unicode", True)})
+
     @unittest.skipUnless(os.environ.get("RENPY_TEST_LAUNCHER"), "Set RENPY_TEST_LAUNCHER to run the engine test")
     def test_engine_loads_generated_dialogues_and_menu_strings(self):
         launcher = Path(os.environ["RENPY_TEST_LAUNCHER"])
         root = self.game.parent
         src = self.game / "story.rpy"
         src.write_text('define e = Character("Captain May")\n'
+                       'image panel = ConditionSwitch(\n'
+                       '    "renpy.variant(\'small\')", Solid("#000"),\n'
+                       '    "True", Text(_(u"Harbor "\n        "sign")))\n'
+                       'define description = _p("""\n    Dock\n    open.\n\n    Wait.\n""")\n'
                        'label start:\n    menu route:\n'
                        '        e happy "Where next?"\n'
                        '        "Harbor {#route}":\n            e "Set sail." id fixed_name\n'
@@ -87,7 +162,10 @@ class TranslationFilesTests(unittest.TestCase):
         (self.game / "options.rpy").write_text(options, encoding="utf-8")
         result = extract_rpy_files([src])
         ds = {u.identifier: "译文" for u in result.dialogues}
-        self.write(result.dialogues, result.strings, ds, {"Harbor {#route}": "港口"})
+        self.assertEqual([u.what for u in result.dialogues], ["Where next?", "Set sail."])
+        self.assertEqual({u.text for u in result.strings if u.context == "_()"}, {"Harbor sign", "Dock open.\n\nWait."})
+        ui = {"Harbor {#route}": "港口", "Harbor sign": "港口招牌", "Dock open.\n\nWait.": "码头开放。\n\n请等候。"}
+        self.write(result.dialogues, result.strings, ds, ui)
         env = dict(os.environ, RENPY_PATH_TO_SAVES=str(root / "userdata"), RENPY_DISABLE_JOYSTICK="1")
         run = subprocess.run([str(launcher), str(root), "translate", "schinese"],
                              cwd=root, env=env, capture_output=True, timeout=60)
@@ -96,6 +174,8 @@ class TranslationFilesTests(unittest.TestCase):
         # identifier is wrong, the official generator appends another block.
         parsed = read_tl_file(self.out / "story.rpy", "schinese")
         self.assertEqual([entry.identifier for entry in parsed.entries if entry.identifier], list(ds))
+        self.assertTrue(all(entry.translation for entry in parsed.entries if not entry.identifier),
+                        "Ren'Py appended a template because an extracted string key did not match.")
         choices = [entry.original for entry in parsed.entries if entry.original == "Harbor {#route}"]
         self.assertEqual(choices, ["Harbor {#route}"])
         # Simulate a release shipping only the engine's compiled translation.

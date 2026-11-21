@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """补漏查缺：扫描已生成的 tl/<语言>/ 翻译文件，分类检测残留问题。
 
-四类问题（报告中的中文类别名）：
+审校问题（报告中的中文类别名）：
 
 1. ``untranslated`` 未翻译残留：译文与原文相同，且原文含成串英文单词。
 2. ``mixed`` 中英参半：译文含目标语言文字，同时残留成段英文（连续 ≥3 个
@@ -13,6 +13,8 @@
 4. ``traditional`` 繁体残留（简体中文目标）：译文含繁体字形。这类问题
    **不需要重译**——繁→简是一一对应的确定性替换，直接在本地把 tl 文件的
    译文行改写为简体（fix_traditional=True，默认开启），零 API 成本。
+5. ``invalid_markup`` 把对白误写成了花括号标签，可能导致游戏报错。
+6. ``missing_name`` 已定义的角色专名或用户指定的保留词丢失。
 
 检测结果写入 ``tl/<语言>.补漏查缺报告.txt`` 供人工逐条核查（含
 文件:行号 定位）；除 ``traditional``（已本地修复）外，问题项原文会合并进
@@ -24,16 +26,18 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from .extract import DialogueUnit, StringUnit
-from .glossary import read_game_terms
+from .extract import DialogueUnit, StringUnit, nontext_source_literals
+from .glossary import read_name_groups, required_game_names
 from .reports import AUDIT_EXPORT_SECTION, _escape_report_text, read_retry_sections, sync_audit_queue
 from .tl_files import TLEntry, TLFile, TranslationMergeError, index_tl_directory, read_tl_file, write_if_unchanged
 from .translator import (protect_names, protect_text, restore_names, restore_text,
-                         target_language_name, unprotected_text)
+                         target_language_name, unprotected_text, untranslated_first_person,
+                         valid_unchanged_text)
 from .zhconv import has_simplified_forms, traditional_chars, to_simplified
 
 # ---------------------------------------------------------------------------
@@ -75,6 +79,7 @@ _WORD_RUN2_RE = re.compile(r"[A-Za-z]{2,}(?:[\s'\u2019\-]+[A-Za-z]{2,}){1,}")
 _UI_WORD_RE = re.compile(r"[A-Za-z]{2,}")
 # 3 个及以上连续英文单词（"the door is locked"）→ 疑似整句漏译
 _WORD_RUN3_RE = re.compile(r"[A-Za-z]{2,}(?:[\s'\u2019\-]+[A-Za-z]{2,}){2,}")
+_RETRY_CATEGORIES = frozenset(("untranslated", "mixed", "wrong_lang", "invalid_markup", "missing_name"))
 
 
 @dataclass
@@ -86,7 +91,7 @@ class AuditItem:
     who: str = ""
     original: str = ""
     translation: str = ""
-    category: str = ""    # untranslated / mixed / wrong_lang / traditional；空 = 正常
+    category: str = ""    # 报告中的问题类别；空 = 正常
     note: str = ""        # 判定依据（报告里展示）
     tl_line: int = 0      # 译文行在 tl 文件里的 1 基行号（traditional 本地修复用）
     is_string: bool = False   # True = translate strings 块（界面文本）
@@ -115,6 +120,73 @@ def _is_tool_control(doc: TLFile) -> bool:
     return bool(doc.lines and doc.lines[0].strip() == _CONTROL_HEADERS.get(stem))
 
 
+_KEYCAP = re.compile(r"(?:(?:Ctrl|Alt|Shift|Meta|Super|Cmd)\+)*(?:[A-Z0-9]|F(?:[1-9]|1[0-9]|2[0-4])"
+                     r"|Ctrl|Alt|Shift|Tab|Enter|Return|Space|Esc|Escape|Backspace|Delete|Home|End|Page Up|Page Down)")
+_SCREEN_HEADER = re.compile(r"^screen\s+(\w+)\b")
+_KEY_LABEL = re.compile(r'''\s+label\s+(?:_\(\s*)?(["'])([^"']+)\1\s*\)?\s*:?(?:\s*#.*)?$''')
+
+
+def _keyboard_labels(source: str) -> set[str]:
+    """A displayed physical key in Ren'Py's keyboard help can remain unchanged.
+
+    A strings key is shared throughout the game. A literal seen in a different
+    context (e.g. an Enter button in another screen in this file) is ambiguous.
+    Shipped translations often refer to an older source line, so use the label
+    and its screen instead of assuming line numbers still coincide.
+    """
+    if "keyboard_help" not in source:
+        return set()
+    labels, other = set(), set()
+    in_help = False
+    for line in source.splitlines():
+        code = line.strip()
+        if not code or code.startswith("#"):
+            continue
+        if not line[0].isspace():
+            header = _SCREEN_HEADER.match(code)
+            in_help = bool(header and header[1] == "keyboard_help")
+        if in_help and (match := _KEY_LABEL.fullmatch(line)) and _KEYCAP.fullmatch(match[2]):
+            labels.add(match[2])
+        else:
+            other.update(v for _, v in re.findall(r'''(["'])([^"'\n]+)\1''', line) if _KEYCAP.fullmatch(v))
+    return labels - other
+
+
+class _NonTextSources:
+    """Confirm historical false positives against today's loose game source."""
+
+    def __init__(self, game: Path):
+        self.game = game.resolve()
+        self.cache: dict[str, set[tuple[int, str, bool]]] = {}
+        self.keyboard: dict[str, set[str]] = {}
+
+    def unchanged_keyboard_label(self, entry: TLEntry) -> bool:
+        return (entry.identifier is None and entry.original == entry.translation
+                and entry.original in self.keyboard.get(entry.src_file, ()))
+
+    def contains(self, entry: TLEntry) -> bool:
+        if not entry.src_file or not entry.src_line or not entry.original:
+            return False
+        if entry.src_file not in self.cache:
+            matches = set()
+            try:
+                path = Path(entry.src_file)
+                if path.parts[:1] == ("game",):
+                    path = Path(*path.parts[1:])
+                path = (self.game / path).resolve()
+                if (path.suffix.lower() in (".rpy", ".rpym") and path.is_relative_to(self.game)
+                        and path.relative_to(self.game).parts[0].lower() != "tl" and path.is_file()):
+                    text = path.read_text(encoding="utf-8-sig")
+                    matches = nontext_source_literals(text)
+                    self.keyboard[entry.src_file] = _keyboard_labels(text)
+            except (OSError, ValueError, RuntimeError):
+                pass  # Missing, moved, compiled-only, or unverifiable: keep the translation visible.
+            self.cache[entry.src_file] = matches
+        if self.unchanged_keyboard_label(entry):
+            return True
+        return (entry.src_line, entry.original, entry.identifier is None) in self.cache[entry.src_file]
+
+
 @dataclass
 class RetryPlan:
     entries: dict[str, str]
@@ -125,7 +197,8 @@ class RetryPlan:
 
 def plan_retry_queue(tl_dir: Path, language: str, queue_path: Path,
                      dialogues: list[DialogueUnit], strings: list[StringUnit],
-                     protected_terms=(), *, docs: dict[Path, TLFile] | None = None) -> RetryPlan:
+                     protected_terms=(), *, required_terms=None,
+                     docs: dict[Path, TLFile] | None = None) -> RetryPlan:
     """Resolve queued text to the individual definitions which still need repair.
 
     A manual import requests translation explicitly. An automatically queued
@@ -141,6 +214,7 @@ def plan_retry_queue(tl_dir: Path, language: str, queue_path: Path,
         docs = index_tl_directory(tl_dir, language)
     by_id = {unit.identifier: unit for unit in dialogues}
     by_text = {unit.text: unit for unit in strings}
+    nontext = _NonTextSources(tl_dir.parent.parent)
     active = {(e.identifier, e.original if not e.identifier else None)
               for doc in docs.values() for e in doc.entries}
     for doc in docs.values():
@@ -155,13 +229,22 @@ def plan_retry_queue(tl_dir: Path, language: str, queue_path: Path,
                     (entry.identifier, entry.original if not entry.identifier else None) in active):
                 continue
             original = unit.what if isinstance(unit, DialogueUnit) else entry.original
-            if original not in entries or not _strip_markup(original, protected_terms).strip():
+            if original is None or original not in entries:
                 continue
+            if nontext.contains(entry):
+                # A keyboard-help string *is* still extracted, and may come
+                # from a failed request in an older version. Respect deliberate
+                # manual requests, but do not waste another request on the key.
+                if nontext.unchanged_keyboard_label(entry):
+                    if original not in manual:
+                        continue
+                elif unit is None:
+                    continue
             if original not in manual and not (original in failed and original == entry.translation):
                 check = AuditItem(doc.path.name, entry.src_file, entry.src_line,
                                   original=original, translation=entry.translation,
                                   is_string=entry.identifier is None)
-                if classify(check, language, protected_terms) not in ("untranslated", "wrong_lang", "mixed"):
+                if classify(check, language, protected_terms, required_terms=required_terms) not in _RETRY_CATEGORIES:
                     continue
             if entry.identifier:
                 plan.dialogues[entry.identifier] = unit or DialogueUnit(
@@ -196,20 +279,58 @@ def parse_tl_file(path: Path, language: str | None = None) -> list[AuditItem]:
 # 分类判定
 # ---------------------------------------------------------------------------
 
-def classify(item: AuditItem, language: str, protected_terms=()) -> str | None:
+def _sentence_tag(source_tags, translated_tags) -> str:
+    """Catch new sentences read as Ren'Py tags without assuming a fixed list of custom tags."""
+    for tag in translated_tags:
+        if tag in source_tags or not tag.startswith("{") or tag == "{{":
+            continue
+        if tag == "{":
+            return tag
+        # Names may be Unicode, prefixed with `#` (invisible disambiguation),
+        # or followed by :axis / =value. Punctuation and spaces in the value
+        # are fine. Never judge based on the contents of a legitimate argument.
+        body = tag[1:-1]
+        if body.startswith("#"):
+            continue
+        key = body.lstrip("/").split("=", 1)[0].split(":", 1)[0]
+        if key and re.search(r"[\s!?.,，。！？；;…]", key):
+            return tag
+    return ""
+
+
+def classify(item: AuditItem, language: str, protected_terms=(), *, required_terms=None) -> str | None:
     """检查玩家可见的译文，包括原文本身已部分翻译的条目。"""
     target = target_language_name(language)
     orig, trans = item.original, item.translation
+    if not trans.strip() and orig.strip():
+        return "untranslated"
+    if orig != trans:
+        src_visible, src_tags = protect_text(orig)
+        dst_visible, dst_tags = protect_text(trans)
+        if tag := _sentence_tag(set(src_tags.values()), dst_tags.values()):
+            item.note = f"译文新增的花括号会被当成文本标签：{tag}"
+            return "invalid_markup"
+        names = protected_terms if required_terms is None else required_terms
+        if names:
+            _, src_names = protect_names(src_visible, names)
+            if src_names:
+                _, dst_names = protect_names(dst_visible, names)
+                missing = Counter(src_names.values()) - Counter(dst_names.values())
+                if missing:
+                    item.note = "未保留原拼写或次数：" + "、".join(
+                        f"{key} ×{count}" if count > 1 else key for key, count in missing.items())
+                    return "missing_name"
     orig_plain = _strip_markup(orig, protected_terms).strip()
     if not orig_plain:
         return None
-    if not trans.strip():
-        return "untranslated"
     expected = _EXPECTED_SCRIPTS.get(target)
     if expected is None:
         return None
     trans_plain = orig_plain if trans == orig else _strip_markup(trans, protected_terms).strip()
     same = trans_plain == orig_plain
+    if untranslated_first_person(orig_plain, trans_plain, target):
+        item.note = "第一人称代词 I 残留在中文译文中"
+        return "mixed"
     for name, pattern in _OTHER_SCRIPTS:
         if pattern not in expected and pattern.search(trans_plain):
             item.note = f"含{name}"
@@ -239,15 +360,40 @@ def classify(item: AuditItem, language: str, protected_terms=()) -> str | None:
     return None
 
 
+def reusable_dialogue(source: str, candidate: str, language: str, protected_terms=()) -> bool:
+    """Check a rendering before borrowing it for a different dialogue ID.
+
+    Do not apply this to the original owner. Its hand-edited wording and custom
+    tags belong to that scene. Every source control (including variables and
+    waits) must survive in order; valid extra styling in a hand translation is
+    allowed, but extra substitutions or a sentence masquerading as a tag are not.
+    """
+    if source == candidate:
+        return valid_unchanged_text(source, language, protected_terms)
+    check = AuditItem("", "", 0, original=source, translation=candidate)
+    if classify(check, language, protected_terms) is not None:
+        return False
+    controls = list(protect_text(source)[1].values())
+    matched = 0
+    for control in protect_text(candidate)[1].values():
+        if matched < len(controls) and control == controls[matched]:
+            matched += 1
+        elif not (control.startswith("{") and control.endswith("}")) or control in controls:
+            return False
+    return matched == len(controls)
+
+
 # ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
 
 _CATEGORY_TITLES = {
     "untranslated": "未翻译残留（译文为空或与原文相同）",
-    "mixed": "中英参半（译文残留成段英文）",
+    "mixed": "中英参半（译文残留英文片段或代词）",
     "wrong_lang": "目标语言不正确（含其他语言 / 整句英文）",
     "traditional": "繁体残留",
+    "invalid_markup": "疑似无效的 Ren'Py 文本标签",
+    "missing_name": "未保留角色专名或指定术语",
 }
 
 
@@ -314,7 +460,10 @@ def run_audit(game_path: str | Path, language: str, log=None,
     lang = language.split("（")[0].split("(")[0].strip()
     if not lang.isidentifier() or lang.lower() == "none":
         raise ValueError(f"目标语言标识无效：{lang}")
-    protected_terms = tuple(dict.fromkeys([*(protected_terms or ()), *read_game_terms(game_dir, lang)]))
+    glossary = read_name_groups(game_dir, lang)
+    explicit = tuple(protected_terms or ())
+    required = required_game_names(glossary.get("characters", ()), explicit)
+    protected_terms = tuple(dict.fromkeys([*explicit, *(n for group in glossary.values() for n in group)]))
     tl_dir = game_dir / "tl" / lang
     docs = index_tl_directory(tl_dir, lang)
     if not docs and not tl_dir.is_dir():
@@ -333,9 +482,10 @@ def run_audit(game_path: str | Path, language: str, log=None,
             all_items.append(it)
 
     problems: list[AuditItem] = []
+    nontext = _NonTextSources(game_dir)
     for it in all_items:
-        cat = classify(it, lang, protected_terms)
-        if cat:
+        cat = classify(it, lang, protected_terms, required_terms=required)
+        if cat and not nontext.contains(it.entry):
             it.category = cat
             if item_docs[id(it)].read_only or it.entry.span is None:
                 summary.read_only_count += 1

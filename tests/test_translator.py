@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import io
 import json
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
 from rpytranslator.translator import (
+    PauseRequested,
     ResponseFormatError,
     TranslationError,
     TranslationClient,
@@ -79,7 +81,7 @@ class TranslatorSafeguardTests(unittest.TestCase):
         single = TranslationClient._build_single_prompt(
             "schinese", compact=True, structured_output=True,
             model="qwen3-8b-q4_k_m")
-        self.assertIn('仅含字符串字段 "translation"', single)
+        self.assertIn('JSON object with a single string field named "translation"', single)
         self.assertIn("proper names yourself", single)
 
     def test_qwen3_detects_names_and_protects_them_before_translation(self) -> None:
@@ -221,6 +223,57 @@ class TranslatorSafeguardTests(unittest.TestCase):
             self.assertEqual(client.translate_texts(["Hello"]), ["测试"])
             self.assertEqual(client.translate_texts(["Bye"]), ["测试"])
             self.assertEqual(prepare.call_count, 2)
+
+    def test_pause_after_rejected_response_prevents_fallback_and_retry_requests(self):
+        source = "Listen, [speaker]."
+        for stage in ("name extraction", "batch prompt change", "single retry"):
+            with self.subTest(stage=stage):
+                client = TranslationClient(TranslationConfig(
+                    model="qwen3:8b" if stage == "name extraction" else "generic",
+                    compact_prompt=True if stage == "single retry" else None,
+                    max_retries=2))
+                client.pause_event = threading.Event()
+                received = []
+
+                def reject_request(messages, *args, **kwargs):
+                    received.append(messages)
+                    if stage == "single retry" and len(received) == 1:
+                        return "not a batch"  # Trigger the single-line path first.
+                    client.pause_event.set()
+                    if stage == "name extraction":
+                        raise TranslationError("HTTP 400: unsupported json_schema")
+                    return "invalid output"  # Missing array or placeholder.
+
+                record = Mock()
+                with (patch.object(client, "chat", side_effect=reject_request),
+                      patch("rpytranslator.translator.time.sleep", side_effect=AssertionError("unexpected delay")),
+                      self.assertRaises(PauseRequested)):
+                    client.translate_texts([source], item_cb=record)
+                self.assertEqual(len(received), 2 if stage == "single retry" else 1)
+                record.assert_not_called()
+                self.assertNotIn(source, client.failed_texts)
+
+    def test_parallel_translation_saves_finished_chunk_before_slower_preceding_chunk(self) -> None:
+        client = TranslationClient(TranslationConfig(model="local", max_workers=2, chunk_items=1, max_retries=1))
+        first, second = "First source.", "Second source."
+        second_recorded = threading.Event()
+        pairs = []
+
+        def request(chunk, *args):
+            if chunk == [first]:
+                self.assertTrue(second_recorded.wait(3))
+                return ["第一句。"]
+            return ["第二句。"]
+
+        def save(source, translated):
+            pairs.append((source, translated))
+            if source == second:
+                second_recorded.set()
+
+        with patch.object(client, "_request_json_array", side_effect=request):
+            result = client.translate_texts([first, second], "schinese", item_cb=save)
+        self.assertEqual(result, ["第一句。", "第二句。"])
+        self.assertEqual(pairs, [(second, "第二句。"), (first, "第一句。")])
 
     def test_http_chat_uses_configured_model_prefix_and_rejects_empty_answers(self) -> None:
         config = TranslationConfig(

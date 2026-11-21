@@ -14,7 +14,7 @@
 
 2. 语言切换界面注入（解决设置里没有语言选项）
    - 检测游戏的 preferences 屏幕是否已含语言按钮
-   - 没有则提取 `screen preferences` 定义，在其末尾注入语言选择 vbox，
+   - 没有则提取实际设置屏幕定义，在原有布局中注入语言行，
      生成 game/zz_language_ui.rpy（后定义同名屏幕覆盖原定义，不动原文件）
    - 同时生成 tl/<语言>/languages.rpy，让设置里语言显示为中文名
 """
@@ -582,41 +582,89 @@ _LANG_UI_SNIPPET = (
 )
 
 
-def _find_direct_child_vbox(lines: list[str], start: int,
-                            parent_indent: int) -> tuple[int | None, int]:
-    """Find a vbox directly inside a screen/use block, skipping comments."""
-    child_indent = parent_indent + 4
-    for i in range(start, len(lines)):
-        body = lines[i].rstrip("\r\n")
-        stripped = body.strip()
-        if not stripped:
-            continue
-        indent = len(body) - len(body.lstrip(" \t"))
-        if indent <= parent_indent:
-            break
-        if stripped.startswith("#"):
-            continue
-        if indent != child_indent:
-            continue
-        if re.match(r"^[ \t]*vbox\s*:\s*(?:#.*)?$", body):
-            return i, indent
-    return None, child_indent
+@dataclass(frozen=True)
+class _ScreenContent:
+    start: int
+    end: int
+    indent: int
+    fixed_viewport: bool = False
+    structured: bool = True
 
 
-def _first_direct_child(lines: list[str], start: int,
-                        parent_indent: int) -> int | None:
-    """Return the first nonblank direct child line, including comments."""
-    child_indent = parent_indent + 4
-    for i in range(start, len(lines)):
-        body = lines[i].rstrip("\r\n")
-        if not body.strip():
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _screen_children(lines: list[str], parent: int) -> _ScreenContent:
+    """Infer the actual child indent and limit from the original statements."""
+    depth = _indent(lines[parent])
+    indent = None
+    end = len(lines)
+    for i in range(parent + 1, len(lines)):
+        if not lines[i].strip() or lines[i].lstrip().startswith("#"):
             continue
-        indent = len(body) - len(body.lstrip(" \t"))
-        if indent <= parent_indent:
+        current = _indent(lines[i])
+        if current <= depth:
+            end = i
             break
-        if indent == child_indent:
-            return i
-    return None
+        if indent is None:
+            indent = current
+    return _ScreenContent(parent + 1, end, indent if indent is not None else depth + 4)
+
+
+def _content_box(lines: list[str]) -> _ScreenContent:
+    """Locate one settings container for generating and checking both controls."""
+    # Strip comments without treating '#' inside quoted menu titles as comments.
+    statements = _strip_comments("\n".join(line.rstrip("\r\n") for line in lines)).split("\n")
+
+    def direct(content):
+        return (i for i in range(content.start, content.end)
+                if statements[i].strip() and _indent(lines[i]) == content.indent)
+
+    def vbox(i):
+        return re.fullmatch(r"vbox\s*:", statements[i].strip())
+
+    use = next((i for i, line in enumerate(statements)
+                if re.match(r"^\s*use\s+game_menu\b.*:\s*$", line)), None)
+    if use is not None:
+        children = _screen_children(lines, use)
+        box = next((i for i in direct(children) if vbox(i)), None)
+        return _screen_children(lines, box) if box is not None else children
+
+    for i, line in enumerate(statements):
+        if not re.match(r"^\s*viewport\b.*:\s*$", line):
+            continue
+        children = _screen_children(lines, i)
+        for j in direct(children):
+            if re.match(r"^has\s+vbox\b", statements[j].strip()):
+                content = _ScreenContent(j + 1, children.end, children.indent)
+            elif vbox(j):
+                content = _screen_children(lines, j)
+            else:
+                continue
+            header = "\n".join(statements[i:j + 1])
+            fixed = bool(re.search(r"\bypos\s+[1-9]\d*\b", header) and
+                         not re.search(r"\b(?:scrollbars|mousewheel|draggable)\b", header))
+            return _ScreenContent(content.start, content.end, content.indent, fixed)
+
+    root = _screen_children(lines, 0)
+    box = next((i for i in direct(root) if vbox(i)), None)
+    if box is not None:
+        return _screen_children(lines, box)
+    # A free-form screen may use arbitrary fixed children and no common list.
+    # Preserve its placement/order and append at the screen's own child depth.
+    return _ScreenContent(root.start, root.end, root.indent, structured=False)
+
+
+def _insert_screen_rows(lines: list[str], index: int, content: _ScreenContent,
+                        snippet: str) -> str:
+    newline = "\r\n" if any(line.endswith("\r\n") for line in lines) else "\n"
+    if index and not lines[index - 1].endswith(("\n", "\r")):
+        lines[index - 1] += newline
+    generated = "".join((" " * content.indent + s if s else "") + newline
+                        for s in snippet.splitlines())
+    lines.insert(index, generated)
+    return "".join(lines)
 
 
 def _reserve_fixed_menu_space(lines: list[str], start: int, indent: int) -> None:
@@ -642,159 +690,12 @@ def _insert_language_ui(block: str, screen_name: str = "preferences") -> str:
     """
     snippet = _LANG_UI_SNIPPET.replace("__SCREEN_NAME__", repr(screen_name))
     lines = block.splitlines(keepends=True)
-    use_index = None
-    root_vbox_index = None
-    indent = 4
-    line_end = "\n"
-    for i, line in enumerate(lines):
-        body = line.rstrip("\r\n")
-        match = re.match(r"^(?P<indent>[ \t]*)use\s+game_menu\b", body)
-        if not match or not body.rstrip().endswith(":"):
-            continue
-        use_index = i
-        use_indent = len(match.group("indent"))
-        indent = use_indent + 4
-        line_end = "\r\n" if line.endswith("\r\n") else "\n"
-        root_vbox_index, root_indent = _find_direct_child_vbox(
-            lines, i + 1, use_indent)
-        if root_vbox_index is not None:
-            indent = root_indent + 4
-        break
-
-    # Custom settings screens often use ``viewport: ...; has vbox`` rather
-    # than ``use game_menu``. Insert as the viewport's first child so the
-    # language selector shares the same scrollable layout as the controls.
-    if use_index is None:
-        for i, line in enumerate(lines):
-            body = line.rstrip("\r\n")
-            viewport = re.match(
-                r"^(?P<indent>[ \t]*)viewport\b.*:\s*(?:#.*)?$", body)
-            if viewport is None:
-                continue
-            viewport_indent = len(viewport.group("indent"))
-            for j in range(i + 1, len(lines)):
-                child = lines[j].rstrip("\r\n")
-                stripped = child.strip()
-                if not stripped or stripped.startswith("#"):
-                    continue
-                current_indent = len(child) - len(child.lstrip(" \t"))
-                if current_indent <= viewport_indent:
-                    break
-                has_vbox = re.match(r"^has\s+vbox\b", stripped)
-                child_vbox = re.match(r"^vbox\s*:\s*(?:#.*)?$", stripped)
-                if current_indent == viewport_indent + 4 and (has_vbox or child_vbox):
-                    indent = current_indent if has_vbox else current_indent + 4
-                    line_end = "\r\n" if lines[j].endswith("\r\n") else "\n"
-                    # A fixed-position viewport may share space with an
-                    # absolute-positioned Back button. Reuse the original
-                    # large blank separator without moving other widgets.
-                    header = _strip_comments("".join(lines[i:j + 1]))
-                    if (re.search(r"\bypos\s+[1-9]\d*\b", header) and
-                            not re.search(r"\b(?:scrollbars|mousewheel|draggable)\b", header)):
-                        _reserve_fixed_menu_space(lines, j + 1, indent)
-                    injected = "".join(
-                        (" " * indent + item if item else "") + line_end
-                        for item in snippet.splitlines())
-                    lines.insert(j + 1, injected)
-                    return "".join(lines)
-
-    if use_index is None:
-        for line in lines[:1]:
-            match = re.match(r"^(?P<indent>[ \t]*)(?:init\s+-?\d+\s+)?screen\b", line)
-            if match:
-                indent = len(match.group("indent")) + 4
-                break
-
-    injected = "".join(
-        (" " * indent + line if line else "") + line_end
-        for line in snippet.splitlines()
-    )
-    if root_vbox_index is None:
-        root_vbox_index = use_index
-    if use_index is None:
-        return block.rstrip("\r\n") + line_end + injected
-    lines.insert(root_vbox_index + 1, injected)
-    return "".join(lines)
-
-
-def _append_to_preferences_vbox(block: str, snippet: str) -> str:
-    """Append a generated section inside the root vbox transcluded by game_menu."""
-    lines = block.splitlines(keepends=True)
-    use_index = None
-    root_vbox_index = None
-    child_indent = 4
-    line_end = "\n"
-    for i, line in enumerate(lines):
-        body = line.rstrip("\r\n")
-        match = re.match(r"^(?P<indent>[ \t]*)use\s+game_menu\b", body)
-        if not match or not body.rstrip().endswith(":"):
-            continue
-        use_index = i
-        use_indent = len(match.group("indent"))
-        child_indent = use_indent + 4
-        line_end = "\r\n" if line.endswith("\r\n") else "\n"
-        root_vbox_index, root_indent = _find_direct_child_vbox(
-            lines, i + 1, use_indent)
-        if root_vbox_index is not None:
-            child_indent = root_indent + 4
-        break
-    if root_vbox_index is None and use_index is None and lines:
-        match = re.match(
-            r"^(?P<indent>[ \t]*)(?:init\s+-?\d+\s+)?screen\b", lines[0])
-        if match:
-            screen_indent = len(match.group("indent"))
-            child_indent = screen_indent + 4
-            root_vbox_index, root_indent = _find_direct_child_vbox(
-                lines, 1, screen_indent)
-            if root_vbox_index is not None:
-                child_indent = root_indent + 4
-    injected = "".join(
-        (" " * child_indent + line if line else "") + line_end
-        for line in snippet.splitlines()
-    )
-    lines.append(injected)
-    return "".join(lines)
-
-
-def _append_to_settings_viewport(block: str, snippet: str) -> str:
-    """Append a generated options section inside a custom viewport vbox."""
-    lines = block.splitlines(keepends=True)
-    for i, line in enumerate(lines):
-        body = line.rstrip("\r\n")
-        viewport = re.match(
-            r"^(?P<indent>[ \t]*)viewport\b.*:\s*(?:#.*)?$", body)
-        if viewport is None:
-            continue
-        viewport_indent = len(viewport.group("indent"))
-        for j in range(i + 1, len(lines)):
-            child = lines[j].rstrip("\r\n")
-            stripped = child.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            current_indent = len(child) - len(child.lstrip(" \t"))
-            if current_indent <= viewport_indent:
-                break
-            has_vbox = (current_indent == viewport_indent + 4 and
-                        re.match(r"^has\s+vbox\b", stripped))
-            child_vbox = (current_indent == viewport_indent + 4 and
-                          re.match(r"^vbox\s*:\s*(?:#.*)?$", stripped))
-            if has_vbox or child_vbox:
-                content_indent = current_indent if has_vbox else current_indent + 4
-                end = j + 1
-                while end < len(lines):
-                    item = lines[end].rstrip("\r\n")
-                    if item.strip():
-                        item_indent = len(item) - len(item.lstrip(" \t"))
-                        if item_indent < content_indent:
-                            break
-                    end += 1
-                newline = "\r\n" if line.endswith("\r\n") else "\n"
-                generated = "".join(
-                    (" " * content_indent + item if item else "") + newline
-                    for item in snippet.splitlines())
-                lines.insert(end, generated)
-                return "".join(lines)
-    return _append_to_preferences_vbox(block, snippet)
+    content = _content_box(lines)
+    if content.fixed_viewport:
+        # Some custom menus have a Back button positioned just below this box.
+        _reserve_fixed_menu_space(lines, content.start, content.indent)
+    index = content.start if content.structured else content.end
+    return _insert_screen_rows(lines, index, content, snippet)
 
 
 def _insert_custom_font_ui(block: str, language: str) -> str:
@@ -802,18 +703,20 @@ def _insert_custom_font_ui(block: str, language: str) -> str:
     if _FONT_UI_MARKER in block:
         return block
     lines = block.splitlines(keepends=True)
+    loop_indent = None
     for i, line in enumerate(lines):
-        if line.lstrip().startswith("textbutton _lang_ui_display_name(_lang_ui_i) "):
+        if line.strip() == "for _lang_ui_i in _lang_ui_names:":
+            loop_indent = line[:_indent(line)]
+        elif loop_indent is not None and line.lstrip().startswith("textbutton _lang_ui_display_name(_lang_ui_i) "):
             # Place this control beside the loop, not inside it (one per language).
-            indent = line[:len(line) - len(line.lstrip()) - 4]
             newline = "\r\n" if line.endswith("\r\n") else "\n"
-            entries = _font_list_entries(indent, ' style "radio_button"', language)
+            entries = _font_list_entries(loop_indent, ' style "radio_button"', language)
             lines.insert(i + 1, newline.join(entries) + newline)
             return "".join(lines)
     # Native language menu with no font list: add a single conditional button.
-    append = (_append_to_preferences_vbox if "use game_menu" in block
-              else _append_to_settings_viewport)
-    return append(block, "\n".join(_font_list_entries("", ' style "radio_button"', language)) + "\n")
+    content = _content_box(lines)
+    return _insert_screen_rows(lines, content.end, content,
+                               "\n".join(_font_list_entries("", ' style "radio_button"', language)))
 
 # 字体选项（设置界面）：单选「系统字体」。
 # _zz_font_select / _zz_font_choices 定义在 zz_cn_font.rpy。为避免「字体补丁
@@ -1133,13 +1036,17 @@ def _extract_screen_block(text: str, screen_name: str) -> str | None:
             continue
         cur_indent = len(line) - len(line.lstrip())
         if stripped.startswith("#"):
-            if cur_indent <= indent:
-                break
+            # Ren'Py ignores the indentation of comments. A flush-left note
+            # between controls does not terminate the current screen.
             block.append(line)
             continue
         if cur_indent <= indent:
             break
         block.append(line)
+    # Decorators, headings and other comments before the next top-level
+    # definition belong to that definition, not to the generated override.
+    while len(block) > 1 and (not block[-1].strip() or block[-1].lstrip().startswith("#")):
+        block.pop()
     return "".join(block)
 
 
@@ -1314,73 +1221,28 @@ def _language_ui_is_top_aligned(text: str,
     if block is None:
         return False
     lines = block.splitlines()
-    use_index = next((i for i, line in enumerate(lines)
-                      if re.match(r"^[ \t]*use\s+game_menu\b.*:\s*(?:#.*)?$",
-                                  line)), None)
-    marker_index = next((i for i, line in enumerate(lines)
-                         if line.strip() == _LANG_UI_MARKER), None)
-    if marker_index is None:
+    content = _content_box(lines)
+    if not content.structured:
         return False
-    if use_index is None:
-        viewport_index = next((i for i, line in enumerate(lines)
-                               if re.match(r"^[ \t]*viewport\b.*:\s*(?:#.*)?$",
-                                           line)), None)
-        if viewport_index is None:
+    for i in range(content.start, content.end):
+        line = lines[i]
+        if line.strip() == _LANG_UI_MARKER:
+            if _indent(line) != content.indent:
+                return False
+            # The picker can look top-aligned even when a former patch has
+            # accidentally swallowed the original root vbox inside its hbox.
+            row = next((j for j in range(i + 1, content.end)
+                        if _indent(lines[j]) == content.indent and
+                        re.fullmatch(r"hbox\s*:\s*(?:#.*)?", lines[j].strip())), None)
+            if row is None:
+                return False
+            children = _screen_children(lines, row)
+            return not any(_indent(lines[j]) == children.indent and
+                           re.fullmatch(r"vbox\s*:\s*(?:#.*)?", lines[j].strip())
+                           for j in range(children.start, children.end))
+        if line.strip() and not line.lstrip().startswith("#"):
             return False
-        viewport_indent = len(lines[viewport_index]) - len(
-            lines[viewport_index].lstrip(" \t"))
-        # A viewport may declare properties such as ``xysize`` or
-        # ``scrollbars`` before its layout root. Mirror the injector and skip
-        # those direct-child properties until ``has vbox``/``vbox`` appears.
-        root_index = None
-        for i in range(viewport_index + 1, len(lines)):
-            body = lines[i].rstrip("\r\n")
-            stripped = body.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            current_indent = len(body) - len(body.lstrip(" \t"))
-            if current_indent <= viewport_indent:
-                break
-            if (current_indent == viewport_indent + 4 and
-                    (re.match(r"^has\s+vbox\b", stripped) or
-                     re.match(r"^vbox\s*:", stripped))):
-                root_index = i
-                break
-        if root_index is None:
-            return False
-        root_line = lines[root_index].strip()
-        if re.match(r"^has\s+vbox\b", root_line):
-            expected_indent = viewport_indent + 4
-            expected_index = root_index + 1
-        elif re.match(r"^vbox\s*:", root_line):
-            expected_indent = viewport_indent + 8
-            expected_index = root_index + 1
-        else:
-            return False
-        while expected_index < len(lines) and (
-                not lines[expected_index].strip() or
-                (lines[expected_index].lstrip().startswith("#") and
-                 lines[expected_index].strip() != _LANG_UI_MARKER)):
-            expected_index += 1
-        return (expected_index == marker_index and
-                len(lines[marker_index]) -
-                len(lines[marker_index].lstrip(" \t")) == expected_indent)
-    use_match = re.match(r"^([ \t]*)use\s+game_menu\b", lines[use_index])
-    if use_match is None:
-        return False
-    use_indent = len(use_match.group(1))
-    root_vbox_index, root_indent = _find_direct_child_vbox(
-        lines, use_index + 1, use_indent)
-    if root_vbox_index is not None:
-        first_child = _first_direct_child(
-            lines, root_vbox_index + 1, root_indent)
-        return (first_child == marker_index
-                and len(lines[marker_index]) -
-                len(lines[marker_index].lstrip(" \t")) == root_indent + 4)
-    first_child = _first_direct_child(lines, use_index + 1, use_indent)
-    return (first_child == marker_index
-            and len(lines[marker_index]) -
-            len(lines[marker_index].lstrip(" \t")) == use_indent + 4)
+    return False
 
 
 def _font_ui_is_current(text: str,
