@@ -1,9 +1,10 @@
 """Translation input/output safeguards for Ren'Py text."""
 from __future__ import annotations
 
+import io
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from rpytranslator.translator import (
     ResponseFormatError,
@@ -20,10 +21,49 @@ from rpytranslator.translator import (
     restore_names,
     restore_text,
     target_language_name,
+    unprotected_text,
+    valid_unchanged_text,
 )
 
 
 class TranslatorSafeguardTests(unittest.TestCase):
+    def test_unchanged_results_compare_only_player_visible_letters_in_the_target_script(self):
+        mixed = "{font=Fonts/繁體.ttf}龍華{/font}：[stats['en]glish'][i]!q]，风停了。"
+        self.assertEqual(unprotected_text(mixed, ["龍華"]).strip(), "： ，风停了。")
+        for source, target, names, accepted in (
+            (mixed, "简体中文", ["龍華"], True),
+            (mixed, "简体中文", [], False),
+            ("形同皇后，只在故里。", "tchinese", [], True),
+            ("請開門。", "tchinese", [], True),
+            ("请开门。", "tchinese", [], False),
+            ("困難的選擇", "zh", [], False),
+            ("简直太难。", "zh", [], True),
+            ("はい、待っています。", "japanese", [], True),
+            ("문을 닫으세요.", "korean", [], True),
+            ("はい、待っています。", "korean", [], False),
+            ("문을 닫으세요.", "japanese", [], False),
+            ("中文 please wait.", "schinese", [], False),
+            ("No. [items['选项'][slot]]", "english", [], True),
+            ("أغلق الباب.", "english", [], False),
+            ("New Detroit City", "schinese", ["New Detroit City"], True),
+        ):
+            with self.subTest(source=source, target=target, names=names):
+                self.assertIs(valid_unchanged_text(source, target, names), accepted)
+        self.assertTrue(valid_unchanged_text("設定", "japanese", is_ui=True))
+
+    def test_untranslated_warning_counts_pending_sentences_and_ignores_names_and_failures(self):
+        client = TranslationClient(TranslationConfig())
+        client.failed_texts.add("Network failure.")
+        lines = ["Alex", "New Detroit City", "{b}[player]{/b}", "风停了。", "Network failure."]
+        messages = []
+        client._warn_if_untranslated(lines, lines, "简体中文", messages.append, ["Alex", "New Detroit City"])
+        self.assertEqual(messages, [])
+        lines = ["Close the door.", "Stay here.", "Is he back?", "Alex"]
+        client._warn_if_untranslated(lines, lines, "简体中文", messages.append, ["Alex"])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("3/4", messages[0])
+        self.assertIn("未翻译报告", messages[0])
+
     def test_qwen3_prompt_selection_and_no_think_switch(self) -> None:
         self.assertTrue(is_qwen3_model("qwen3-8b-q4_k_m"))
         self.assertTrue(is_qwen3_model("qwen3:8b"))
@@ -94,6 +134,7 @@ class TranslatorSafeguardTests(unittest.TestCase):
                 client.translate_texts(["Good night, Alex."], "schinese"),
                 ["Alex，晚安。"],
             )
+            self.assertEqual(client.detected_names, ("Alex",))
 
     def test_qwen3_name_extraction_parser_accepts_flat_and_legacy_nested_lists(self) -> None:
         self.assertEqual(
@@ -143,12 +184,100 @@ class TranslatorSafeguardTests(unittest.TestCase):
         self.assertIn("announced", protected)
         self.assertEqual(restore_names(protected, placeholders), source)
 
+    def test_automatic_names_are_visible_whole_words_outside_exclamations(self) -> None:
+        client = TranslationClient(TranslationConfig(model="qwen3:8b", structured_output=False))
+        sample = "{b}HOLY FUCK!{/b} Jo and Anna met {a=https://site.com/HiddenName}KEVSKY{/a}."
+        with patch.object(client, "chat", return_value='["HOLY","FUCK","Ann","Jo","HiddenName","KEVSKY"]'):
+            self.assertEqual(client._extract_qwen3_names([sample]), ["Jo", "KEVSKY"])
+
     def test_qwen3_local_requests_default_to_one_gpu_generation(self) -> None:
         client = TranslationClient(TranslationConfig(
             base_url="http://127.0.0.1:11434/v1",
             model="qwen3-8b-q4_k_m"))
         self.assertEqual(client.config.max_workers, 1)
         self.assertEqual(client._batch_cap, 2)
+
+    def test_local_defaults_allow_explicit_worker_counts_without_mutating_settings(self) -> None:
+        for model, requested, expected in (("qwen3:8b", 2, 2), ("hy-mt2", 1, 1),
+                                           ("hy-mt2", None, 4)):
+            with self.subTest(model=model, requested=requested):
+                config = TranslationConfig(
+                    base_url="http://127.0.0.2:11434/v1", model=model,
+                    max_workers=requested)
+                client = TranslationClient(config)
+                self.assertEqual(client.config.max_workers, expected)
+                self.assertEqual(config.max_workers, requested)
+                self.assertTrue(client._use_compact())
+
+    def test_prepare_runs_once_before_first_real_translation_and_can_retry(self) -> None:
+        prepare = Mock(side_effect=[TranslationError("模型未就绪"), None])
+        client = TranslationClient(TranslationConfig(), prepare=prepare)
+        with patch.object(client, "chat", return_value='["测试"]') as chat:
+            self.assertEqual(client.translate_texts([" "]), [" "])
+            prepare.assert_not_called()
+            with self.assertRaisesRegex(TranslationError, "模型未就绪"):
+                client.translate_texts(["Hello"])
+            chat.assert_not_called()
+            self.assertEqual(client.translate_texts(["Hello"]), ["测试"])
+            self.assertEqual(client.translate_texts(["Bye"]), ["测试"])
+            self.assertEqual(prepare.call_count, 2)
+
+    def test_http_chat_uses_configured_model_prefix_and_rejects_empty_answers(self) -> None:
+        config = TranslationConfig(
+            base_url="http://localhost:1234/custom/v1?api-version=preview",
+            api_key="test-key", model="my-tag:8b", temperature=0.7, timeout=12)
+        client = TranslationClient(config)
+        url = "http://localhost:1234/custom/v1/chat/completions?api-version=preview"
+        for content in ("ok", "", None):
+            reply = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+            with self.subTest(content=content), patch(
+                    "urllib.request.urlopen", return_value=io.BytesIO(reply)) as opened:
+                if content:
+                    self.assertEqual(client.chat([], max_tokens=8), content)
+                else:
+                    with self.assertRaises(ResponseFormatError):
+                        client.chat([], max_tokens=8)
+                req = opened.call_args.args[0]
+                body = json.loads(req.data)
+                self.assertEqual(req.full_url, url)
+                self.assertEqual(req.get_header("Authorization"), "Bearer test-key")
+                self.assertEqual(body["model"], "my-tag:8b")
+                self.assertEqual(body["temperature"], 0.7)
+                self.assertEqual(body["max_tokens"], 8)
+                self.assertEqual(opened.call_args.kwargs["timeout"], 12)
+
+    def test_batch_and_single_preserve_names_markup_and_literal_tokens_when_simplifying(self) -> None:
+        source = ("@@p0@@ {font=舊檔/[font_name].ttf}Meet 龍華{/font}"
+                  "\n[stats['東]區'][i]!q] [[door]")
+        protected = ("@@p0@@ @@p1@@遇見 @@n0@@@@p2@@"
+                     "@@p3@@@@p4@@ @@p5@@門]")
+        expected = ("@@p0@@ {font=舊檔/[font_name].ttf}遇见 龍華{/font}"
+                    "\n[stats['東]區'][i]!q] [[门]")
+        # Names are supplied by the caller here. Qwen's separate discovery
+        # request is covered by test_qwen3_detects_names_and_protects_them_before_translation.
+        client = TranslationClient(TranslationConfig(model="generic-instruct", max_retries=1))
+        for target in ("schinese", "zh_hans", "Simplified Chinese"):
+            with self.subTest(target=target):
+                with patch.object(client, "chat", return_value=json.dumps([protected])) as chat:
+                    self.assertEqual(client.translate_texts([source], target, names=["龍華"]), [expected])
+                    chat.assert_called_once()
+                with patch.object(client, "chat", return_value=protected):
+                    self.assertEqual(client._translate_single(source, target, names=["龍華"]), expected)
+
+    def test_single_fallback_rejects_model_generated_renpy_syntax(self) -> None:
+        client = TranslationClient(TranslationConfig(
+            compact_prompt=True, structured_output=False, max_retries=1))
+        for addition in ("[player]", "{p}", "\n再见"):
+            with self.subTest(addition=addition), patch.object(
+                    client, "chat", return_value="你好" + addition):
+                self.assertEqual(client._translate_single("Hello", "zh"), "Hello")
+
+    def test_longer_names_take_priority_and_cannot_replace_generated_markers(self) -> None:
+        text = "Ann Marie meets Ann, @@n2@@, 公主Alex来了 and Alexandra."
+        masked, mapping = protect_names(text, ["Ann", "Ann Marie", "Alex", "n0", "n2"])
+        self.assertEqual(list(mapping.values()), ["Ann Marie", "Ann", "Alex"])
+        self.assertIn("Alexandra", masked)
+        self.assertEqual(restore_names(masked, mapping), text)
 
     def test_renpy_markup_names_and_line_breaks_round_trip(self) -> None:
         source = "Hello, [player]! {b}Alex{/b}\nSee you, Alex."
@@ -381,7 +510,7 @@ class TranslatorSafeguardTests(unittest.TestCase):
 
     def test_single_translation_uses_structured_json_and_restores_protected_tokens(self) -> None:
         client = TranslationClient(TranslationConfig(
-            base_url="http://127.0.0.1:11434/v1", compact_prompt=True,
+            base_url="http://127.0.0.1:11434/v1", model="generic-instruct", compact_prompt=True,
             max_retries=1))
         seen = {}
 

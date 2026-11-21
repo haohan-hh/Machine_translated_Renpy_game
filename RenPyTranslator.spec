@@ -1,6 +1,23 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.win32.versioninfo import (
+    FixedFileInfo, StringFileInfo, StringTable, StringStruct, VarFileInfo, VarStruct, VSVersionInfo,
+)
 from pathlib import Path
+from runpy import run_path
+
+metadata = run_path(str(Path(SPECPATH) / 'rpytranslator' / '__init__.py'))
+release = metadata['__version__']
+version_numbers = tuple(map(int, release.split('.'))) + (0,)
+version_info = VSVersionInfo(
+    ffi=FixedFileInfo(filevers=version_numbers, prodvers=version_numbers),
+    kids=[StringFileInfo([StringTable('080404b0', [
+        StringStruct('ProductName', metadata['APP_NAME']),
+        StringStruct('FileDescription', metadata['APP_NAME']),
+        StringStruct('FileVersion', release),
+        StringStruct('ProductVersion', release),
+    ])]), VarFileInfo([VarStruct('Translation', [0x0804, 1200])])],
+)
 
 datas = []
 binaries = []
@@ -48,6 +65,7 @@ exe = EXE(
     a.datas,
     [],
     name='RenPyTranslator',
+    version=version_info,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

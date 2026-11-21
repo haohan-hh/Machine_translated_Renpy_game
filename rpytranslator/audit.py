@@ -28,8 +28,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from .extract import encode_say_string
-from .zhconv import traditional_chars, to_simplified
+from .extract import DialogueUnit, StringUnit
+from .glossary import read_game_terms
+from .reports import AUDIT_EXPORT_SECTION, _escape_report_text, read_retry_sections, sync_audit_queue
+from .tl_files import TLEntry, TLFile, TranslationMergeError, index_tl_directory, read_tl_file, write_if_unchanged
+from .translator import (protect_names, protect_text, restore_names, restore_text,
+                         target_language_name, unprotected_text)
+from .zhconv import has_simplified_forms, traditional_chars, to_simplified
 
 # ---------------------------------------------------------------------------
 # 语言 → 目标文字
@@ -43,13 +48,14 @@ _THAI_RE = re.compile(r"[\u0e00-\u0e7f]")                       # 泰文
 _GREEK_RE = re.compile(r"[\u0370-\u03ff]")                      # 希腊文
 _ASCII_WORD_RE = re.compile(r"[A-Za-z]{2,}")                    # 英文单词（≥2 字母）
 
-# 各目标语言「应有的文字」。None（英语）表示以 ASCII 字母为期望。
-_EXPECTED_SCRIPTS: dict[str, re.Pattern | None] = {
-    "schinese": _CJK_RE, "tchinese": _CJK_RE,
-    "zh": _CJK_RE, "zh_cn": _CJK_RE, "zh_hans": _CJK_RE, "zh_hant": _CJK_RE,
-    "japanese": _KANA_RE, "ja": _KANA_RE,
-    "korean": _HANGUL_RE, "ko": _HANGUL_RE,
-    "english": None, "en": None,
+# Han-only Japanese menu labels such as 設定 are legitimate. Audit installed
+# text conservatively: script alone cannot tell which language wrote them.
+_EXPECTED_SCRIPTS: dict[str, tuple[re.Pattern, ...]] = {
+    "Simplified Chinese": (_CJK_RE,),
+    "Traditional Chinese": (_CJK_RE,),
+    "Japanese": (_KANA_RE, _CJK_RE),
+    "Korean": (_HANGUL_RE, _CJK_RE),
+    "English": (_ASCII_WORD_RE,),
 }
 
 # 「错误语言」的文字特征：(显示名, 正则)。
@@ -71,16 +77,6 @@ _UI_WORD_RE = re.compile(r"[A-Za-z]{2,}")
 _WORD_RUN3_RE = re.compile(r"[A-Za-z]{2,}(?:[\s'\u2019\-]+[A-Za-z]{2,}){2,}")
 
 
-def _norm_language(language: str) -> str:
-    """GUI 的语言显示名（如 ``schinese（简体中文）``）→ 语言码。"""
-    return language.split("（")[0].split("(")[0].strip().lower()
-
-
-# 「简体中文」目标的语言码（繁体目标只检测不转换：简→繁是多对一的
-# 有损映射，如「后」→「後/后」，自动转换会出错）
-_SIMPLIFIED_LANGS = {"schinese", "zh", "zh_cn", "zh_hans"}
-
-
 @dataclass
 class AuditItem:
     """一个翻译条目及其判定结果（category 为空表示无问题）。"""
@@ -94,6 +90,7 @@ class AuditItem:
     note: str = ""        # 判定依据（报告里展示）
     tl_line: int = 0      # 译文行在 tl 文件里的 1 基行号（traditional 本地修复用）
     is_string: bool = False   # True = translate strings 块（界面文本）
+    entry: TLEntry | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -103,238 +100,142 @@ class AuditSummary:
     report_path: str = ""
     queued: int = 0                                # 合并进未翻译报告的条数
     fixed_traditional: int = 0                     # 已本地转换为简体的条数
+    read_only_count: int = 0                       # 需要提供对应翻译源码才能修改
+    fixed_files: list[Path] = field(default_factory=list)
+
+
+_CONTROL_HEADERS = {
+    "zz_language_display": "# 语言显示名（汉化工具自动生成）",
+    "zz_language_switch_probe": "# 语言切换探针（汉化工具自动生成）",
+}
+
+
+def _is_tool_control(doc: TLFile) -> bool:
+    stem = re.sub(r"(?:_rpytranslator)+$", "", doc.path.stem)
+    return bool(doc.lines and doc.lines[0].strip() == _CONTROL_HEADERS.get(stem))
+
+
+@dataclass
+class RetryPlan:
+    entries: dict[str, str]
+    manual_texts: set[str]
+    dialogues: dict[str, DialogueUnit] = field(default_factory=dict)
+    strings: dict[str, StringUnit] = field(default_factory=dict)
+
+
+def plan_retry_queue(tl_dir: Path, language: str, queue_path: Path,
+                     dialogues: list[DialogueUnit], strings: list[StringUnit],
+                     protected_terms=(), *, docs: dict[Path, TLFile] | None = None) -> RetryPlan:
+    """Resolve queued text to the individual definitions which still need repair.
+
+    A manual import requests translation explicitly. An automatically queued
+    item may have been repaired by the player or have a good translation in
+    another scene. An installed game can also use common UI strings which do
+    not appear in its own sources.
+    """
+    entries, manual, failed = read_retry_sections(queue_path)
+    plan = RetryPlan(entries, manual)
+    if not entries:
+        return plan
+    if docs is None:
+        docs = index_tl_directory(tl_dir, language)
+    by_id = {unit.identifier: unit for unit in dialogues}
+    by_text = {unit.text: unit for unit in strings}
+    active = {(e.identifier, e.original if not e.identifier else None)
+              for doc in docs.values() for e in doc.entries}
+    for doc in docs.values():
+        if _is_tool_control(doc):
+            continue
+        candidates = doc.reference_entries if doc.read_only else doc.entries
+        for entry in candidates:
+            if entry.span is None or entry.translation is None:
+                continue
+            unit = by_id.get(entry.identifier) if entry.identifier else by_text.get(entry.original)
+            if doc.read_only and (unit is None or
+                    (entry.identifier, entry.original if not entry.identifier else None) in active):
+                continue
+            original = unit.what if isinstance(unit, DialogueUnit) else entry.original
+            if original not in entries or not _strip_markup(original, protected_terms).strip():
+                continue
+            if original not in manual and not (original in failed and original == entry.translation):
+                check = AuditItem(doc.path.name, entry.src_file, entry.src_line,
+                                  original=original, translation=entry.translation,
+                                  is_string=entry.identifier is None)
+                if classify(check, language, protected_terms) not in ("untranslated", "wrong_lang", "mixed"):
+                    continue
+            if entry.identifier:
+                plan.dialogues[entry.identifier] = unit or DialogueUnit(
+                    entry.who, original, None, entry.src_file, entry.src_line, identifier=entry.identifier)
+            else:
+                plan.strings[original] = unit or StringUnit(original, entry.src_file, entry.src_line)
+    return plan
 
 
 # ---------------------------------------------------------------------------
 # tl 文件解析（与 generator.py 的输出对称）
 # ---------------------------------------------------------------------------
 
-_LOC_RE = re.compile(r"^#\s*(.+?):(\d+)\s*$")
-_TRANSLATE_RE = re.compile(r"^translate\s+\S+\s+(\S+):\s*$")
-_STRINGS_RE = re.compile(r"^translate\s+\S+\s+strings:\s*$")
-_OLD_RE = re.compile(r"^old\s+(.*)$")
-_NEW_RE = re.compile(r"^new\s+(.*)$")
-# 注释原句行（块内缩进已被 strip）：`who "..."` 或 `"..."`
-_ORIG_RE = re.compile(r"^#\s*(?:(\S+)\s+)?(\".*)$")
-# 译文行：`who "..."` 或 `"..."`
-_SAY_RE = re.compile(r"^(?:(\S+)\s+)?(\".*)$")
-
-
-def _decode_say_string(s: str) -> str:
-    r"""反转义 generator.encode_say_string（\n、\"、\\、双空格前的\ ）。"""
-    if not s:
-        return s
-    out: list[str] = []
-    i = 0
-    n = len(s)
-    while i < n:
-        c = s[i]
-        if c == "\\" and i + 1 < n:
-            nxt = s[i + 1]
-            if nxt == "n":
-                out.append("\n")
-                i += 2
-                continue
-            if nxt == '"':
-                out.append('"')
-                i += 2
-                continue
-            if nxt == " ":
-                out.append(" ")
-                i += 2
-                continue
-            if nxt == "\\":
-                out.append("\\")
-                i += 2
-                continue
-        out.append(c)
-        i += 1
-    return "".join(out)
-
-
-def _quoted(text: str) -> str:
-    """取行内成对引号中的内容并反转义（`"abc"` / ``'abc'`` → ``abc``）。
-
-    对话块用双引号（generator 的输出）；工具自己生成的显示名映射
-    （zz_language_display.rpy）用单引号，两种都要吃得下。
-    不合法（没有成对引号）时返回原文。
-    """
-    s = text.strip()
-    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
-        return _decode_say_string(s[1:-1])
-    return s
-
-
-def _strip_markup(text: str) -> str:
+def _strip_markup(text: str, protected_terms=()) -> str:
     """去掉 Ren'Py 标签 {…} 与插值 […]，只留要给玩家看的字面文本。"""
-    text = re.sub(r"\{[^{}]*\}", " ", text)
-    text = re.sub(r"\[[^\[\]]*\]", " ", text)
-    return text
+    return unprotected_text(text, protected_terms)
 
 
-def parse_tl_file(path: Path) -> list[AuditItem]:
-    """解析一个 tl/<语言>/xxx.rpy，返回其中的对话与字符串翻译条目。"""
-    try:
-        lines = path.read_text(encoding="utf-8-sig", errors="ignore").splitlines()
-    except OSError:
-        return []
-    items: list[AuditItem] = []
-    src_file, src_line = path.name, 0
-    i = 0
-    n = len(lines)
-    while i < n:
-        raw = lines[i]
-        s = raw.strip()
-        m = _LOC_RE.match(s)
-        if m:
-            src_file, src_line = m.group(1), int(m.group(2))
-            i += 1
-            continue
-        if _TRANSLATE_RE.match(s) and not _STRINGS_RE.match(s):
-            # 对话块：其后第一行 `# ...` 为原句，下一个非注释行为译文
-            who, original, translation = "", "", ""
-            trans_line = 0
-            j = i + 1
-            while j < n:
-                t = lines[j].strip()
-                if not t:
-                    j += 1
-                    continue
-                if t.startswith("#"):
-                    if not original:
-                        mm = _ORIG_RE.match(t)
-                        if mm:
-                            who = mm.group(1) or ""
-                            original = _quoted(mm.group(2))
-                    j += 1
-                    continue
-                # 第一个非注释、非空行 = 译文行
-                mm = _SAY_RE.match(t)
-                if mm:
-                    translation = _quoted(mm.group(2))
-                    trans_line = j + 1
-                break
-            if original or translation:
-                items.append(AuditItem(
-                    tl_file=path.name, src_file=src_file, src_line=src_line,
-                    who=who, original=original, translation=translation,
-                    tl_line=trans_line))
-            # 跳到块外（下一个 0 缩进的行）
-            i = max(j, i + 1)
-            while i < n and (not lines[i].strip() or lines[i][:1].isspace()):
-                i += 1
-            continue
-        if _STRINGS_RE.match(s):
-            # 字符串块：old "..." / new "..." 成对
-            j = i + 1
-            pending_old: str | None = None
-            p_file, p_line = src_file, src_line
-            while j < n:
-                t = lines[j].strip()
-                if not t:
-                    j += 1
-                    continue
-                mloc = _LOC_RE.match(t)
-                if mloc:
-                    p_file, p_line = mloc.group(1), int(mloc.group(2))
-                    j += 1
-                    continue
-                if t.startswith("translate"):
-                    break
-                mo = _OLD_RE.match(t)
-                if mo:
-                    pending_old = _quoted(mo.group(1))
-                    j += 1
-                    continue
-                mn = _NEW_RE.match(t)
-                if mn and pending_old is not None:
-                    items.append(AuditItem(
-                        tl_file=path.name, src_file=p_file, src_line=p_line,
-                        original=pending_old, translation=_quoted(mn.group(1)),
-                        tl_line=j + 1, is_string=True))
-                    pending_old = None
-                    j += 1
-                    continue
-                j += 1
-            i = j
-            continue
-        i += 1
-    return items
+def _audit_items(doc: TLFile) -> list[AuditItem]:
+    return [AuditItem(
+        tl_file=doc.path.name, src_file=entry.src_file, src_line=entry.src_line,
+        who=entry.who, original=entry.original, translation=entry.translation,
+        tl_line=entry.line + 1, is_string=entry.identifier is None, entry=entry,
+    ) for entry in doc.entries if entry.original is not None and entry.translation is not None]
+
+
+def parse_tl_file(path: Path, language: str | None = None) -> list[AuditItem]:
+    return _audit_items(read_tl_file(path, language))
 
 
 # ---------------------------------------------------------------------------
 # 分类判定
 # ---------------------------------------------------------------------------
 
-def classify(item: AuditItem, language: str) -> str | None:
-    """对单条翻译判定问题类别；返回 None 表示正常。
-
-    判定只在「原文确实是外文（不含目标语言文字）」时进行——
-    游戏源文本本身已含中文（例如自带部分汉化）的条目跳过。
-    """
-    lang = _norm_language(language)
-    expected_re = _EXPECTED_SCRIPTS.get(lang, _CJK_RE)
+def classify(item: AuditItem, language: str, protected_terms=()) -> str | None:
+    """检查玩家可见的译文，包括原文本身已部分翻译的条目。"""
+    target = target_language_name(language)
     orig, trans = item.original, item.translation
-    if not orig.strip() or not trans.strip():
+    orig_plain = _strip_markup(orig, protected_terms).strip()
+    if not orig_plain:
         return None
-    # 原文已含目标语言文字 → 不是「待翻译成目标语言」的条目，跳过
-    if expected_re is not None and expected_re.search(_strip_markup(orig)):
+    if not trans.strip():
+        return "untranslated"
+    expected = _EXPECTED_SCRIPTS.get(target)
+    if expected is None:
         return None
-    if lang == "english" and _ASCII_WORD_RE.search(orig):
-        pass  # 英文目标的原文检查在下面统一处理
+    trans_plain = orig_plain if trans == orig else _strip_markup(trans, protected_terms).strip()
+    same = trans_plain == orig_plain
+    for name, pattern in _OTHER_SCRIPTS:
+        if pattern not in expected and pattern.search(trans_plain):
+            item.note = f"含{name}"
+            return "untranslated" if same else "wrong_lang"
 
-    trans_plain = _strip_markup(trans)
-    orig_plain = _strip_markup(orig)
-    has_expected = (
-        _ASCII_WORD_RE.search(trans_plain) is not None
-        if expected_re is None
-        else expected_re.search(trans_plain) is not None)
-
-    # 1) 未翻译残留：译文 == 原文，且原文有成串英文单词
-    if trans_plain.strip() == orig_plain.strip():
-        # 界面字符串（"SAVE"/"LOAD"）单词也必须翻译；对话里的单个英文词
-        # 多为键名/舞台指令，维持 ≥2 连续单词的判定
-        if item.is_string:
-            if _UI_WORD_RE.search(orig_plain):
-                return "untranslated"
-        elif _WORD_RUN2_RE.search(orig_plain):
-            return "untranslated"
-        return None
-
-    if not has_expected:
-        # 3) 目标语言不正确
-        #    a) 含其他语言文字（假名/韩文/西里尔/泰文/希腊；汉字在非中文目标下）
-        for name, rx in _OTHER_SCRIPTS:
-            if expected_re is not None and rx is expected_re:
-                continue
-            if lang.startswith("zh") or lang in ("schinese", "tchinese"):
-                if rx is _CJK_RE:
-                    continue
-            elif expected_re is None and rx is _CJK_RE:
-                pass  # 英文目标：译文是中文 → 确实异常，保留判定
-            if rx.search(trans_plain):
-                item.note = f"含{name}"
-                return "wrong_lang"
-        #    b) 整句仍是英文（与原文不同）——模型「改写」而非「翻译」
-        if _WORD_RUN2_RE.search(trans_plain):
-            item.note = "整句仍为英文"
-            return "wrong_lang"
-        return None
-
-    # 2) 中英参半：有目标语言文字，又残留 ≥3 个连续英文单词
-    if _WORD_RUN3_RE.search(trans_plain):
-        item.note = "残留成段英文"
-        return "mixed"
-
-    # 4) 繁体残留（仅简体中文目标）：以上都正常、只是字形不对。放在最后
-    #    是有意的——「mixed + 繁体」的条目先按 mixed 进重译队列（重译才能
-    #    解决英文残留），纯繁体才走本地转换（免 API 修复）。
-    if lang in _SIMPLIFIED_LANGS:
+    if target != "English":
+        has_expected = any(pattern.search(trans_plain) for pattern in expected)
+        if has_expected and _WORD_RUN3_RE.search(trans_plain):
+            item.note = "残留成段英文"
+            return "mixed"
+        if not has_expected:
+            # A single untranslated menu command is actionable. In dialogue
+            # require two words so a short name or key does not enter the queue.
+            pattern = _UI_WORD_RE if same and item.is_string else _WORD_RUN2_RE
+            if pattern.search(trans_plain):
+                item.note = "仍含英文"
+                return "untranslated" if same else "wrong_lang"
+    if target == "Simplified Chinese":
         tch = traditional_chars(trans_plain)
         if tch:
             item.note = "含繁体字: " + "".join(tch[:12]) + (
                 "…" if len(tch) > 12 else "")
             return "traditional"
+    elif target == "Traditional Chinese" and has_simplified_forms(trans_plain):
+        item.note = "含简体字形"
+        return "wrong_lang"
     return None
 
 
@@ -343,78 +244,51 @@ def classify(item: AuditItem, language: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 _CATEGORY_TITLES = {
-    "untranslated": "未翻译残留（译文与原文相同）",
+    "untranslated": "未翻译残留（译文为空或与原文相同）",
     "mixed": "中英参半（译文残留成段英文）",
     "wrong_lang": "目标语言不正确（含其他语言 / 整句英文）",
-    "traditional": "繁体残留（已自动转换为简体）",
+    "traditional": "繁体残留",
 }
 
 
-def _simplify_say_line(line: str) -> tuple[str, str] | None:
-    """把一个译文行（``who "…"`` / ``new "…"``）引号内的繁体转为简体。
-
-    返回 ``(新行, 转换后的译文原文)``；行内没有引号或没有繁体时返回 None。
-    只动引号内的内容——说话人前缀、``new`` 关键字、缩进、行尾注释都不碰。
-    """
-    first, last = line.find('"'), line.rfind('"')
-    if first == -1 or last <= first:
-        return None
-    prefix, body, suffix = line[:first], line[first + 1:last], line[last + 1:]
-    decoded = _decode_say_string(body)
-    simplified = to_simplified(decoded)
-    if simplified == decoded:
-        return None
-    return prefix + encode_say_string(simplified) + suffix, simplified
-
-
 def _fix_traditional_lines(items: list[AuditItem],
-                           item_paths: dict[int, Path], log) -> int:
+                           item_docs: dict[int, TLFile], protected_terms, log) -> dict[Path, int]:
     """把繁体译文行就地改写为简体（繁→简一一对应，无需重译）。
 
     只改 ``new "…"`` / 译文行的引号内容；``old`` 原文行绝不碰——原文是
     游戏文本的匹配键，动了会导致 Ren'Py 对不上号而整块失效。
-    返回成功改写的条数。
+    返回实际写入的文件及其改写条数。
     """
     by_file: dict[Path, list[AuditItem]] = {}
     for it in items:
-        p = item_paths.get(id(it))
-        if p is not None and it.tl_line > 0:
-            by_file.setdefault(p, []).append(it)
+        doc = item_docs[id(it)]
+        if not doc.read_only and it.entry is not None and it.entry.span is not None:
+            by_file.setdefault(doc.path, []).append(it)
 
-    fixed = 0
+    fixed = {}
     for path, group in by_file.items():
-        try:
-            raw = path.read_text(encoding="utf-8-sig", errors="strict")
-        except (OSError, UnicodeError) as exc:
-            if log:
-                log(f"补漏查缺：读取 {path.name} 失败，跳过本地转换: {exc}")
-            continue
-        ends_nl = raw.endswith("\n")
-        lines = raw.split("\n")
-        touched: list[AuditItem] = []
+        doc = item_docs[id(group[0])]
+        lines = doc.lines.copy()
+        touched = []
         for it in group:
-            idx = it.tl_line - 1
-            if not 0 <= idx < len(lines):
-                continue
-            rv = _simplify_say_line(lines[idx])
-            if rv is None:
-                continue
-            lines[idx], simplified = rv
-            touched.append(it)
+            text, markup = protect_text(it.translation)
+            text, names = protect_names(text, protected_terms)
+            simplified = restore_text(restore_names(to_simplified(text), names), markup)
+            if simplified != it.translation:
+                idx = it.entry.line
+                lines[idx] = it.entry.with_translation(lines[idx], simplified)
+                touched.append((it, simplified))
         if not touched:
             continue
         try:
-            out = "\n".join(lines)
-            if ends_nl and not out.endswith("\n"):
-                out += "\n"
-            path.write_text(out, encoding="utf-8-sig")
-        except OSError as exc:
+            write_if_unchanged(path, "".join(lines), doc)
+        except (OSError, TranslationMergeError) as exc:
             if log:
-                log(f"补漏查缺：写回 {path.name} 失败: {exc}")
+                log(f"补漏查缺：未写回 {path.name}: {exc}")
             continue
-        fixed += len(touched)
-        for it in touched:
-            it.translation = to_simplified(it.translation)   # 报告展示转换后译文
+        fixed[path] = len(touched)
+        for it, simplified in touched:
+            it.translation = simplified
             it.note = "已自动转换为简体"
     return fixed
 
@@ -426,24 +300,9 @@ def _resolve_game_dir(game_path: str | Path) -> Path:
     return p
 
 
-def _escape_report_text(text: str) -> str:
-    """「未翻译报告」条目的多行转义：换行 → ``\\n``、反斜杠 → ``\\\\``。
-
-    报告是「一行一条」的格式（pipeline._parse_untran_report 靠行解析），
-    多行原文必须压成一行，否则一条会污染成多条。
-    """
-    return text.replace("\\", "\\\\").replace("\n", "\\n")
-
-
-def _unescape_report_text(text: str) -> str:
-    """_escape_report_text 的逆操作（写入/解析两侧配对使用）。"""
-    return re.sub(r"\\(.)", lambda m: "\n" if m.group(1) == "n" else m.group(1),
-                  text)
-
-
 def run_audit(game_path: str | Path, language: str, log=None,
               queue_for_retranslate: bool = True,
-              fix_traditional: bool = True) -> AuditSummary:
+              fix_traditional: bool = True, protected_terms=()) -> AuditSummary:
     """扫描 tl/<语言>/ 全部翻译文件，写报告并把问题项排入重译队列。
 
     ``fix_traditional``（默认开）：简体中文目标下检出繁体残留时，直接在
@@ -452,57 +311,73 @@ def run_audit(game_path: str | Path, language: str, log=None,
     """
     summary = AuditSummary()
     game_dir = _resolve_game_dir(game_path)
-    lang = _norm_language(language)
+    lang = language.split("（")[0].split("(")[0].strip()
+    if not lang.isidentifier() or lang.lower() == "none":
+        raise ValueError(f"目标语言标识无效：{lang}")
+    protected_terms = tuple(dict.fromkeys([*(protected_terms or ()), *read_game_terms(game_dir, lang)]))
     tl_dir = game_dir / "tl" / lang
-    if not tl_dir.is_dir():
+    docs = index_tl_directory(tl_dir, lang)
+    if not docs and not tl_dir.is_dir():
         if log:
             log(f"补漏查缺：未找到 {tl_dir}，跳过（先完成一次翻译）")
         return summary
 
-    # 不扫注入的界面补丁（无 translate 块，扫了也无害，但明确排除省时间）
     all_items: list[AuditItem] = []
-    item_paths: dict[int, Path] = {}     # id(item) -> tl 文件路径（修复要用）
-    for f in sorted(tl_dir.rglob("*.rpy")):
-        if f.name in ("zz_cn_font.rpy", "zz_language_ui.rpy"):
+    item_docs: dict[int, TLFile] = {}
+    for path, doc in docs.items():
+        if _is_tool_control(doc):
             continue
-        for it in parse_tl_file(f):
-            item_paths[id(it)] = f
+        for it in _audit_items(doc):
+            it.tl_file = doc.origin or str(path.relative_to(tl_dir))
+            item_docs[id(it)] = doc
             all_items.append(it)
 
     problems: list[AuditItem] = []
     for it in all_items:
-        cat = classify(it, lang)
+        cat = classify(it, lang, protected_terms)
         if cat:
             it.category = cat
+            if item_docs[id(it)].read_only or it.entry.span is None:
+                summary.read_only_count += 1
+                it.note = (it.note + "；" if it.note else "") + "只读译文，需提供对应 .rpy 源文件"
             problems.append(it)
 
     # 繁体残留 → 本地修复（把译文行改写为简体）。来自模型输出质量，
     # 但修复与模型无关：繁→简一一对应，直接替换 tl 文件即可。
-    if fix_traditional and lang in _SIMPLIFIED_LANGS:
+    if fix_traditional and target_language_name(lang) == "Simplified Chinese":
         trad_items = [it for it in problems if it.category == "traditional"]
         if trad_items:
-            fixed = _fix_traditional_lines(trad_items, item_paths, log)
-            summary.fixed_traditional = fixed
+            fixed = _fix_traditional_lines(trad_items, item_docs, protected_terms, log)
+            summary.fixed_files = list(fixed)
+            summary.fixed_traditional = sum(fixed.values())
             if log:
-                log(f"补漏查缺：已把 {fixed} 条繁体译文本地转换为简体"
+                log(f"补漏查缺：已把 {summary.fixed_traditional} 条繁体译文本地转换为简体"
                     f"（无需重译）")
 
     summary.total = len(all_items)
     for it in problems:
         summary.counts[it.category] = summary.counts.get(it.category, 0) + 1
 
+    actionable = {}
+    for it in problems:
+        if it.category != "traditional" and not item_docs[id(it)].read_only and it.entry.span is not None:
+            actionable.setdefault(it.original, f"{it.src_file}:{it.src_line}")
+
     report = tl_dir.parent / f"{lang}.补漏查缺报告.txt"
     summary.report_path = str(report)
 
     if problems:
         try:
+            report.parent.mkdir(parents=True, exist_ok=True)
             with open(report, "w", encoding="utf-8-sig") as f:
                 f.write("补漏查缺报告（翻译完成后自动扫描）\n")
                 f.write(f"扫描时间: {datetime.now():%Y-%m-%d %H:%M:%S}\n")
-                f.write(f"扫描范围: tl/{lang}/*.rpy，共 {len(all_items)} 条翻译\n")
+                f.write(f"扫描范围: tl/{lang} 的松散及归档脚本，共 {len(all_items)} 条翻译\n")
                 if summary.fixed_traditional:
                     f.write(f"繁体残留: {summary.fixed_traditional} 条已本地转换为简体（不占重译名额）\n")
-                queued_note = ("已自动排入重译队列，点击「开始汉化」即可补充修正"
+                if summary.read_only_count:
+                    f.write(f"其中 {summary.read_only_count} 条位于只读脚本，提供对应 .rpy 译文源码后可修正\n")
+                queued_note = ("可编辑的未翻译或错译原文将排入重译队列"
                                if queue_for_retranslate else "未排入重译队列")
                 f.write(f"发现问题: {len(problems)} 条（{queued_note}）\n")
                 for cat, title in _CATEGORY_TITLES.items():
@@ -514,9 +389,14 @@ def run_audit(game_path: str | Path, language: str, log=None,
                         where = f"{it.src_file}:{it.src_line}"
                         who = f" [{it.who}]" if it.who else ""
                         note = f"（{it.note}）" if it.note else ""
-                        f.write(f"\n[{where}]{who} {note}\n")
+                        f.write(f"\n[{where}]{who} {note}\n  位置: {it.tl_file}:{it.tl_line}\n")
                         f.write(f"  原文: {it.original}\n")
                         f.write(f"  译文: {it.translation}\n")
+                # Escape multiline source just once, so importing this report
+                # cannot select read-only controls or a locally repaired entry.
+                f.write("\n" + AUDIT_EXPORT_SECTION + "\n")
+                for text, loc in actionable.items():
+                    f.write(f"{loc}  {_escape_report_text(text)}\n")
         except OSError as exc:
             if log:
                 log(f"补漏查缺：写报告失败: {exc}")
@@ -536,44 +416,10 @@ def run_audit(game_path: str | Path, language: str, log=None,
         if log:
             log(f"补漏查缺：{len(all_items)} 条翻译全部正常，未发现残留问题")
 
-    # 排入重译队列：把问题项原文合并进「未翻译报告」（按文本去重）。
-    # 下次「开始汉化」时增量模式只重译报告中列出的文本。
-    if problems and queue_for_retranslate:
+    if queue_for_retranslate:
         untran = tl_dir.parent / f"{lang}.未翻译报告.txt"
-        existing: set[str] = set()
-        if untran.is_file():
-            try:
-                for ln in untran.read_text(
-                        encoding="utf-8-sig", errors="ignore").splitlines():
-                    m = re.match(r"^.+:\d+\s{2,}(.+)$", ln.strip())
-                    if m:
-                        existing.add(_unescape_report_text(m.group(1).strip()))
-            except OSError:
-                pass
-        added = 0
-        seen_new: set[str] = set()
-        chunk: list[str] = []
-        for it in problems:
-            if it.category == "traditional":
-                continue   # 已本地修复，无需重译
-            text = it.original.strip()
-            if not text or text in existing or text in seen_new:
-                continue
-            seen_new.add(text)
-            chunk.append(f"{it.src_file}:{it.src_line}  "
-                         f"{_escape_report_text(text)}")
-            added += 1
-        if chunk:
-            try:
-                with open(untran, "a", encoding="utf-8-sig") as f:
-                    f.write("\n\n== 补漏查缺发现的问题（自动排入，重译成功后消失）==\n")
-                    for line in chunk:
-                        f.write("\n" + line)
-                summary.queued = added
-                if log:
-                    log(f"已把 {added} 条问题项排入重译队列"
-                        f"（{untran.name}），再次点击「开始汉化」即可补充修正")
-            except OSError as exc:
-                if log:
-                    log(f"补漏查缺：排入重译队列失败: {exc}")
+        summary.queued = sync_audit_queue(untran, actionable)
+        if log and summary.queued:
+            log(f"已把 {summary.queued} 条问题项排入重译队列"
+                f"（{untran.name}），再次点击「开始汉化」即可补充修正")
     return summary

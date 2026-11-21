@@ -107,7 +107,7 @@ class PatcherTests(unittest.TestCase):
         self.assertIn("            hbox:\n                style_prefix \"radio\"", patched)
         self.assertIn('_lang_ui_display_name(_lang_ui_i)', patched)
         self.assertIn('Language(_lang_ui_i)', patched)
-        self.assertIn('Function(_lang_ui_note_selection, _lang_ui_i)', patched)
+        self.assertIn("Function(_lang_ui_note_selection, _lang_ui_i, 'preferences')", patched)
         self.assertIn('timer 0.25 repeat True action Function(_ls_observe_language_switch)', patched)
         self.assertIn(patcher._FONT_UI_MARKER, patched)
         self.assertIn('textbutton "系统字体"', patched)
@@ -174,17 +174,35 @@ class PatcherTests(unittest.TestCase):
         self.assertTrue(patcher._language_ui_is_top_aligned(
             patched, "mm_preferences"))
 
+    def test_only_fixed_settings_reuse_the_stock_spacer_for_the_added_row(self) -> None:
+        source = (
+            "screen quick_preferences():\n"
+            "    viewport xpos 400 ypos 210:\n"
+            "{scroll}"
+            "        has vbox\n"
+            "        hbox:\n"
+            "            null height (4 * gui.pref_spacing)\n"
+            "        null height (4 * gui.pref_spacing)  # between groups\n"
+            "        bar value Preference('voice volume')\n"
+        )
+        fixed = patcher._build_language_ui(source.format(scroll=""), screen_name="quick_preferences")
+        self.assertIn("        null height gui.pref_spacing  # between groups", fixed)
+        self.assertIn("            null height (4 * gui.pref_spacing)", fixed)
+        scrollable = patcher._build_language_ui(
+            source.format(scroll="        mousewheel True\n"), screen_name="quick_preferences")
+        self.assertIn("        null height (4 * gui.pref_spacing)  # between groups", scrollable)
+
     def test_custom_font_health_check_allows_decompiler_blank_lines(self) -> None:
         text = (
             "init 999 screen mm_preferences():\n"
             "    viewport:\n"
             "        has vbox\n"
             f"        {patcher._LANG_UI_MARKER}\n"
-            f"        {patcher._FONT_UI_MARKER}\n\n"
-            "        if _preferences.language == 'schinese':\n\n"
-            "            label _(\"Font\")\n\n"
-            "            if _zz_font_choices:\n\n"
-            "                textbutton \"系统字体\" action NullAction()\n"
+            "        hbox:\n"
+            f"            {patcher._FONT_UI_MARKER}\n\n"
+            "            if _preferences.language == 'schinese':\n\n"
+            "                if _zz_font_choices:\n\n"
+            "                    textbutton \"系统字体\" action NullAction()\n"
         )
         self.assertTrue(patcher._font_ui_is_current(text, "mm_preferences"))
 
@@ -241,6 +259,15 @@ class PatcherTests(unittest.TestCase):
             self.assertLess(mm_block.index(patcher._FONT_UI_MARKER),
                             mm_block.index("text 'Rollback Side'"))
             self.assertTrue(patcher._font_ui_is_current(mm_block))
+            # Both settings screens must fit the system button alongside the
+            # language loop, without adding two rows above their audio sliders.
+            for name in ("preferences", "mm_preferences", "quick_preferences"):
+                block = patcher._extract_screen_block(generated, name)
+                rows = block.splitlines()
+                loop = next(line for line in rows if "for _lang_ui_i in " in line)
+                marker = next(line for line in rows if line.strip() == patcher._FONT_UI_MARKER)
+                self.assertEqual(len(loop) - len(loop.lstrip()), len(marker) - len(marker.lstrip()))
+                self.assertNotIn('label _("Font")', block)
 
     def test_native_preferences_language_does_not_rebuild_custom_only_patch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -305,6 +332,109 @@ class PatcherTests(unittest.TestCase):
             self.assertTrue(second.skip)
             self.assertEqual(
                 generated.read_text(encoding="utf-8-sig"), initial_content)
+
+    def test_only_the_target_action_in_the_settings_screen_counts_as_native(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            (game / "screens.rpy").write_text(
+                "screen preferences():\n"
+                "    vbox:\n"
+                "        textbutton 'Other' action Language('chinese')\n"
+                "        $ metadata = renpy.known_languages()\n"
+                "screen gallery():\n"
+                "    textbutton 'Chinese' action Language('schinese')\n", encoding="utf-8")
+            self.assertTrue(patcher.apply_language_ui(game, "schinese").ok)
+            source = (game / "zz_language_ui.rpy").read_text(encoding="utf-8-sig")
+            self.assertEqual(patcher.monitored_settings_screens(source), ["preferences"])
+
+    def test_display_names_respect_nested_owners_and_all_covered_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            lang_dir = game / "tl" / "schinese"
+            chapters = lang_dir / "chapters"
+            chapters.mkdir(parents=True)
+            nested = chapters / "dialogue.rpy"
+            keys = tuple(patcher._LANGUAGE_DISPLAY['schinese']) + ('Language',)
+            def setup_pairs(words):
+                nested.write_text("translate schinese strings:\n" + "".join(
+                    f"    old {s!r}\n    new {s!r}\n" for s in words), encoding="utf-8")
+            setup_pairs(["Language", "Font"])
+            script = lang_dir / "zz_language_display.rpy"
+            self.assertTrue(patcher.ensure_language_name(game, 'schinese').ok)
+            text = script.read_text(encoding="utf-8-sig")
+            self.assertNotIn("'Font'", text)
+            self.assertNotIn("'Language'", text)
+            setup_pairs(keys)
+            self.assertTrue(patcher.ensure_language_name(game, 'schinese').ok)
+            self.assertNotIn("translate schinese strings:", script.read_text(encoding="utf-8-sig"))
+            self.assertTrue(patcher.ensure_language_name(game, 'schinese').skip)
+
+    def test_disabling_font_and_non_chinese_do_not_inject_chinese_font_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            (game / "screens.rpy").write_text("screen preferences():\n    text 'Options'\n")
+            (game / "zz_cn_font.rpy").write_text("_zz_font_choices = {}\ndef _zz_font_select(c): pass\n")
+            for language, with_font in (("schinese", False), ("japanese", True)):
+                with self.subTest(language=language), patch.object(patcher, "apply_font_patch") as font:
+                    tl = game / "tl" / language
+                    tl.mkdir(parents=True)
+                    results = patcher.apply_all(game, language, with_font=with_font)
+                    self.assertTrue(all(r.ok for r in results))
+                    font.assert_not_called()
+                    source = (game / "zz_language_ui.rpy").read_text(encoding="utf-8-sig")
+                    self.assertNotIn('textbutton "系统字体"', source)
+                    self.assertIn("Language(_lang_ui_i)", source)
+                    self.assertEqual((tl / "zz_language_display.rpy").is_file(), language == "schinese")
+
+    def test_archived_ui_uses_effective_patch_and_respects_loose_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            archived = (game / "patch.rpa", "ui/screens.rpy", object())
+            menu = b"screen preferences():\n    text 'Archive menu'\n"
+            with patch.object(patcher.rpa_loader, "iter_script_entries", return_value=[archived]), \
+                    patch.object(patcher.rpa_loader, "read_entry", return_value=menu) as read_entry:
+                rows = patcher._settings_screens(game)
+                self.assertEqual(rows, [("preferences", menu.decode(), "patch.rpa::ui/screens.rpy")])
+                (game / "ui").mkdir()
+                (game / "ui" / "screens.rpy").write_text("screen help():\n    pass\n")
+                self.assertEqual(patcher._settings_screens(game), [])
+                read_entry.assert_called_once_with(archived[0], archived[2])
+
+    def test_override_tracks_source_updates_and_changed_font_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            original = game / "screens.rpy"
+            source = "screen preferences():\n    use game_menu('Settings'):\n        vbox:\n            text 'Sound'\n"
+            original.write_text(source, encoding="utf-8")
+            (game / "zz_cn_font.rpy").write_text("_zz_font_choices = {}\ndef _zz_font_select(x): pass\n")
+            patcher.apply_language_ui(game, "schinese", with_font=True)
+            original.write_text(source.replace("Sound", "Music"), encoding="utf-8")
+            second = patcher.apply_language_ui(game, "tchinese", with_font=True)
+            self.assertTrue(second.ok)
+            self.assertFalse(second.skip)
+            generated = (game / "zz_language_ui.rpy").read_text(encoding="utf-8-sig")
+            self.assertIn("text 'Music'", generated)
+            self.assertNotIn("text 'Sound'", generated)
+            self.assertIn("if _preferences.language == 'tchinese':", generated)
+            self.assertNotIn("if _preferences.language == 'schinese':", generated)
+
+    def test_new_native_action_retires_only_the_generated_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            original = game / "screens.rpy"
+            original.write_text("screen preferences():\n    text 'Options'\n", encoding="utf-8")
+            patcher.apply_language_ui(game)
+            override = game / "zz_language_ui.rpy"
+            cache = override.with_suffix(".rpyc")
+            cache.write_bytes(b"cached previous override")
+            keep = game / "screens.rpyc"
+            keep.write_bytes(b"original")
+            original.write_text("screen preferences():\n    textbutton 'CN' action Language('schinese')\n",
+                                encoding="utf-8")
+            self.assertTrue(patcher.apply_language_ui(game).ok)
+            self.assertFalse(override.exists())
+            self.assertFalse(cache.exists())
+            self.assertTrue(keep.exists())
 
     def test_language_picker_finds_root_vbox_after_comments(self) -> None:
         source = (

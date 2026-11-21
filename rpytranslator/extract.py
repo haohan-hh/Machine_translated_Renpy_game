@@ -6,7 +6,7 @@
 renpy/translation/__init__.py 的 Restructurer.create_translate）：
 
   翻译 ID = label.replace(".", "_") + "_" + md5(code + "\\r\\n").hexdigest()[:8]
-  其中 code = Say.get_code() 的规范化输出（who 可选 + encode_say_string(what)）
+  显式 id 优先于自动生成的 ID；code 是 Say.get_code() 的规范化输出。
 
 对话（say）              → translate <lang> <id> 块
 菜单选项 / _() 字符串 /
@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import re
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -67,6 +68,16 @@ def encode_say_string(s: str) -> str:
 # `balto "@@p0@@p这样自我介绍可能不是最好的方式。"`。游戏运行时无害，
 # 但会污染译文、干扰增量匹配，解析已有 tl 时统一剥离。
 _SAY_POS_MARKER = re.compile(r"@@p\d+@@p")
+_SAY_ESCAPE = re.compile(r"\\(u([0-9a-fA-F]{1,4})|.)", re.DOTALL)
+
+
+def _say_value(raw: str) -> str:
+    """Ren'Py collapses whitespace before interpreting escapes in a say literal."""
+    def unescape(m):
+        if m[2]:
+            return chr(int(m[2], 16))
+        return {"n": "\n", "{": "{{", "[": "[[", "%": "%%"}.get(m[1], m[1])
+    return _SAY_ESCAPE.sub(unescape, re.sub(r"[ \n]+", " ", raw))
 
 
 def decode_say_string(raw: str) -> str:
@@ -76,25 +87,7 @@ def decode_say_string(raw: str) -> str:
     解析既有 tl 时复用本函数，与生成器输出格式一致；剥离位置标记可避免
     Ren'Py 编译残留干扰译文增量匹配（同一原文出现两条生成式与以不同形式）。
     """
-    out: list[str] = []
-    i, n = 0, len(raw)
-    while i < n:
-        c = raw[i]
-        if c == "\\" and i + 1 < n:
-            nxt = raw[i + 1]
-            if nxt == "n":
-                out.append("\n")
-            elif nxt == " ":
-                out.append(" ")
-            elif nxt == '"':
-                out.append('"')
-            else:
-                out.append(nxt)          # \\ → \
-            i += 2
-        else:
-            out.append(c)
-            i += 1
-    return _SAY_POS_MARKER.sub("", "".join(out))
+    return _SAY_POS_MARKER.sub("", _say_value(raw))
 
 
 def make_say_code(
@@ -168,12 +161,15 @@ class DialogueUnit:
 
     def __post_init__(self):
         if not self.code:
-            self.code = make_say_code(
-                self.who, self.what, self.attributes, self.temporary_attributes,
-                self.interact, self.with_expr, self.explicit_id, self.arguments,
-            )
+            self.code = self.say_code(self.what)
         if not self.identifier:
-            self.identifier = make_dialogue_identifier(self.label, self.code)
+            self.identifier = self.explicit_id or make_dialogue_identifier(self.label, self.code)
+
+    def say_code(self, what: str) -> str:
+        return make_say_code(
+            self.who, what, self.attributes, self.temporary_attributes,
+            self.interact, self.with_expr, self.explicit_id, self.arguments,
+        )
 
 
 @dataclass
@@ -215,13 +211,15 @@ _STRING_START = re.compile(r'("""|\'\'\'|"|\')')
 def _unescape(body: str, quote: str = '"') -> str:
     """对字符串体做转义还原（与 Python/Ren'Py 语义一致）。"""
     try:
-        return ast.literal_eval(quote + body + quote)
-    except Exception:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            return ast.literal_eval(quote + body + quote)
+    except (ValueError, SyntaxError):
         # literal_eval 失败时退化为原样返回（保留转义符）
         return body
 
 
-def _parse_string_literal(s: str, pos: int) -> tuple[str | None, int]:
+def _parse_string_literal(s: str, pos: int, *, spoken: bool = False) -> tuple[str | None, int]:
     """从 s[pos:] 解析 Ren'Py 字符串字面量（支持三引号、转义）。
     返回 (字面量的真实值, 结束位置)；失败返回 (None, pos)。"""
     m = _STRING_START.match(s, pos)
@@ -238,7 +236,7 @@ def _parse_string_literal(s: str, pos: int) -> tuple[str | None, int]:
             return _unescape(body, quote), i + 3
         if not triple and s[i] == quote[0]:
             body = s[body_start:i]
-            return _unescape(body, quote), i + 1
+            return (_say_value(body) if spoken else _unescape(body, quote)), i + 1
         if s[i] == "\\":
             i += 2
             continue
@@ -327,6 +325,7 @@ def _logical_lines(raw: str) -> list[_LogicalLine]:
             buf.append(line)
             if open_quote * 3 in line:
                 open_quote = None
+                flush()
             continue
 
         code = strip_comment(line)
@@ -365,6 +364,7 @@ _SCREEN_PROP_RE = re.compile(
     r'\b(?:tooltip|alt|text|title|subtitle)\s+(["\'])', re.I)
 # define/default 中的 Character 调用
 _CHARACTER_RE = re.compile(r'\b\w*Character\s*\(')
+_CHARACTER_NAME_ARG = re.compile(r'\s*(?:name\s*=\s*)?(?:_\(\s*)?')
 # 判断字符串是否值得翻译时，剥离 {标签} / [插值] / {#...} 特殊标记
 _STRIP_TAG_RE = re.compile(r"\{[^{}]*\}")
 _STRIP_INSERT_RE = re.compile(r"\[[^\[\]]*\]")
@@ -384,6 +384,7 @@ class RpyExtractor:
         self.strings: list[StringUnit] = []
         self.used_ids: set[str] = set()
         self.seen_strings: set[str] = set()
+        self._string_units: dict[str, StringUnit] = {}
         self.skipped: list[str] = []
         self._label: str | None = None
         self._alternate: str | None = None
@@ -393,10 +394,16 @@ class RpyExtractor:
         self._global_label: str | None = None
         self._stack: list[_Ctx] = []
         self._open_define_parens = 0   # 跨行 define 未闭合的括号数
+        self._open_define: list[str] = []
+        self._define_line = 0
 
     # -- 通用 --------------------------------------------------------------
 
     def _add_dialogue(self, who, what, line_no, source_line, **kw):
+        if who and _STRING_START.match(who):
+            display_name, end = _parse_string_literal(who, 0)
+            if display_name and end == len(who) and any(c.isalpha() for c in display_name):
+                self._add_string(display_name, line_no, context="character")
         unit = DialogueUnit(
             who=who, what=what, label=self._label, filename=self.filename,
             line=line_no, source_line=source_line, **kw,
@@ -429,8 +436,6 @@ class RpyExtractor:
                 r"\.(?:png|jpe?g|webp|bmp|gif|ogg|wav|mp3|flac|opus|ttf|otf"
                 r"|woff|woff2|rpy|rpyc|webm|mp4|txt|json|json5)$", v):
             return False
-        if "{#" in v:                                 # {#...} 翻译器特殊注释
-            return False
         plain = _STRIP_TAG_RE.sub("", v)
         plain = _STRIP_INSERT_RE.sub("", plain)
         plain = plain.strip()
@@ -439,13 +444,18 @@ class RpyExtractor:
         return True
 
     def _add_string(self, text, line_no, context=""):
-        if not text or text in self.seen_strings:
+        if text in self._string_units:
+            if context == "character":
+                self._string_units[text].context = context
+            return
+        if not text:
             return
         if not self._is_translatable_text(text):
             return
         self.seen_strings.add(text)
-        self.strings.append(StringUnit(text=text, filename=self.filename,
-                                       line=line_no, context=context))
+        unit = StringUnit(text=text, filename=self.filename, line=line_no, context=context)
+        self._string_units[text] = unit
+        self.strings.append(unit)
 
     def _unique_id(self, identifier: str) -> str:
         base = identifier
@@ -521,7 +531,12 @@ class RpyExtractor:
 
         # 跨行 define 的延续行（ConditionSwitch / 字典 / 列表参数等），忽略
         if self._open_define_parens:
+            self._open_define.append(stripped)
             self._open_define_parens += self._paren_net(text)
+            if self._open_define_parens <= 0:
+                self._open_define_parens = 0
+                self._add_character_names(" ".join(self._open_define), self._define_line)
+                self._open_define.clear()
             return
 
         # python / translate 块内：忽略语句（_() 字符串另由全局扫描处理）
@@ -545,9 +560,7 @@ class RpyExtractor:
 
         # 语句关键字
         keyword = self._keyword_of(stripped)
-        if keyword in ("label", "menu"):
-            # `menu name:` 在 Ren'Py 中等价于一个隐式 label，对话/选项的
-            # 翻译 identifier 以此为前缀。漏掉会让大批量说错 label。
+        if keyword == "label":
             self._handle_label(stripped)
             return
         if keyword == "call":
@@ -570,7 +583,7 @@ class RpyExtractor:
             self._stack.append(_Ctx(_TRANSLATE, indent))
             return
         if keyword == "menu":
-            self._handle_menu(stripped)
+            self._handle_label(stripped)  # A named menu also declares a label.
             self._stack.append(_Ctx(_MENU, indent))
             return
         if keyword == "screen":
@@ -587,13 +600,18 @@ class RpyExtractor:
             return  # 单行 python
 
         # menu 上下文中的裸字符串 = 菜单选项/标题（仅限菜单体缩进）
-        if top and top.kind == _MENU and self._is_bare_string_start(stripped):
+        menu_item = False
+        if top and top.kind == _MENU:
             if top.menu_indent is None:
                 top.menu_indent = indent
-            if indent == top.menu_indent:
-                self._handle_menu_string(stripped, ll.line)
-                return
-            # 更深缩进的裸字符串 → 旁白对话，继续走 say 解析
+            menu_item = indent == top.menu_indent
+            if menu_item and self._is_bare_string_start(stripped):
+                value, end = _parse_string_literal(stripped, 0, spoken=True)
+                rest = stripped[end:].lstrip()
+                # A quoted speaker followed by speech is a say menuitem.
+                if value is not None and (not rest or stripped.endswith(":")):
+                    self._add_string(value, ll.line, context="menu")
+                    return
 
         # 尝试解析为对话（say）
         units = self._parse_say(stripped, ll.line)
@@ -602,6 +620,8 @@ class RpyExtractor:
         for who, what, kw in units:
             if what == "{clear}":
                 continue
+            if menu_item and who:
+                kw["interact"] = False
             self._add_dialogue(who, what, ll.line, text, **kw)
 
     @staticmethod
@@ -613,7 +633,7 @@ class RpyExtractor:
     def _is_python_stmt(stripped: str) -> bool:
         if stripped.startswith("python"):
             return True
-        return bool(re.match(r"^init(?:\s+offset\s+\d+)?(?:\s+-\w+)*\s+python\b", stripped))
+        return bool(re.match(r"^init(?:\s+[+-]?\d+)?\s+python\b", stripped))
 
     def _resolve_label_name(self, name: str) -> str:
         """按 Ren'Py 语义解析 label 名，返回完整名。
@@ -665,17 +685,6 @@ class RpyExtractor:
     def _is_bare_string_start(stripped: str) -> bool:
         return bool(_STRING_START.match(stripped))
 
-    def _handle_menu(self, stripped: str):
-        # 兼容保留：命名 menu 等价于隐式 label（实际入口在关键字分发的
-        # label/menu 分支，统一走 _handle_label 的新解析语义）。
-        self._handle_label(stripped)
-
-    def _handle_menu_string(self, stripped: str, line_no: int):
-        value, _ = _parse_string_literal(stripped, 0)
-        if value is None or not value or len(value) > 2000:
-            return
-        self._add_string(value, line_no, context="menu")
-
     def _handle_define(self, stripped: str, line_no: int):
         """define/default 语句：
         1) 值直接是字符串（跳过明显非文本内容）
@@ -690,12 +699,22 @@ class RpyExtractor:
                 # xxxVars.name = '...' 通常是角色名，与 Character 名称一样保留原文
                 ctx = "character" if re.search(r"\w+Vars\.name\s*=", stripped) else "define"
                 self._add_string(value, line_no, context=ctx)
+        if self._open_define_parens > 0:
+            self._open_define = [stripped]
+            self._define_line = line_no
+        else:
+            self._add_character_names(stripped, line_no)
+
+    def _add_character_names(self, stripped: str, line_no: int):
         for cm in _CHARACTER_RE.finditer(stripped):
-            sm = _STRING_START.search(stripped, cm.end())
-            if sm:
-                value, _ = _parse_string_literal(stripped, sm.start())
-                if value is not None and self._is_translatable_plain_string(value):
-                    self._add_string(value, line_no, context="character")
+            # Character(None, color="..."), DynamicCharacter("player.name")
+            # have no literal display name. Only consume an actual name argument.
+            if "DynamicCharacter" in cm[0]:
+                continue
+            start = _CHARACTER_NAME_ARG.match(stripped, cm.end()).end()
+            value, _ = _parse_string_literal(stripped, start)
+            if value is not None and self._is_translatable_plain_string(value):
+                self._add_string(value, line_no, context="character")
 
     @staticmethod
     def _is_translatable_plain_string(value: str) -> bool:
@@ -720,7 +739,7 @@ class RpyExtractor:
 
     def _parse_say(self, stripped: str, line_no: int):
         """尝试把一行解析为 say 语句。返回 [(who, what, kwargs)] 或 None。"""
-        m = re.match(r"^([A-Za-z_]\w*)", stripped)
+        m = re.match(r"^([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)", stripped)
         if m:
             who = m.group(1)
             if who not in NON_WHO_KEYWORDS or who == "extend":
@@ -734,14 +753,9 @@ class RpyExtractor:
         if stripped[:1] in ('"', "'"):
             lit, end = _parse_string_literal(stripped, 0)
             if lit is not None:
-                j = end
-                while j < len(stripped) and stripped[j] in " \t":
-                    j += 1
-                if j < len(stripped) and stripped[j] in ('"', "'"):
-                    # 后面还有第二个字符串 → 第一个是 who
-                    r = self._parse_say_rest(stripped, end)
-                    if r is not None:
-                        return r
+                r = self._parse_say_rest(stripped, end)
+                if r is not None:
+                    return r
         # 旁白：`"what" ...`
         return self._parse_say_rest(stripped, 0)
 
@@ -785,7 +799,7 @@ class RpyExtractor:
         # 第一个字符串（必需）
         while i < n and s[i] in " \t":
             i += 1
-        what, i = _parse_string_literal(s, i)
+        what, i = _parse_string_literal(s, i, spoken=True)
         if what is None:
             return None
 
@@ -838,7 +852,7 @@ class RpyExtractor:
                 i = j
                 continue
             # 追加字符串（monologue 模式）
-            v, ni = _parse_string_literal(s, i)
+            v, ni = _parse_string_literal(s, i, spoken=True)
             if v is not None:
                 whats.append(v)
                 i = ni
@@ -878,13 +892,13 @@ def scan_underscore_strings(text: str, filename: str) -> list[StringUnit]:
             if not m:
                 break
             value, end = _parse_string_literal(ll.text, m.start("quote"))
+            i = end if end > m.start() else m.start() + 1
             if value is not None and value not in seen and 0 < len(value) <= 2000:
                 seen.add(value)
                 if not RpyExtractor._is_translatable_text(value):
                     continue
                 result.append(StringUnit(text=value, filename=filename,
                                          line=ll.line, context="_()"))
-            i = end if end > m.start() else m.start() + 1
     return result
 
 
@@ -916,7 +930,7 @@ def extract_rpy_files(files: list[Path]) -> ExtractionResult:
     all_strings: list[StringUnit] = []
     skipped: list[str] = []
     by_file: dict[str, list[DialogueUnit]] = {}
-    seen_strings: set[str] = set()
+    seen_strings: dict[str, StringUnit] = {}
     used_ids: set[str] = set()
 
     for f in files:
@@ -935,8 +949,10 @@ def extract_rpy_files(files: list[Path]) -> ExtractionResult:
             by_file.setdefault(d.filename, []).append(d)
         for u in r.strings:
             if u.text in seen_strings:
+                if u.context == "character":
+                    seen_strings[u.text].context = "character"
                 continue
-            seen_strings.add(u.text)
+            seen_strings[u.text] = u
             all_strings.append(u)
 
     return ExtractionResult(

@@ -92,7 +92,17 @@ _TABLE = """
 鐲镯 鐳镭 龔龚 鶯莺 鷄鸡 灘滩 豎竖 燙烫 腫肿 爍烁 箇个 筍笋 聶聂 蘊蕴
 擄掳 攏拢 燴烩 膽胆 竄窜 竊窃 籠笼 籃篮 籬篱 篩筛 簫箫 簞箪 篤笃 簍篓
 簀箦 篳筚 簑蓑 簑蓑 籪簖 倖幸 盃杯 餚肴 測测 並并 偽伪 兌兑 勻匀 匱匮
+簡简 殼壳 難难
 """
+
+# Common forms that distinguish simplified writing, for checking a traditional
+# target without attempting an ambiguous reverse conversion (后, 里, 只, etc.).
+_SIMPLIFIED_FORMS = frozenset(
+    "们这说话谁让该对开关过样实应点现发觉头体见东无亲爱丽阳阴华学举旧岁业乐书买卖读"
+    "语词认识记讲论谢请课调谈议护报执边达选遗适迟进远运连还问间为个来会时没从气决"
+    "约妈归够梦历兴义习闻触将扩电车马鸟鱼龙风飞戏钱银铁钟儿两写画节艺陆鸡树桥药医"
+    "静响吓脏横纵温湿亿战争击杀军团队导帅师级统组织结给绝继续练总经绿线网编终"
+    "长门简汉国欢声单条页岛湾层钥锁麦黄蓝颜变态错张难剑广厅场壳弹")
 
 _TRAD_TO_SIMP: dict[str, str] = {}
 for _seg in _TABLE.split():
@@ -121,6 +131,11 @@ def has_traditional(text: str) -> bool:
     if not text:
         return False
     return any(ch in _TRAD_TO_SIMP for ch in text)
+
+
+def has_simplified_forms(text: str) -> bool:
+    """Check common unambiguous forms, leaving shared characters alone."""
+    return not _SIMPLIFIED_FORMS.isdisjoint(text)
 
 
 def to_simplified(text: str) -> str:

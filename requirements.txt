@@ -1,2 +1,2 @@
-requests>=2.31
-win32more>=0.8.1
+# The CLI uses the standard library. WinUI is required by the Windows GUI.
+win32more>=0.8.1; sys_platform == "win32"

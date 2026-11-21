@@ -2,7 +2,7 @@
 """
 翻译文件生成器：按源文件生成 tl/<语言>/ 下的 .rpy 翻译文件。
 
-输出格式与 Ren'Py 官方 TranslationGenerator 逐字节一致：
+按 Ren'Py 的 translate 对话块和 old/new 字符串格式输出：
 
     # TODO: Translation updated at 2026-08-30 14:30:00
 
@@ -21,11 +21,14 @@
 from __future__ import annotations
 
 import datetime
-import re
 from collections import defaultdict
 from pathlib import Path
 
 from .extract import DialogueUnit, StringUnit, encode_say_string
+from .tl_files import (
+    TLEntry, TLFile, TranslationMergeError, editable_output_path, encode_string,
+    index_tl_directory, unambiguous_translations, write_if_unchanged,
+)
 
 _HEADER = "# TODO: Translation updated at {stamp}"
 
@@ -58,23 +61,11 @@ def _rel_path(filename: str, game_dir: Path) -> str:
 
 def _dialogue_body(unit: DialogueUnit, translated: str) -> str:
     """单个对话翻译块（不含 translate 头）。"""
-    lines: list[str] = []
-    who = unit.who
-    # 原句注释：who 可选
-    comment = encode_say_string(unit.what)
-    if who:
-        comment = who + " " + comment
-    lines.append("    # " + comment)
-    # 译文行
-    new_comment = encode_say_string(translated)
-    if who:
-        new_comment = who + " " + new_comment
-    lines.append("    " + new_comment)
-    return "\n".join(lines)
+    return "    # " + unit.say_code(unit.what) + "\n    " + unit.say_code(translated)
 
 
 def _string_body(text: str, translated: str) -> str:
-    return "    old " + encode_say_string(text) + "\n    new " + encode_say_string(translated)
+    return "    old " + encode_string(text) + "\n    new " + encode_string(translated)
 
 
 def build_file_script(
@@ -139,6 +130,52 @@ def group_by_source_file(
     return dict(grouped)
 
 
+def _owners(docs: dict[Path, TLFile]) -> dict[tuple[bool, str], tuple[TLFile, TLEntry]]:
+    owners = {}
+    for doc in docs.values():
+        for entry in doc.entries:
+            key = (entry.identifier is None,
+                   entry.original if entry.identifier is None else entry.identifier)
+            if key in owners:
+                first, other = owners[key]
+                raise TranslationMergeError(
+                    f"已有译文重复定义 {key[1]!r}：{first.origin or first.path}:{other.block_start + 1} "
+                    f"和 {doc.origin or doc.path}:{entry.block_start + 1}，请先检查这两处")
+            owners[key] = (doc, entry)
+    return owners
+
+
+def parse_existing_translations(
+    tl_dir: Path, language: str, *, originals: dict[str, str] | None = None,
+    docs: dict[Path, TLFile] | None = None,
+) -> tuple[dict[str, str | None], dict[str, str | None]]:
+    """None denotes an occupied multi-statement or dynamic translation."""
+    dialogues, strings = {}, {}
+    if docs is None:
+        docs = index_tl_directory(tl_dir, language)
+    # Archived source alone is not registered by Ren'Py. Feed its unambiguous
+    # static translations to the planner so a loose definition can reuse them.
+    references = unambiguous_translations(
+        ((entry.identifier is None, entry.identifier or entry.original), (entry.original, entry.translation))
+        for doc in docs.values() for entry in doc.reference_entries if entry.translation)
+    for (is_string, key), pair in references.items():
+        if pair is not None:
+            (strings if is_string else dialogues)[key] = pair[1]
+            if not is_string and originals is not None and pair[0] is not None:
+                originals[key] = pair[0]
+    for (is_string, key), (doc, entry) in _owners(docs).items():
+        value = entry.translation
+        if value == "" and (doc.read_only or entry.span is None):
+            value = None  # an empty compiled/dynamic rendering cannot be filled in place
+        (strings if is_string else dialogues)[key] = value
+        if not is_string and originals is not None:
+            if entry.original is not None:
+                originals[key] = entry.original
+            else:
+                originals.pop(key, None)
+    return dialogues, strings
+
+
 def write_translation_files(
     dialogues: list[DialogueUnit],
     strings: list[StringUnit],
@@ -149,40 +186,78 @@ def write_translation_files(
     tl_root: Path | None = None,
     updated_at: str | None = None,
     progress_cb=None,
+    *,
+    retry_texts: set[str] | None = None,
+    changed_ids: set[str] | None = None,
+    accepted_originals: set[tuple[bool, str]] | None = None,
 ) -> list[Path]:
-    """生成全部 tl/<语言>/ 翻译文件，返回写出文件路径列表。"""
+    """Add missing definitions or repair requested literals in place in their owning files."""
     if tl_root is None:
         tl_root = game_dir / "tl"
     out_dir = tl_root / language
-    out_dir.mkdir(parents=True, exist_ok=True)
+    docs = index_tl_directory(out_dir, language)
+    owners = _owners(docs)
+    seen = set()
+    changes: dict[Path, list[str]] = {}
+    retry_texts = retry_texts or set()
+    changed_ids = changed_ids or set()
+    accepted_originals = accepted_originals or set()
 
-    grouped = group_by_source_file(dialogues, strings)
-    written: list[Path] = []
-    # Ren'Py 的字符串翻译全局唯一：同一字符串（如界面文本 "Language"）出现在
-    # 多个源文件（screens.rpy、languages.rpy）时，只能在一个 tl 文件中定义一次，
-    # 否则运行时报 "A translation for ... already exists"。
-    # 按文件排序顺序，把字符串分配给第一个出现的文件，其余文件跳过。
-    seen_strings: set[str] = set()
-    for idx, (src, (ds, ss)) in enumerate(sorted(grouped.items()), 1):
-        ss_dedup: list[StringUnit] = []
-        for s in ss:
-            if s.text not in seen_strings:
-                seen_strings.add(s.text)
-                ss_dedup.append(s)
-        script = build_file_script(
-            ds, ss_dedup, language, dialogue_translations, string_translations,
-            game_dir=game_dir, updated_at=updated_at,
-        )
-        if not script:
+    def needs_definition(is_string, key, source, value):
+        lookup = (is_string, key)
+        if value is None or lookup in seen:
+            return False
+        seen.add(lookup)
+        if lookup not in owners:
+            return True
+        doc, entry = owners[lookup]
+        changed = not is_string and key in changed_ids and source != entry.original
+        fallback = value == source and lookup not in accepted_originals
+        if changed and (entry.original_span is None or not value.strip() or fallback):
+            return False
+        if entry.translation is None or (entry.translation == value and not changed):
+            return False
+        if entry.translation and (not changed and (source not in retry_texts or fallback)):
+            return False
+        if doc.read_only or entry.span is None:
+            raise TranslationMergeError(f"重译 {key!r} 需要对应的可编辑 .rpy 源文件：{doc.origin or doc.path}")
+        if doc.path not in changes:
+            changes[doc.path] = doc.lines.copy()
+        lines = changes[doc.path]
+        if changed:
+            start, end = entry.original_span
+            line = lines[entry.original_line]
+            lines[entry.original_line] = line[:start] + encode_say_string(source) + line[end:]
+        if entry.translation != value:
+            lines[entry.line] = entry.with_translation(lines[entry.line], value)
+        return False
+
+    for src, (ds, ss) in sorted(group_by_source_file(dialogues, strings).items()):
+        ds = [u for u in ds if needs_definition(False, u.identifier, u.what,
+                                                dialogue_translations.get(u.identifier))]
+        ss = [u for u in ss if needs_definition(True, u.text, u.text,
+                                                string_translations.get(u.text))]
+        if not (ds or ss):
             continue
-        # 目标路径与源文件相对 game 目录的结构一致（保留子目录），
-        # 避免 days/route_aelfric/day_6.rpy 与 days/route_ulrich/day_6.rpy
-        # 等不同目录的同名文件互相覆盖。
-        rel = _rel_path(src, game_dir) if game_dir else Path(src).name
-        out_file = out_dir / rel
-        out_file.parent.mkdir(parents=True, exist_ok=True)
-        out_file.write_text(script, encoding="utf-8-sig")
+        rel = Path(_rel_path(src, game_dir)).with_suffix(".rpy")
+        if rel.is_absolute() or rel.drive or ".." in rel.parts:
+            raise TranslationMergeError(f"源脚本路径不能写入翻译目录：{src}")
+        out_file = editable_output_path(out_dir / rel, docs)
+        script = build_file_script(ds, ss, language, dialogue_translations, string_translations,
+                                   game_dir=game_dir, updated_at=updated_at)
+        doc = docs.get(out_file)
+        if out_file not in changes:
+            changes[out_file] = doc.lines.copy() if doc else []
+        lines = changes[out_file]
+        newline = doc.newline if doc else "\n"
+        if lines:
+            lines.append(newline if lines[-1].endswith(("\r", "\n")) else newline * 2)
+        lines.append(script.replace("\n", newline))
+
+    written = []
+    for idx, (out_file, lines) in enumerate(changes.items(), 1):
+        write_if_unchanged(out_file, "".join(lines), docs.get(out_file))
         written.append(out_file)
         if progress_cb:
-            progress_cb(idx, len(grouped), str(out_file))
+            progress_cb(idx, len(changes), str(out_file))
     return written

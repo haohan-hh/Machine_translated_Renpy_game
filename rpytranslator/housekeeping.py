@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-汉化后自动化处理（每次汉化完成后自动执行）：
+旧版维护函数。当前翻译流程按标识合并译文并报告冲突，不会自动执行清理。
 
 1. 删除“有对应 .rpy/.rpym 源文件”的 .rpyc/.rpymc
    Ren'Py 运行时优先加载 .rpyc；若 .rpyc 早于本次汉化（没有对应翻译的
@@ -50,8 +50,7 @@ def dedupe_translate_blocks(tl_lang_dir: Path) -> int:
     """清理 tl/<语言> 目录下重复的 translate 块，返回删除的块数。
 
     以 `translate <语言> <identifier>:` 行为块边界，同一 (语言, identifier)
-    只保留首次出现的块。字符串块 `translate <语言> strings:` 同样按规则去重
-    （同文件内只保留第一个）。逐行重建文件，不改动其余内容与注释。
+    只保留首次出现的对话块。多个 strings 块可合法地定义不同的字符串。
     """
     if not tl_lang_dir.is_dir():
         return 0
@@ -80,6 +79,8 @@ def dedupe_translate_blocks(tl_lang_dir: Path) -> int:
         seen: set[str] = set()
         drop_ranges: list[tuple[int, int]] = []
         for start, end, key in blocks:
+            if key.endswith("|strings"):
+                continue
             if key in seen:
                 drop_ranges.append((start, end))
             else:

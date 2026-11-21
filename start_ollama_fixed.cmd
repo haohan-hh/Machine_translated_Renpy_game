@@ -1,34 +1,32 @@
 @echo off
 setlocal
-rem Let the tray app own and supervise its API server. The previous serve-first
-rem order made the app's own child fail to bind and retry once per second.
-set "ROOT=%~dp0"
-set "OLLAMA_HOME=%LOCALAPPDATA%\Programs\Ollama"
-set "OLLAMA_MODELS=%ROOT%_dependencies\ollama_user_data_live\models"
+set "RPY_OLLAMA_API=http://127.0.0.1:11434/api/version"
+rem A running service owns its model store, even if this copy has no bundle.
+curl.exe --noproxy "*" --silent --fail --max-time 2 "%RPY_OLLAMA_API%" >nul 2>&1
+if not errorlevel 1 exit /b 0
+
+rem A manually opened tray app starts and supervises the API itself.
+tasklist.exe /FI "IMAGENAME eq ollama app.exe" /FO CSV /NH 2>nul | findstr.exe /I /L /C:"ollama app.exe" >nul
+if not errorlevel 1 goto wait_for_server
+
+set "RPY_OLLAMA_DIR=%LOCALAPPDATA%\Programs\Ollama"
+if not exist "%RPY_OLLAMA_DIR%\ollama app.exe" set "RPY_OLLAMA_DIR=%~dp0_dependencies\ollama_program"
+if not exist "%RPY_OLLAMA_DIR%\ollama app.exe" exit /b 4
+if not defined OLLAMA_MODELS if exist "%~dp0_dependencies\ollama_user_data_live\models\" set "OLLAMA_MODELS=%~dp0_dependencies\ollama_user_data_live\models"
 set "OLLAMA_HOST=127.0.0.1:11434"
-set "OLLAMA_NO_CLOUD=1"
+if not defined OLLAMA_NO_CLOUD set "OLLAMA_NO_CLOUD=1"
+start "" /B /D "%RPY_OLLAMA_DIR%" "%RPY_OLLAMA_DIR%\ollama app.exe" --hide --fast-startup
+if errorlevel 1 exit /b 1
 
-if not exist "%OLLAMA_HOME%\ollama.exe" exit /b 1
-if not exist "%OLLAMA_HOME%\ollama app.exe" exit /b 4
-if not exist "%OLLAMA_MODELS%\manifests-v2\ollama.com\library" exit /b 2
-
-rem Do not launch a second tray instance or server when the API is ready.
-curl.exe --silent --fail --max-time 2 http://127.0.0.1:11434/api/version >nul 2>&1
-if not errorlevel 1 exit /b 0
-
-rem Ollama's Windows app starts and supervises ollama.exe serve itself.
-start "" /D "%OLLAMA_HOME%" "%OLLAMA_HOME%\ollama app.exe" --hide --fast-startup
-set /a WAITED=0
 :wait_for_server
-curl.exe --silent --fail --max-time 2 http://127.0.0.1:11434/api/version >nul 2>&1
+rem This also runs with stdin connected to NUL when started by the translator.
+rem Use a wall-clock deadline and a timer independent of any console input.
+powershell.exe -NoLogo -NoProfile -NonInteractive -Command ^
+  "$timer = [Diagnostics.Stopwatch]::StartNew();" ^
+  "do {" ^
+  "  try { if ((Invoke-RestMethod -Uri $env:RPY_OLLAMA_API -TimeoutSec 2 -ErrorAction Stop).version) { exit 0 } } catch {};" ^
+  "  Start-Sleep -Milliseconds 500;" ^
+  "} while ($timer.Elapsed.TotalSeconds -lt 60); exit 3"
 if not errorlevel 1 exit /b 0
-set /a WAITED+=1
-if %WAITED% GEQ 60 goto server_failed
-timeout /t 1 /nobreak >nul
-goto wait_for_server
-
-:server_failed
-echo Ollama app did not make the API ready at 127.0.0.1:11434 within 60 seconds.
-echo Check %LOCALAPPDATA%\Ollama\app.log for startup details.
-pause
+echo Ollama did not make its local API ready within 60 seconds. Check the Ollama app log. 1>&2
 exit /b 3

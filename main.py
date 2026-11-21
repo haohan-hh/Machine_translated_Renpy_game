@@ -7,9 +7,9 @@ Ren'Py 游戏自动汉化工具 - 主入口
     python main.py --cli <游戏目录> [选项]    # 命令行模式
 
 CLI 选项:
-    --api-url   翻译服务地址（默认 https://api.openai.com/v1）
+    --api-url   翻译服务地址（默认使用已保存的设置）
     --api-key   API Key
-    --model     模型名（默认 gpt-4o-mini）
+    --model     模型名（未配置时使用本地 Qwen3）
     --lang      目标语言标识（默认 schinese）
     --keep-terms  额外保留原文的专有名词（人名等），逗号分隔
     --no-font-patch  跳过自动配置中文字体
@@ -27,16 +27,18 @@ def main(argv=None) -> int:
         prog="rpytranslator",
         description="Ren'Py 游戏自动汉化工具：识别文本 → AI 翻译 → 生成汉化文件",
     )
-    parser.add_argument("--gui", action="store_true", help="启动图形界面")
-    parser.add_argument("--cli", metavar="游戏目录", nargs="?",
-                        const=None, help="命令行模式，指定游戏目录")
-    parser.add_argument("--api-url", default="https://api.openai.com/v1",
+    from rpytranslator import __version__
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--gui", action="store_true", help="启动图形界面")
+    mode.add_argument("--cli", metavar="游戏目录", help="命令行模式，指定游戏目录")
+    parser.add_argument("--api-url",
                         help="翻译 API 地址（OpenAI 兼容）")
-    parser.add_argument("--api-key", default="", help="API Key")
-    parser.add_argument("--model", default="gpt-4o-mini", help="模型名")
-    parser.add_argument("--lang", default="schinese",
+    parser.add_argument("--api-key", help="API Key")
+    parser.add_argument("--model", help="模型名")
+    parser.add_argument("--lang",
                         help="目标语言（schinese / tchinese / zh_cn …）")
-    parser.add_argument("--keep-terms", default="",
+    parser.add_argument("--keep-terms",
                         help="额外保留原文的专有名词（人名等），逗号分隔")
     parser.add_argument("--no-font-patch", action="store_true",
                         help="跳过自动配置中文字体")
@@ -70,17 +72,22 @@ def _launch_cli(args) -> int:
     from pathlib import Path
 
     from rpytranslator.pipeline import run_pipeline
-    from rpytranslator.translator import TranslationConfig
+    from rpytranslator.settings import config_path, load_settings, model_config, split_terms
 
     game = Path(args.cli).expanduser().resolve()
     if not game.exists():
         print(f"错误: 路径不存在 - {game}")
         return 1
 
-    cfg = TranslationConfig(
-        base_url=args.api_url, api_key=args.api_key, model=args.model)
+    try:
+        saved = load_settings(config_path())
+        cfg = model_config(saved, url=args.api_url, key=args.api_key, model=args.model)
+    except (ValueError, OSError) as exc:
+        print(f"配置错误: {exc}")
+        return 1
+    lang = args.lang or (saved.get("lang") or "schinese").split("（")[0].split("(")[0].strip()
     print(f"游戏目录: {game}")
-    print(f"API: {args.api_url} | 模型: {args.model} | 语言: {args.lang}")
+    print(f"API: {cfg.base_url} | 模型: {cfg.model} | 语言: {lang}")
 
     def _progress(m: str) -> None:
         if m.startswith("PROGRESS|"):
@@ -90,16 +97,13 @@ def _launch_cli(args) -> int:
         else:
             print("  ", m)
 
-    extra_terms = [
-        t.strip() for t in args.keep_terms.replace("，", ",").split(",")
-        if t.strip()
-    ]
-    result = run_pipeline(game, config=cfg, language=args.lang,
+    terms = args.keep_terms if args.keep_terms is not None else saved.get("keep_terms", "")
+    result = run_pipeline(game, config=cfg, language=lang,
                           progress_cb=_progress,
-                          apply_font_patch=not args.no_font_patch,
-                          apply_language_ui=not args.no_lang_ui,
+                          apply_font_patch=not args.no_font_patch and saved.get("font", True),
+                          apply_language_ui=not args.no_lang_ui and saved.get("lang_ui", True),
                           apply_verification=not args.no_verify,
-                          extra_terms=extra_terms or None)
+                          extra_terms=split_terms(terms))
     print("\n" + "=" * 50)
     print(result.message)
     if not result.ok:

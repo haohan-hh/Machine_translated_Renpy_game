@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 import queue
-import sys
 import threading
 import time
 from pathlib import Path
@@ -35,9 +34,9 @@ from . import __version__ as PKG_VERSION
 from . import engine
 from .connection import (
     endpoint_parts,
-    ensure_ollama_service,
     is_local_endpoint,
-    wait_for_model_registration,
+    ollama_gpu_status,
+    prepare_local_model,
     wait_for_tcp,
 )
 from .gui_state import (
@@ -45,6 +44,10 @@ from .gui_state import (
     should_follow_log,
 )
 from .pipeline import run_pipeline
+from .storage import write_text_atomic
+from .settings import (
+    DEFAULT_MODEL, DEFAULT_SERVICE, DEFAULT_URL, config_path, load_settings, split_terms,
+)
 from .translator import (
     TranslationClient,
     TranslationConfig,
@@ -69,7 +72,7 @@ PRESETS: dict[str, tuple[str, str]] = {
     "智谱 GLM": ("https://open.bigmodel.cn/api/paas/v4", "glm-4-flash"),
     # Keep the explicit tag so a fresh Ollama process resolves the model
     # deterministically after the model store is moved to another drive.
-    "Ollama 本地": ("http://localhost:11434/v1", "qwen3-8b-q4_k_m:latest"),
+    DEFAULT_SERVICE: (DEFAULT_URL, DEFAULT_MODEL),
     "自定": ("", ""),
 }
 SERVICES = list(PRESETS)
@@ -85,22 +88,12 @@ LANGUAGES = [
 # In a frozen one-file build ``__file__`` points inside PyInstaller's
 # temporary extraction directory. Keep the user configuration beside the
 # launcher so it survives extraction cleanup and can travel with the app.
-if getattr(sys, "frozen", False):
-    _CONFIG_PATH = Path(sys.executable).resolve().with_name(
-        "rpytranslator_config.json"
-    )
-else:
-    _CONFIG_PATH = (Path(__file__).resolve().parent.parent
-                    / "config" / "rpytranslator_config.json")
+_CONFIG_PATH = config_path()
 
 
 def _write_config(data: dict) -> None:
     """同目录原子替换，避免意外退出时把已有配置截断。"""
-    _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    pending = _CONFIG_PATH.with_name(_CONFIG_PATH.name + ".tmp")
-    pending.write_text(json.dumps(data, ensure_ascii=False, indent=2),
-                       encoding="utf-8")
-    pending.replace(_CONFIG_PATH)
+    write_text_atomic(_CONFIG_PATH, json.dumps(data, ensure_ascii=False, indent=2))
 
 # 日志配色（Windows.UI.Color: A, R, G, B）
 _COLOR_DEFAULT = Color(255, 232, 240, 247)
@@ -450,22 +443,19 @@ class GuiApp(XamlApplication):
     def _load_settings(self) -> None:
         data: dict = {}
         try:
-            if _CONFIG_PATH.exists():
-                data = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-        if not isinstance(data, dict):
-            data = {}
+            data = load_settings(_CONFIG_PATH)
+        except (OSError, ValueError) as exc:
+            self._append_log(f"无法读取设置文件 {_CONFIG_PATH}：{exc}", "err")
         self._loading_settings = True
         try:
-            self.ApiUrlBox.Text = data.get("url", PRESETS[SERVICES[0]][0])
+            self.ApiUrlBox.Text = data.get("url", DEFAULT_URL)
             self.ApiKeyBox.Password = data.get("key", "")
-            self.ModelBox.Text = data.get("model", PRESETS[SERVICES[0]][1])
+            self.ModelBox.Text = data.get("model", DEFAULT_MODEL)
             try:
-                si = SERVICES.index(data.get("service", SERVICES[0]))
+                si = SERVICES.index(data.get("service", DEFAULT_SERVICE))
                 self.ServiceBox.SelectedIndex = si
             except Exception:
-                self.ServiceBox.SelectedIndex = 0
+                self.ServiceBox.SelectedIndex = SERVICES.index("自定")
             try:
                 li = LANGUAGES.index(data.get("lang", LANGUAGES[0]))
                 self.LangBox.SelectedIndex = li
@@ -529,10 +519,7 @@ class GuiApp(XamlApplication):
         """保存任务身份；即使进度缓存尚未产生，重启后也能提示手动继续。"""
         self._pending_task = task
         try:
-            data = (json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
-                    if _CONFIG_PATH.exists() else {})
-            if not isinstance(data, dict):
-                data = {}
+            data = load_settings(_CONFIG_PATH)
             if task is None:
                 data.pop("pending_task", None)
             else:
@@ -544,10 +531,7 @@ class GuiApp(XamlApplication):
     def _remember_game_path(self, path: str) -> None:
         """仅更新最近的游戏目录，不把尚未保存的 API 表单一起落盘。"""
         try:
-            data = (json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
-                    if _CONFIG_PATH.exists() else {})
-            if not isinstance(data, dict):
-                data = {}
+            data = load_settings(_CONFIG_PATH)
             data["game_path"] = path
             _write_config(data)
         except (OSError, ValueError) as exc:
@@ -760,6 +744,8 @@ class GuiApp(XamlApplication):
             return
         url, model = PRESETS[SERVICES[idx]]
         if url:
+            if url.rstrip("/") != self.ApiUrlBox.Text.strip().rstrip("/"):
+                self.ApiKeyBox.Password = ""
             self.ApiUrlBox.Text = url
         if model:
             self.ModelBox.Text = model
@@ -786,12 +772,17 @@ class GuiApp(XamlApplication):
         self.OnStart(sender, e)
 
     def OnOpenOutput(self, sender, e) -> None:
-        if self.game_dir:
-            out = os.path.join(self.game_dir, "汉化补丁")
-            try:
-                os.startfile(out)  # type: ignore[attr-defined]
-            except OSError:
-                os.startfile(self.game_dir)  # type: ignore[attr-defined]
+        if not self.game_dir:
+            return
+        lang = LANGUAGES[self.LangBox.SelectedIndex].split("（")[0]
+        game = engine._find_game_dir(Path(self.game_dir))
+        if game is None or not (game / "tl" / lang).is_dir():
+            self._append_log(f"尚未生成 {lang} 的翻译目录", "info")
+            return
+        try:
+            os.startfile(game / "tl" / lang)  # type: ignore[attr-defined]
+        except OSError as exc:
+            self._append_log(f"打开翻译目录失败：{exc}", "err")
 
     # -- 事件：开始汉化 -----------------------------------------------------
 
@@ -818,10 +809,7 @@ class GuiApp(XamlApplication):
         font = self.FontSwitch.IsOn
         lang_ui = self.LangUiSwitch.IsOn
         game_dir = self.game_dir
-        keep_terms = [
-            t.strip() for t in self.KeepTermsBox.Text.replace("，", ",").split(",")
-            if t.strip()
-        ]
+        keep_terms = split_terms(self.KeepTermsBox.Text)
 
         config = TranslationConfig(
             base_url=url,
@@ -890,15 +878,11 @@ class GuiApp(XamlApplication):
         try:
             _scheme, host, port = endpoint_parts(config.base_url)
 
-            # The tray UI may be open while its API child is absent (common
-            # after moving OLLAMA_MODELS to another drive). Start the managed
-            # local service here so users do not have to run the CMD wrapper.
-            if is_local_endpoint(config.base_url) and port == 11434:
-                self.msg_q.put("正在检查 Ollama 服务；未启动时会自动启动…")
-                ready, detail = ensure_ollama_service(config.base_url)
-                if not ready:
-                    self.msg_q.put("TEST_ERR|%s" % detail)
-                    return
+            ready, detail = prepare_local_model(config.base_url, config.model,
+                                                api_key=config.api_key, log=self.msg_q.put)
+            if not ready:
+                self.msg_q.put("TEST_ERR|%s" % detail)
+                return
 
             # DNS 解析本身没有可移植的超时参数，放到守护线程中并由
             # join(15s) 兜底，避免某个坏 DNS 服务器冻结 GUI worker。
@@ -935,20 +919,9 @@ class GuiApp(XamlApplication):
                     % (host, port, last_err, tcp_error_hint(last_err, host)))
                 return
 
-            # 3) Ollama 在 HTTP 监听后还可能尚未注册模型。先轮询模型清单，
-            #    再发 chat，避免把启动竞态误报成“模型不存在”。
-            if is_local_endpoint(config.base_url):
-                self.msg_q.put("服务已启动，正在等待模型注册…")
-                registered, detail = wait_for_model_registration(
-                    config.base_url, config.model, timeout=120.0,
-                    poll_interval=1.0, api_key=config.api_key)
-                if not registered:
-                    self.msg_q.put("TEST_ERR|%s" % detail)
-                    return
-
-            # 4) HTTP 请求（含鉴权，验证地址 / Key / 模型）。本地模型首次
-            #    加载权重可能耗时 10~60 秒，故请求超时放宽到 120 秒。
-            self.msg_q.put("TCP 已连通，正在发送测试请求（本地模型首次加载可能较慢）…")
+            # Check chat authorization and an actual model response after the
+            # separate local model load has completed.
+            self.msg_q.put("TCP 已连通，正在等候所选模型的测试答复…")
             test_cfg = TranslationConfig(
                 base_url=config.base_url,
                 api_key=config.api_key,
@@ -957,7 +930,7 @@ class GuiApp(XamlApplication):
                 max_retries=1,
             )
             client = TranslationClient(test_cfg)
-            t0 = time.time()
+            t0 = time.monotonic()
             resp = ""
             for attempt in range(4):
                 try:
@@ -982,8 +955,11 @@ class GuiApp(XamlApplication):
                     self.msg_q.put(
                         "模型正在注册或首次加载，%d 秒后自动重试…" % wait_s)
                     time.sleep(wait_s)
-            elapsed = int((time.time() - t0) * 1000)
+            elapsed = int((time.monotonic() - t0) * 1000)
             snippet = (resp or "")[:60]
+            gpu = ollama_gpu_status(config.base_url, config.model, api_key=config.api_key)
+            if gpu:
+                self.msg_q.put(gpu)
             self.msg_q.put("TEST_OK|连接成功（%d ms）：%s" % (elapsed, snippet))
         except Exception as exc:
             self.msg_q.put("TEST_ERR|%s" % exc)
@@ -1006,7 +982,7 @@ class GuiApp(XamlApplication):
         self._progress_before_aux = (float(self.Progress.Value), self.ProgressText.Text)
         self.worker = threading.Thread(
             target=self._run_audit,
-            args=(game_dir, lang),
+            args=(game_dir, lang, split_terms(self.KeepTermsBox.Text)),
             daemon=True,
         )
         self.worker.start()
@@ -1017,11 +993,11 @@ class GuiApp(XamlApplication):
         self.StatusText.Text = "补漏查缺扫描中…"
         self._append_log("补漏查缺：正在扫描 tl/%s 下的翻译文件…" % lang, "info")
 
-    def _run_audit(self, game_dir: str, lang: str) -> None:
+    def _run_audit(self, game_dir: str, lang: str, names: list[str]) -> None:
         """后台线程：跑 audit.run_audit，日志经 msg_q 回 UI 线程。"""
         try:
             from rpytranslator.audit import run_audit
-            run_audit(game_dir, lang, log=lambda t: self.msg_q.put(t))
+            run_audit(game_dir, lang, log=self.msg_q.put, protected_terms=names)
         except Exception as exc:  # noqa: BLE001
             import traceback
             self.msg_q.put("ERR|补漏查缺失败: %s" % exc)
@@ -1044,13 +1020,6 @@ class GuiApp(XamlApplication):
         pause_event=None,
     ) -> None:
         try:
-            _scheme, _host, port = endpoint_parts(config.base_url)
-            if is_local_endpoint(config.base_url) and port == 11434:
-                self.msg_q.put("正在检查 Ollama 服务；未启动时会自动启动…")
-                ready, detail = ensure_ollama_service(config.base_url)
-                if not ready:
-                    self.msg_q.put("RESULT_ERR|%s" % detail)
-                    return
             result = run_pipeline(
                 game_path=game_dir or "",
                 config=config,

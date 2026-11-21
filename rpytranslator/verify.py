@@ -14,7 +14,7 @@
 
 本模块提供闭环验证：
 1. ``write_verification_patch()`` —— 汉化完成后向游戏注入
-   ``game/zz_verify_translations.rpy``（init 2000，可安全删除）。
+   ``game/zz_verify_translations.rpy``（init 999，可安全删除）。
    游戏启动时由 Ren'Py 读取自身的对话翻译注册表
    ``renpy.game.script.translator.default_translates``（全部对话，
    实测为 dict[identifier -> TranslateSay/Translate]）与
@@ -31,27 +31,29 @@
   「噪音」条目不会被误当作漏译（``is_noise_text``）。
 - 多行（NVL）文本补译时只翻译去空前导空行的正文，保留原换行结构，
   显著提高 AI 保留 ``\\n`` 的成功率（此前整段翻译极易丢失占位符）。
-- ``Translate`` 类型实测（Ren'Py 8.2）其块内至多包含一个 ``Say``（block 为
-  ``[UserStatement, Say]`` 或仅 ``[UserStatement]``），无 Say 即无文字（噪音），
-  含 Say 的可与 ``TranslateSay`` 同样安全自动补译；若极端环境出现多 Say 块
-  则跳过并提示，避免生成结构不符的块导致 Ren'Py 编译失败（整份翻译失效）。
+- 带有 voice 等其他语句或多句 Say 的 ``Translate`` 保留给人工处理。
+  把这类翻译单元改成孤立的一句对话会丢失游戏行为。
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .extract import decode_say_string, encode_say_string
-from .patcher import PatchResult
+from .extract import encode_say_string
+from .patcher import PatchResult, monitored_settings_screens
+from .tl_files import (TranslationMergeError, editable_output_path, index_tl_directory,
+                       unambiguous_translations, write_if_unchanged)
+from .translator import (PauseRequested, TranslationError, target_language_name,
+                         unprotected_text, valid_unchanged_text)
 
 # 运行时验证补丁文件名（game 根目录；zz_ 前缀是工具自动生成的约定，
 # engine 扫描 / 更新脚本时会跳过）
 RUNTIME_PATCH_NAME = "zz_verify_translations.rpy"
 # Language-switch probe files are separate from the dialogue-missing checker.
-# The probe uses Ren'Py's public change_language/translate_string APIs and
-# writes a report after the game starts, without changing game content.
+# The probe observes the screen action and checks the active translation.
 LANGUAGE_SWITCH_PATCH_NAME = "zz_language_switch_check.rpy"
 LANGUAGE_SWITCH_PROBE_FILE_NAME = "zz_language_switch_probe.rpy"
 LANGUAGE_SWITCH_REPORT_TEMPLATE = "{lang}.语言切换验证报告.txt"
@@ -69,9 +71,6 @@ _TITLE_ROWS = 3  # 前 3 行为统计标题
 # Ren'Py 文本标签 {…} / 插值 […]（与 translator 一致）
 _TAG_RE = re.compile(r"\{[^{}]*\}")
 _INSERT_RE = re.compile(r"\[[^\[\]]*\]")
-
-_TL_BLOCK_RE = re.compile(r"translate\s+(\S+)\s+([^\s:]+):\s*$")
-
 
 # ---------------------------------------------------------------------------
 # 无实际文字的“噪音”判定
@@ -116,7 +115,7 @@ init 999 python:
     _vv_lang = '__LANG__'
     _vv_path = _vv_os.path.join(config.gamedir, 'tl',
                                 _vv_lang + '.运行时缺失报告.txt')
-    try:
+    def _vv_write_report():
         # 兼容两种注册表位置（8.x: script.translator；7.x: script.translations）
         _vv_tr = None
         _vv_script = renpy.game.script
@@ -129,9 +128,9 @@ init 999 python:
         _vv_def = getattr(_vv_tr, 'default_translates', None)
         if _vv_def is None:
             raise Exception('no default_translates')
-        _vv_lng = getattr(_vv_tr, 'language_translates', {})
+        _vv_lng = getattr(_vv_tr, 'language_translates', None)
         if not hasattr(_vv_lng, '__contains__'):
-            _vv_lng = {}
+            raise ValueError('no language_translates registry')
         _vv_rows = []
         _vv_miss = 0
         for _vv_code in _vv_def:
@@ -140,14 +139,27 @@ init 999 python:
             _vv_node = _vv_def[_vv_code]
             _vv_who = getattr(_vv_node, 'who', None)
             _vv_what = getattr(_vv_node, 'what', '')
-            if _vv_who is None:
+            _vv_kind = type(_vv_node).__name__
+            if _vv_kind == 'Translate':
                 _vv_blk = getattr(_vv_node, 'block', None)
                 if _vv_blk:
-                    for _vv_e in _vv_blk:
-                        if type(_vv_e).__name__ == 'Say':
-                            _vv_who = getattr(_vv_e, 'who', None)
-                            _vv_what = getattr(_vv_e, 'what', '')
-                            break
+                    _vv_says = [_vv_e for _vv_e in _vv_blk if type(_vv_e).__name__ == 'Say']
+                    if _vv_says:
+                        _vv_who = getattr(_vv_says[0], 'who', None)
+                        _vv_what = getattr(_vv_says[0], 'what', '')
+                        # Preserve any other executable statements (e.g. voice).
+                        _vv_kind = ('TranslateSay' if len(_vv_blk) == 1
+                                    else 'TranslateComplex')
+                        _vv_node_say = _vv_says[0]
+            else:
+                _vv_node_say = _vv_node
+            if _vv_kind == 'TranslateSay' and (
+                    getattr(_vv_node_say, 'attributes', None) or
+                    getattr(_vv_node_say, 'temporary_attributes', None) or
+                    getattr(_vv_node_say, 'with_', None) or
+                    getattr(_vv_node_say, 'arguments', None) or
+                    not getattr(_vv_node_say, 'interact', True)):
+                _vv_kind = 'TranslateComplex'
             if _vv_what is None:
                 _vv_what = ''
             _vv_what2 = str(_vv_what).replace('\n', '\\n').replace('\t', ' ')
@@ -156,7 +168,7 @@ init 999 python:
             _vv_ln = getattr(_vv_node, 'linenumber', 0) or 0
             _vv_rows.append('%s:%s\t%s\t%s\t%s\t%s' % (
                 _vv_fn, _vv_ln, _vv_who2, _vv_what2, _vv_code,
-                type(_vv_node).__name__))
+                _vv_kind))
             _vv_miss += 1
         _vv_dir = _vv_os.path.dirname(_vv_path)
         if not _vv_os.path.isdir(_vv_dir):
@@ -167,8 +179,22 @@ init 999 python:
             _vv_f.write('---- missing list (file:line [who] what id type) ----\n')
             if _vv_rows:
                 _vv_f.write('\n'.join(_vv_rows))
-    except Exception:
-        pass
+
+    def _vv_check_loaded_language():
+        try:
+            _vv_write_report()
+        except Exception as _vv_exc:
+            renpy.log('Runtime translation report could not be written: %r' % (_vv_exc,))
+
+    if getattr(config, 'defer_tl_scripts', False):
+        # At init the target table may still be empty. This callback runs
+        # after Ren'Py loads the selected language's scripts.
+        def _vv_after_language_change():
+            if _preferences.language == _vv_lang:
+                _vv_check_loaded_language()
+        config.change_language_callbacks.append(_vv_after_language_change)
+    else:
+        _vv_check_loaded_language()
 '''
 
 
@@ -218,16 +244,17 @@ _LANGUAGE_SWITCH_PATCH = r'''# -*- coding: utf-8 -*-
 init 999 python:
     import io as _ls_io
     import os as _ls_os
+    import hashlib as _ls_hash
     _ls_lang = __LANG_REPR__
     _ls_probe = __PROBE_REPR__
+    _ls_expected = __TRANSLATION_REPR__
     _ls_screen_names = __SCREEN_NAMES__
     _ls_path = _ls_os.path.join(
         config.gamedir, 'tl', _ls_lang + '.语言切换验证报告.txt')
     _ls_ui_path = _ls_os.path.join(config.gamedir, 'zz_language_ui.rpy')
     _ls_ui_signature = __UI_SIGNATURE__
-    _ls_state = {'language': '__rpytranslator_unset__', 'last_report': None,
-                 'passed': False, 'ui_action': None, 'known_languages': None,
-                 'requested': None, 'selection_ticks': 0}
+    _ls_state = {'last_report': None, 'ui_action': None, 'known_languages': None,
+                 'request_id': None, 'selection_ticks': 0, 'finished': None}
 
     def _ls_current_language():
         try:
@@ -257,7 +284,7 @@ init 999 python:
                     continue
         try:
             _ls_tl = _ls_os.path.join(config.gamedir, 'tl')
-            if _ls_os.path.isdir(_ls_tl):
+            if not _ls_api and _ls_os.path.isdir(_ls_tl):
                 for _ls_name in _ls_os.listdir(_ls_tl):
                     _ls_path_candidate = _ls_os.path.join(_ls_tl, _ls_name)
                     if _ls_os.path.isdir(_ls_path_candidate):
@@ -271,13 +298,14 @@ init 999 python:
             _ls_name = str(_ls_value)
             if _ls_name and _ls_name.lower() != 'none' and _ls_name not in _ls_unique:
                 _ls_unique.append(_ls_name)
-        _ls_result = (_ls_unique, (_ls_api or bool(_ls_unique)))
-        _ls_state['known_languages'] = _ls_result
+        _ls_result = (sorted(_ls_unique), (_ls_api or bool(_ls_unique)))
+        if _ls_lang in _ls_unique:
+            _ls_state['known_languages'] = _ls_result
         return _ls_result
 
     def _ls_write(_ls_status, _ls_before, _ls_after, _ls_translated,
                   _ls_active_translated, _ls_known, _ls_visible_screens,
-                  _ls_ui_action, _ls_requested, _ls_error=''):
+                  _ls_ui_action, _ls_requested, _ls_request_screen, _ls_error=''):
         try:
             _ls_dir = _ls_os.path.dirname(_ls_path)
             if not _ls_os.path.isdir(_ls_dir):
@@ -297,6 +325,7 @@ init 999 python:
                             (_ls_visible_screens,))
                 _ls_f.write('ui_language_action_present: %r\n' % (_ls_ui_action,))
                 _ls_f.write('button_requested_language: %r\n' % (_ls_requested,))
+                _ls_f.write('button_screen: %r\n' % (_ls_request_screen,))
                 _ls_f.write('ui_click_simulated: False\n')
                 _ls_f.write('ui_signature: %s\n' % _ls_ui_signature)
                 _ls_f.write('check_scope: records a requested UI language and verifies the active preference and probe translation\n')
@@ -312,24 +341,13 @@ init 999 python:
             return False
 
     def _ls_observe_language_switch():
-        if _ls_state['passed']:
-            return
         _ls_current = _ls_current_language()
-        _ls_previous = _ls_state['language']
         try:
-            _ls_requested = _rpytranslator_requested_language
-        except Exception:
-            _ls_requested = None
-        _ls_previous_requested = _ls_state['requested']
-        if (_ls_previous != '__rpytranslator_unset__' and
-                _ls_previous == _ls_current and
-                _ls_previous_requested == _ls_requested and
-                not (_ls_requested == _ls_lang and _ls_current != _ls_lang) and
-                _ls_state['last_report'] is not None and
-                _ls_state['last_report'][0] in ('READY', 'PASS')):
-            return
-        _ls_state['language'] = _ls_current
-        _ls_state['requested'] = _ls_requested
+            _ls_id, _ls_screen, _ls_before, _ls_requested = _rpytranslator_language_request
+        except (NameError, ValueError, TypeError):
+            _ls_id, _ls_screen, _ls_before, _ls_requested = 0, None, None, None
+        if _ls_id != _ls_state['request_id']:
+            _ls_state.update(request_id=_ls_id, selection_ticks=0, finished=None)
         _ls_translated = None
         _ls_active_translated = None
         _ls_known, _ls_known_api = _ls_known_languages()
@@ -339,18 +357,16 @@ init 999 python:
         try:
             for _ls_name in _ls_screen_names:
                 try:
-                    if renpy.get_screen(_ls_name):
+                    _ls_visible = renpy.get_screen(_ls_name)
+                    if _ls_visible and getattr(_ls_visible, 'name', _ls_name) == _ls_name:
                         _ls_visible_screens.append(_ls_name)
                 except Exception:
                     pass
             if _ls_ui_action is None:
                 try:
-                    with _ls_io.open(_ls_ui_path, 'r', encoding='utf-8-sig') as _ls_ui_f:
-                        _ls_ui_source = _ls_ui_f.read()
-                    _ls_ui_action = (
-                        'Language(_lang_ui_i)' in _ls_ui_source and
-                        'Function(_lang_ui_note_selection, _lang_ui_i)' in _ls_ui_source and
-                        'Function(_ls_observe_language_switch)' in _ls_ui_source)
+                    with _ls_io.open(_ls_ui_path, 'rb') as _ls_ui_f:
+                        _ls_ui_action = (_ls_hash.sha256(_ls_ui_f.read()).hexdigest()[:16]
+                                         == _ls_ui_signature)
                 except Exception:
                     _ls_ui_action = False
                 _ls_state['ui_action'] = _ls_ui_action
@@ -360,16 +376,15 @@ init 999 python:
                 _ls_error = 'known_languages API unavailable'
             elif _ls_lang not in _ls_known:
                 _ls_error = 'target language is not registered'
-            else:
+            elif _ls_current == _ls_lang or not getattr(config, 'defer_tl_scripts', False):
                 # The synthetic strings entry checks that Ren'Py loaded a
-                # real translation in the same language selected by the UI.
+                # real translation. Deferred scripts only load on selection.
                 _ls_translated = renpy.translate_string(
                     _ls_probe, language=_ls_lang)
                 if _ls_current == _ls_lang:
                     _ls_active_translated = renpy.translate_string(_ls_probe)
-                if (_ls_translated is None or
-                        _ls_translated == _ls_probe):
-                    _ls_error = 'probe translation is unavailable'
+                if _ls_translated != _ls_expected:
+                    _ls_error = 'target probe does not match the installed translation'
                 elif (_ls_current == _ls_lang and
                       _ls_active_translated != _ls_translated):
                     _ls_error = 'active language does not return the target translation'
@@ -377,32 +392,42 @@ init 999 python:
             _ls_error = repr(_ls_exc)
         if _ls_error:
             _ls_status = 'ERROR' if 'API unavailable' in _ls_error else 'FAIL'
-        elif _ls_state['passed']:
-            _ls_status = 'PASS'
-        elif (_ls_current == _ls_lang and
-              _ls_requested == _ls_lang and
-              _ls_previous != '__rpytranslator_unset__' and
-              _ls_previous != _ls_lang):
-            _ls_status = 'PASS'
-        elif _ls_requested == _ls_lang and _ls_current != _ls_lang:
-            _ls_state['selection_ticks'] += 1
-            if _ls_state['selection_ticks'] >= 4:
+        elif (_ls_requested == _ls_lang and _ls_screen in _ls_visible_screens
+                and _ls_before != _ls_lang):
+            if _ls_state['finished'] == 'FAIL':
                 _ls_status = 'FAIL'
                 _ls_error = 'language button selection did not activate the target language'
-            else:
+            elif _ls_state['finished'] == 'expired':
                 _ls_status = 'READY'
+            elif _ls_current == _ls_lang:
+                _ls_status = 'PASS'
+                _ls_state['finished'] = 'PASS'
+            elif _ls_state['finished'] == 'PASS':
+                _ls_state['finished'] = 'expired'
+                _ls_status = 'READY'
+            else:
+                _ls_state['selection_ticks'] += 1
+                if _ls_state['selection_ticks'] >= 4:
+                    _ls_status = _ls_state['finished'] = 'FAIL'
+                    _ls_error = 'language button selection did not activate the target language'
+                else:
+                    _ls_status = 'READY'
         else:
-            _ls_state['selection_ticks'] = 0
+            if _ls_screen and _ls_screen not in _ls_visible_screens:
+                _ls_state['finished'] = 'expired'
             _ls_status = 'READY'
-        _ls_report_key = (_ls_status, _ls_current, _ls_error)
+        _ls_report_key = (_ls_status, _ls_id, _ls_current, _ls_visible_screens,
+                          _ls_translated, _ls_active_translated, _ls_error)
         if _ls_report_key == _ls_state['last_report']:
             return
-        if _ls_write(_ls_status, _ls_previous, _ls_current, _ls_translated,
+        if _ls_write(_ls_status, _ls_before, _ls_current, _ls_translated,
                      _ls_active_translated, _ls_known, _ls_visible_screens,
-                     _ls_ui_action, _ls_requested, _ls_error):
+                     _ls_ui_action, _ls_requested, _ls_screen, _ls_error):
             _ls_state['last_report'] = _ls_report_key
-            if _ls_status == 'PASS':
-                _ls_state['passed'] = True
+
+    # Supersede the prior session even if the user never opens settings.
+    _ls_write('WAITING', None, _ls_current_language(), None, None,
+              [], [], False, None, None)
 '''
 
 
@@ -411,8 +436,17 @@ def language_switch_report_path(game_dir: Path, language: str) -> Path:
     return game_dir / "tl" / LANGUAGE_SWITCH_REPORT_TEMPLATE.format(lang=language)
 
 
-def read_language_switch_report(path: Path) -> dict[str, str]:
-    """Read the last language-switch probe result without trusting its values."""
+def _ui_signature(ui_patch: Path) -> str:
+    try:
+        return hashlib.sha256(ui_patch.read_bytes()).hexdigest()[:16]
+    except OSError:
+        return "missing"
+
+
+def read_language_switch_report(path: Path, language: str | None = None,
+                                ui_signature: str | None = None,
+                                screen_names: list[str] | None = None) -> dict[str, str]:
+    """Read a report, rejecting mismatched installations and incomplete PASS rows."""
     result: dict[str, str] = {}
     try:
         for line in Path(path).read_text(
@@ -422,6 +456,71 @@ def read_language_switch_report(path: Path) -> dict[str, str]:
                 result[key.strip()] = value.strip()
     except OSError:
         return {}
+    if ((language is not None and result.get("target_language") != language) or
+            (ui_signature is not None and result.get("ui_signature") != ui_signature)):
+        return {}
+    if result.get("status") == "PASS":
+        try:
+            target = result["target_language"]
+            before = ast.literal_eval(result["language_before"])
+            after = ast.literal_eval(result["language_after_switch"])
+            requested = ast.literal_eval(result["button_requested_language"])
+            screen = ast.literal_eval(result["button_screen"])
+            visible = ast.literal_eval(result["visible_settings_screens"])
+            translated = ast.literal_eval(result["probe_translation_target"])
+            active = ast.literal_eval(result["probe_translation_active"])
+            if not (before != target == after == requested and
+                    active == translated == LANGUAGE_SWITCH_PROBE_TRANSLATION and
+                    result["preferences_screen_visible"] == "True" and
+                    result["ui_language_action_present"] == "True" and
+                    isinstance(visible, list) and isinstance(screen, str) and
+                    screen in visible and (screen_names is None or screen in screen_names)):
+                return {}
+        except (ValueError, TypeError, KeyError, SyntaxError):
+            return {}
+    return result
+
+
+def install_language_switch_probe(game_dir: Path, language: str,
+                                  log_cb=None) -> PatchResult:
+    """Install a monitor only for settings screens that record real clicks."""
+    game_dir = Path(game_dir)
+    ui_patch = game_dir / "zz_language_ui.rpy"
+    try:
+        source = ui_patch.read_text(encoding="utf-8-sig") if ui_patch.is_file() else ""
+        screens = monitored_settings_screens(source)
+    except (OSError, UnicodeError) as exc:
+        return PatchResult(message=f"无法检查语言设置界面: {exc}")
+    if not screens:
+        result = PatchResult(ok=True, skip=True,
+                             message="未检测到工具生成的语言按钮，跳过其运行时验证")
+        try:
+            # When an update supplies native controls, an old monitor would
+            # keep replacing its historical result on every subsequent boot.
+            monitor = game_dir / LANGUAGE_SWITCH_PATCH_NAME
+            if monitor.is_file() and monitor.read_text(encoding="utf-8-sig").startswith(
+                    "# -*- coding: utf-8 -*-\n# 语言切换链路验证（汉化工具自动生成"):
+                monitor.with_suffix(".rpyc").unlink(missing_ok=True)
+                monitor.unlink()
+        except (OSError, UnicodeError) as exc:
+            return PatchResult(message=f"无法停用旧语言切换探针: {exc}")
+        if log_cb:
+            log_cb(result.message)
+        return result
+    result = write_language_switch_probe(game_dir, language, screens, log_cb)
+    if result.ok and log_cb:
+        report = read_language_switch_report(
+            language_switch_report_path(game_dir, language), language,
+            _ui_signature(ui_patch), screens)
+        status = report.get("status")
+        if status == "PASS":
+            log_cb("上次语言切换已通过验证")
+        elif status in {"FAIL", "ERROR"}:
+            log_cb(f"上次语言切换验证失败: {report.get('error', status)}")
+        elif status == "READY":
+            log_cb(f"已打开游戏设置，请从其他语言切换到 {language} 以验证切换结果")
+        else:
+            log_cb("等待在游戏设置中验证语言切换")
     return result
 
 
@@ -442,12 +541,8 @@ def write_language_switch_probe(game_dir: Path, language: str = "schinese",
         return res
     patch = game_dir / LANGUAGE_SWITCH_PATCH_NAME
     tl_dir = game_dir / "tl" / language
-    probe_file = tl_dir / LANGUAGE_SWITCH_PROBE_FILE_NAME
     ui_patch = game_dir / "zz_language_ui.rpy"
-    try:
-        ui_signature = hashlib.sha256(ui_patch.read_bytes()).hexdigest()[:16]
-    except OSError:
-        ui_signature = "missing"
+    ui_signature = _ui_signature(ui_patch)
     valid_screens = [name for name in (screen_names or ["preferences"])
                      if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(name))]
     if not valid_screens:
@@ -455,6 +550,7 @@ def write_language_switch_probe(game_dir: Path, language: str = "schinese",
     patch_text = (_LANGUAGE_SWITCH_PATCH
                   .replace("__LANG_REPR__", repr(language))
                   .replace("__PROBE_REPR__", repr(LANGUAGE_SWITCH_PROBE_TEXT))
+                  .replace("__TRANSLATION_REPR__", repr(LANGUAGE_SWITCH_PROBE_TRANSLATION))
                   .replace("__SCREEN_NAMES__", repr(valid_screens))
                   .replace("__UI_SIGNATURE__", repr(ui_signature)))
     probe_text = (
@@ -469,15 +565,24 @@ def write_language_switch_probe(game_dir: Path, language: str = "schinese",
         patch_changed = (not patch.is_file() or
                          patch.read_text(encoding="utf-8-sig", errors="ignore")
                          != patch_text)
-        probe_changed = (not probe_file.is_file() or
-                         probe_file.read_text(encoding="utf-8-sig",
-                                              errors="ignore") != probe_text)
+        docs = index_tl_directory(tl_dir, language)
+        owners = [(doc, entry) for doc in docs.values() for entry in doc.entries
+                  if entry.identifier is None and entry.original == LANGUAGE_SWITCH_PROBE_TEXT]
+        if len(owners) > 1:
+            return PatchResult(message="语言探针字符串已有多个定义，请检查目标语言的译文")
+        if owners and owners[0][1].translation != LANGUAGE_SWITCH_PROBE_TRANSLATION:
+            return PatchResult(message=f"语言探针字符串与已有译文冲突：{owners[0][0].path}")
+        probe_changed = not owners
+        if probe_changed:
+            probe_file = editable_output_path(tl_dir / LANGUAGE_SWITCH_PROBE_FILE_NAME, docs)
+            old = docs.get(probe_file)
+            if old:
+                probe_text = "".join(old.lines) + old.newline * 2 + probe_text.replace("\n", old.newline)
+            write_if_unchanged(probe_file, probe_text, old)
+            res.files.append(probe_file)
         if patch_changed:
             patch.write_text(patch_text, encoding="utf-8-sig")
             res.files.append(patch)
-        if probe_changed:
-            probe_file.write_text(probe_text, encoding="utf-8-sig")
-            res.files.append(probe_file)
         if patch_changed or probe_changed:
             # Do not report a result from an older version of the injected
             # check as though it validated the new files.
@@ -485,7 +590,7 @@ def write_language_switch_probe(game_dir: Path, language: str = "schinese",
                 language_switch_report_path(game_dir, language).unlink()
             except FileNotFoundError:
                 pass
-    except OSError as exc:
+    except (OSError, TranslationMergeError) as exc:
         res.ok = False
         res.message = f"写语言切换验证探针失败: {exc}"
         return res
@@ -495,7 +600,7 @@ def write_language_switch_probe(game_dir: Path, language: str = "schinese",
                    "已注入语言切换自动验证探针")
     res.detail = (f"在游戏设置中打开语言选项后检查 "
                   f"{language_switch_report_path(game_dir, language).name}；"
-                  "使用简体中文按钮后会自动记录 PASS/FAIL")
+                  f"从其他语言切换到 {language} 后会记录结果")
     if log_cb:
         log_cb("  " + ("- " if res.skip else "✓ ") + res.message)
         log_cb("    - " + res.detail)
@@ -521,17 +626,19 @@ class MissingItem:
         return self.node_type == "TranslateSay"
 
 
-def parse_runtime_report(path: Path) -> list[MissingItem]:
-    """解析运行时缺失报告。返回全部条目（含噪音，调用方自行过滤）。"""
-    try:
-        lines = path.read_text(encoding="utf-8-sig", errors="ignore").splitlines()
-    except OSError:
-        return []
+def parse_runtime_report(path: Path, language: str | None = None) -> list[MissingItem]:
+    """Parse the dialogue report and reject incomplete or misdirected snapshots."""
+    lines = path.read_text(encoding="utf-8-sig").splitlines()
+    header = re.fullmatch(r"missing (\w+) translation: (\d+)", lines[1]) if len(lines) >= _TITLE_ROWS else None
+    if (not header or not re.fullmatch(r"total dialogue ids: \d+", lines[0])
+            or not lines[2].startswith("---- missing list")
+            or (language is not None and header[1] != language)):
+        raise ValueError("报告标题或目标语言不匹配")
     items: list[MissingItem] = []
     for ln in lines[_TITLE_ROWS:]:
         parts = ln.split(_TAB)
-        if len(parts) < 5:
-            continue
+        if len(parts) < 5 or not re.fullmatch(r"\w+", parts[-2]):
+            raise ValueError("报告中存在不完整的对话记录")
         # 结构固定为: 文件:行 / [who] / what / id / 类型；正文里的制表符
         # 已被补丁替换为空格，仍可能残留极端情况，故取前后列、正文段合并。
         where, who = parts[0], parts[1]
@@ -539,7 +646,7 @@ def parse_runtime_report(path: Path) -> list[MissingItem]:
         what = _TAB.join(parts[2:-2])
         who = who.strip("[]")
         what = what.replace("\\n", "\n")
-        fname, _, line_s = where.partition(":")
+        fname, _, line_s = where.rpartition(":")
         try:
             line = int(line_s)
         except ValueError:
@@ -547,21 +654,14 @@ def parse_runtime_report(path: Path) -> list[MissingItem]:
         items.append(MissingItem(
             filename=fname, line=line, who=who, what=what,
             identifier=identifier, node_type=node_type.strip() or "TranslateSay"))
+    if len(items) != int(header[2]):
+        raise ValueError("缺失对话总数与报告行数不符")
     return items
 
 
 # ---------------------------------------------------------------------------
 # 已有译文反查（原文 → 译文）
 # ---------------------------------------------------------------------------
-
-def _decode_say(raw: str) -> str:
-    """还原 rpy 字符串：``\\\\n → 换行、\\\\" → "、\\\\ → 空格、\\\\\\\\ → \\``。
-
-    透传到 ``extract.decode_say_string``，对已有 tl 的解析保留统一行为
-    （含 @@pN@@p 编译位置标记剥离，避免与生成器产生的原文不一致）。
-    """
-    return decode_say_string(raw)
-
 
 def load_tl_dialogue_map(tl_lang_dir: Path, language: str) -> dict[str, str]:
     """加载 tl/<语言> 中全部对话翻译：{原文(去首尾空白): 译文}。
@@ -570,58 +670,20 @@ def load_tl_dialogue_map(tl_lang_dir: Path, language: str) -> dict[str, str]:
     与生成器输出格式一致，也兼容官方/手工格式。多行文本以还原后的
     真实换行存储。
     """
-    mapping: dict[str, str] = {}
-    if not tl_lang_dir.is_dir():
-        return mapping
-    for f in sorted(tl_lang_dir.rglob("*.rpy")):
-        try:
-            lines = f.read_text(encoding="utf-8-sig", errors="ignore").splitlines()
-        except OSError:
-            continue
-        i, n = 0, len(lines)
-        while i < n:
-            m = _TL_BLOCK_RE.match(lines[i].strip())
-            if not m or m.group(1) != language or m.group(2) == "strings":
-                i += 1
-                continue
-            i += 1
-            com: str | None = None
-            tl: str | None = None
-            while i < n:
-                s = lines[i].strip()
-                if not s:
-                    i += 1
-                    continue
-                if _TL_BLOCK_RE.match(s):
-                    break
-                q, rq = s.find('"'), s.rfind('"')
-                if q == -1 or rq <= q:
-                    i += 1
-                    continue
-                inner = s[q + 1:rq]
-                if s.startswith("#"):
-                    if com is None:
-                        com = _decode_say(inner)
-                else:
-                    tl = _decode_say(inner)
-                    i += 1
-                    break
-                i += 1
-            if com is not None and tl is not None and com.strip():
-                mapping[com.strip()] = tl
-    return mapping
+    return _reusable_dialogue(index_tl_directory(tl_lang_dir, language).values())
+
+
+def _reusable_dialogue(docs) -> dict[str, str]:
+    mapping = unambiguous_translations(
+        (entry.original.strip(), entry.translation.strip())
+        for doc in docs for entry in doc.entries
+        if entry.identifier and entry.original and entry.translation)
+    return {src: dst for src, dst in mapping.items() if dst and dst != src}
 
 
 # ---------------------------------------------------------------------------
 # 自动补译修复补丁
 # ---------------------------------------------------------------------------
-
-def _split_leading_ws(s: str) -> tuple[str, str]:
-    """把文本拆成「前导空白（含换行）+ 正文」。NVL 段常以 \\n 空行开头，
-    补译时只翻译正文，换行结构原样恢复，避免 AI 丢占位符。"""
-    m = re.match(r"^([\s]*)(.*)$", s, re.S)
-    return m.group(1), m.group(2)
-
 
 def build_missing_fix(
     game_dir: Path,
@@ -633,8 +695,8 @@ def build_missing_fix(
     """根据运行时缺失报告生成 tl/<语言>/zz_missing_fix.rpy。
 
     规则（实测经验固化，避免踩坏已生效翻译）：
-    - 空 / 符号 / 纯标签 / 纯换行段（is_noise_text）→ 跳过，无文字不补。
-    - TranslateSay / 含单个 Say 的 Translate → 优先复用现有 tl 译文；
+    - 单句只有人名、插值或符号时保留原文，也为其运行时标识注册对应条目。
+    - 简单单句对话 → 优先复用现有 tl 译文；
       无译文则 AI 翻译；多行文本先拆出前导空白再翻正文。
     - 无 Say 的 Translate 块（纯 UserStatement 段落）→ 无文字，跳过。
     幂等：已生成的 zz_missing_fix.rpy 会先被解析合并，重复运行不丢旧修复。
@@ -650,155 +712,109 @@ def build_missing_fix(
         return res
 
     tl_dir = game_dir / "tl" / language
-    items = parse_runtime_report(report)
-    if not items:
-        res.ok = True
-        res.skip = True
-        res.message = f"运行时缺失报告无条目：{report.name}"
-        return res
+    try:
+        items = parse_runtime_report(report, language)
+    except (OSError, ValueError) as exc:
+        return PatchResult(message=f"无法读取运行时缺失报告 {report.name}: {exc}")
+    if not items and not any(tl_dir.glob(Path(FIX_FILE_NAME).stem + "*.rpy")):
+        return PatchResult(ok=True, skip=True, message=f"运行时缺失报告无条目：{report.name}")
     if log_cb:
         log_cb(f"  - 运行时缺失报告：共 {len(items)} 条")
 
-    noise = 0
-    reuse = 0
-    need_ai = 0
-    failed = 0
-    # identifier -> (who, lead空白, src原文, 完整译文)
-    resolved: dict[str, tuple[str, str, str, str]] = {}
-
-    # 1. 读取旧修复补丁（幂等合并）
-    fix_file = tl_dir / FIX_FILE_NAME
-    if fix_file.is_file():
-        try:
-            _merge_old_fix(fix_file, language, resolved)
-        except OSError:
-            pass
-
-    # 2. 已有 tl 译文反查表
-    tl_map = load_tl_dialogue_map(tl_dir, language)
-
-    to_ai: list[tuple[int, str]] = []     # (原索引, 待翻译正文)
-    pending: list[MissingItem] = []
-    for it in items:
-        if it.identifier in resolved:
-            continue
-        if is_noise_text(it.what):
-            noise += 1
-            continue
-        # 已有译文复用（多行文本以去前导空白的正文匹配）
-        lead, body = _split_leading_ws(it.what)
-        key = (body or it.what).strip()
-        tr = tl_map.get(key)
-        if tr and tr.strip() != key:
-            resolved[it.identifier] = (it.who, lead, it.what, lead + tr.strip())
-            reuse += 1
-        else:
-            to_ai.append((len(pending), key))
-            pending.append(it)
-
-    # 3. AI 翻译缺失的正文
-    ai_trans: list[str] = []
-    if to_ai and client is not None:
-        texts = [key for _, key in to_ai]
-        if log_cb:
-            log_cb(f"  - 自动补译 {len(texts)} 条（运行时实际缺少翻译的对话）…")
-        ai_trans = client.translate_texts(texts, names=names or [])
-    for (pi, key), tr in zip(to_ai, ai_trans):
-        it = pending[pi]
-        if tr and tr.strip() and tr.strip() != key:
-            lead, _ = _split_leading_ws(it.what)
-            resolved[it.identifier] = (it.who, lead, it.what, lead + tr.strip())
-            need_ai += 1
-        else:
-            failed += 1
-
-    # 4. 写补丁（合并旧修复）
-    if resolved:
-        _write_fix_file(fix_file, language, resolved)
-        res.files.append(fix_file)
-    summary = (f"运行时缺失补译完成：新复用 {reuse} 条、新翻译 {need_ai} 条，"
-               f"跳过空/符号等无文字条目 {noise} 条"
-               + (f"、翻译失败 {failed} 条" if failed else ""))
-    res.ok = True
-    res.message = summary
-    res.detail = f"补丁文件: {fix_file.name if fix_file.exists() else FIX_FILE_NAME}"
-    if log_cb:
-        log_cb("  ✓ " + summary)
-        if not resolved:
-            log_cb("  - 本次没有需要补译的条目")
-    return res
-
-
-def _merge_old_fix(path: Path, language: str,
-                   resolved: dict[str, tuple[str, str, str, str]]) -> None:
-    """把旧 zz_missing_fix.rpy 中已有块并入 resolved，实现幂等合并。"""
-    lines = path.read_text(encoding="utf-8-sig", errors="ignore").splitlines()
-    i, n = 0, len(lines)
-    while i < n:
-        m = _TL_BLOCK_RE.match(lines[i].strip())
-        if not m or m.group(1) != language or m.group(2) == "strings":
-            i += 1
-            continue
-        ident = m.group(2)
-        i += 1
-        com: str | None = None
-        who: str | None = None
-        tl: str | None = None
-        while i < n:
-            s = lines[i].strip()
-            if not s:
-                i += 1
+    try:
+        docs = index_tl_directory(tl_dir, language)
+    except (OSError, TranslationMergeError) as exc:
+        return PatchResult(message=f"无法核对已有补译: {exc}")
+    fix_file = editable_output_path(tl_dir / FIX_FILE_NAME, docs)
+    old_fix = docs.get(fix_file)
+    installed = {entry.identifier for path, doc in docs.items() if path != fix_file
+                 for entry in doc.entries if entry.identifier}
+    reusable = _reusable_dialogue(docs.values())
+    lines = list(old_fix.lines) if old_fix else []
+    claimed = set(installed)
+    if old_fix:
+        for entry in reversed(old_fix.entries):
+            if entry.identifier is None:
                 continue
-            if _TL_BLOCK_RE.match(s):
-                break
-            if s.startswith("#"):
-                if com is None:
-                    # # who "原文"（who 可选）
-                    rest = s[1:].strip()
-                    q, rq = rest.find('"'), rest.rfind('"')
-                    if q != -1 and rq > q:
-                        head = rest[:q].strip()
-                        who = head or None
-                        com = _decode_say(rest[q + 1:rq])
-            else:
-                q, rq = s.find('"'), s.rfind('"')
-                if q != -1 and rq > q:
-                    tl = _decode_say(s[q + 1:rq])
-                    if not who:
-                        head = s[:q].strip()
-                        who = head or None
-                    break
-            i += 1
-        if com is not None and tl is not None:
-            lead, body = _split_leading_ws(com)
-            resolved[ident] = (who or "", lead, com, lead + tl.strip())
-        else:
-            i += 1
+            if entry.identifier in installed:
+                del lines[entry.block_start:entry.block_end]
+            claimed.add(entry.identifier)
 
-
-def _write_fix_file(
-    path: Path,
-    language: str,
-    resolved: dict[str, tuple[str, str, str, str]],
-) -> None:
-    """写 tl/<语言>/zz_missing_fix.rpy。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    parts = [
-        "# -*- coding: utf-8 -*-",
-        "# 运行时缺失对话自动补译（汉化工具生成）：按 Ren'Py 运行时 identifier",
-        "# 补齐翻译，可与主汉化文件共存；删除本文件即可回退这部分补译。",
-    ]
-    for ident in sorted(resolved):
-        who, _lead, src, full = resolved[ident]
-        com = encode_say_string(src)
-        tln = encode_say_string(full)
-        parts.append("")
-        parts.append(f"translate {language} {ident}:")
-        parts.append("")
-        if who:
-            parts.append("    # " + who + " " + com)
-            parts.append("    " + who + " " + tln)
+    target = target_language_name(language)
+    protected = set(names or ()) | set(getattr(client, "detected_names", ()))
+    pending: dict[str, list[MissingItem]] = {}
+    resolved: list[tuple[MissingItem, str]] = []
+    reused = kept = unsupported = 0
+    for item in items:
+        if item.identifier in claimed:
+            continue
+        claimed.add(item.identifier)
+        # Old reports label all compound blocks "Translate". Their other
+        # statements are not present in those reports and cannot be recreated.
+        if not item.is_say:
+            if not is_noise_text(item.what):
+                unsupported += 1
+            continue
+        key = item.what.strip()
+        if not any(c.isalpha() for c in unprotected_text(key, protected)):
+            resolved.append((item, key))
+            kept += 1
+        elif key in reusable:
+            resolved.append((item, reusable[key]))
+            reused += 1
         else:
-            parts.append("    # " + com)
-            parts.append("    " + tln)
-    path.write_text("\n".join(parts) + "\n", encoding="utf-8-sig")
+            pending.setdefault(key, []).append(item)
+
+    error = ""
+    if pending and client is not None:
+        try:
+            translated = client.translate_texts(list(pending), target=target, names=names or [])
+        except PauseRequested:
+            raise
+        except (TranslationError, OSError, RuntimeError, ValueError) as exc:
+            translated = []
+            error = str(exc)
+        protected.update(getattr(client, "detected_names", ()))
+        failed = getattr(client, "failed_texts", ())
+        for key, value in zip(list(pending), translated):
+            if key in failed or not isinstance(value, str) or not value.strip():
+                continue
+            value = value.strip()
+            if value == key:
+                if not valid_unchanged_text(key, target, protected):
+                    continue
+                kept += len(pending[key])
+            resolved.extend((item, value) for item in pending.pop(key))
+    remaining = sum(len(group) for group in pending.values()) + unsupported
+    if resolved:
+        newline = old_fix.newline if old_fix else "\n"
+        if not old_fix:
+            lines.append("# 运行时缺失对话自动补译（汉化工具生成）" + newline)
+        if lines and not lines[-1].endswith(("\r", "\n")):
+            lines.append(newline)
+        for item, translated_body in resolved:
+            # Preserve both margins, including the blank lines used in NVL text.
+            body = item.what.strip()
+            rendered = item.what.replace(body, translated_body, 1) if body else item.what
+            who = item.who + " " if item.who else ""
+            lines.append(newline.join((
+                "", f"translate {language} {item.identifier}:", "",
+                "    # " + who + encode_say_string(item.what),
+                "    " + who + encode_say_string(rendered), "")))
+    changed = lines != (old_fix.lines if old_fix else [])
+    if changed:
+        try:
+            write_if_unchanged(fix_file, "".join(lines), old_fix)
+        except (OSError, TranslationMergeError) as exc:
+            return PatchResult(message=f"保存运行时补译失败: {exc}")
+    detail = f"复用 {reused} 条，原样保留 {kept} 条，新翻译 {len(resolved) - reused - kept} 条"
+    if remaining:
+        detail += f"，仍有 {remaining} 条待补译"
+    if unsupported:
+        detail += f"，其中 {unsupported} 个复杂对话块需保留原结构手动补译"
+    if error:
+        detail += f"（{error}）"
+    if log_cb:
+        log_cb("运行时补译：" + detail)
+    return PatchResult(ok=not remaining, skip=not changed and not remaining,
+                       files=[fix_file] if changed else [], message="运行时补译：" + detail)
